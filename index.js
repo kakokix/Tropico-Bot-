@@ -1327,7 +1327,175 @@ async function lockAllChannels(guild, lock, reason) {
 }
 
 /* ========================================================================== */
-/*            5 - TICKETS, GIVEAWAYS, COMPTEURS, PANNEAUX PUBLICS             */
+/*                           5 - DROITS DES SALONS                            */
+/* ========================================================================== */
+
+// channels.js — qui peut voir, écrire et parler, salon par salon.
+
+
+/* ========================================================================== */
+/*                            CATALOGUE DES DROITS                            */
+/* ========================================================================== */
+
+const TEXTUAL = [ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.GuildForum];
+const VOCAL = [ChannelType.GuildVoice, ChannelType.GuildStageVoice];
+
+/** Droits pilotables, avec le type de salon auquel ils s'appliquent. */
+const PERMS = {
+  view:    { label: "Voir",        emoji: "👁️", flag: PermissionFlagsBits.ViewChannel,          scope: "all" },
+  send:    { label: "Écrire",      emoji: "💬", flag: PermissionFlagsBits.SendMessages,         scope: "text" },
+  react:   { label: "Réagir",      emoji: "😀", flag: PermissionFlagsBits.AddReactions,         scope: "text" },
+  files:   { label: "Fichiers",    emoji: "📎", flag: PermissionFlagsBits.AttachFiles,          scope: "text" },
+  links:   { label: "Liens",       emoji: "🔗", flag: PermissionFlagsBits.EmbedLinks,           scope: "text" },
+  threads: { label: "Fils",        emoji: "🧵", flag: PermissionFlagsBits.CreatePublicThreads,  scope: "text" },
+  connect: { label: "Rejoindre",   emoji: "🎧", flag: PermissionFlagsBits.Connect,              scope: "voice" },
+  speak:   { label: "Parler",      emoji: "🎙️", flag: PermissionFlagsBits.Speak,                scope: "voice" },
+  video:   { label: "Caméra",      emoji: "📹", flag: PermissionFlagsBits.Stream,               scope: "voice" },
+};
+
+function isCategory(ch) { return ch?.type === ChannelType.GuildCategory; }
+function isVoice(ch) { return VOCAL.includes(ch?.type); }
+function isText(ch) { return TEXTUAL.includes(ch?.type); }
+
+/** Droits pertinents pour ce salon. */
+function permsFor(channel) {
+  return Object.entries(PERMS).filter(([, p]) => {
+    if (p.scope === "all") return true;
+    if (isCategory(channel)) return true;          // une catégorie porte les deux
+    if (p.scope === "text") return isText(channel);
+    return isVoice(channel);
+  });
+}
+
+/* ========================================================================== */
+/*                          LECTURE ET ÉCRITURE                               */
+/* ========================================================================== */
+
+/** @returns {"allow"|"deny"|"inherit"} */
+function stateOf(channel, targetId, key) {
+  const ow = channel.permissionOverwrites?.cache?.get(targetId);
+  if (!ow) return "inherit";
+  const flag = PERMS[key].flag;
+  if (ow.allow?.has(flag)) return "allow";
+  if (ow.deny?.has(flag)) return "deny";
+  return "inherit";
+}
+
+const STATE_ICON = { allow: "✅", deny: "⛔", inherit: "⬜" };
+const STATE_WORD = { allow: "autorisé", deny: "refusé", inherit: "hérité" };
+
+const NEXT = { inherit: "allow", allow: "deny", deny: "inherit" };
+const VALUE = { allow: true, deny: false, inherit: null };
+
+/**
+ * Fait tourner un droit : hérité → autorisé → refusé → hérité.
+ * @returns {Promise<{state:string, error?:string}>}
+ */
+async function cyclePerm(channel, targetId, key, reason) {
+  const current = stateOf(channel, targetId, key);
+  const next = NEXT[current];
+  const permName = Object.entries(PermissionFlagsBits).find(([, v]) => v === PERMS[key].flag)?.[0];
+  if (!permName) return { state: current, error: "Droit inconnu." };
+  try {
+    await channel.permissionOverwrites.edit(targetId, { [permName]: VALUE[next] }, { reason });
+    return { state: next };
+  } catch (e) {
+    return { state: current, error: e.message.slice(0, 150) };
+  }
+}
+
+/** Force un droit à une valeur précise (utilisé par les raccourcis). */
+async function setPerm(channel, targetId, key, value, reason) {
+  const permName = Object.entries(PermissionFlagsBits).find(([, v]) => v === PERMS[key].flag)?.[0];
+  if (!permName) return false;
+  return channel.permissionOverwrites.edit(targetId, { [permName]: value }, { reason })
+    .then(() => true).catch(() => false);
+}
+
+/* ========================================================================== */
+/*                                RACCOURCIS                                  */
+/* ========================================================================== */
+
+/** Verrouille : plus personne n'écrit ni ne parle, mais tout le monde voit. */
+async function lockChannel(channel, lock, reason) {
+  const everyone = channel.guild.roles.everyone.id;
+  const keys = isVoice(channel) || isCategory(channel) ? ["speak", "send"] : ["send"];
+  let done = 0;
+  for (const k of keys) {
+    if (await setPerm(channel, everyone, k, lock ? false : null, reason)) done++;
+  }
+  return done > 0;
+}
+
+/** Masque totalement le salon. */
+async function hideChannel(channel, hide, reason) {
+  return setPerm(channel, channel.guild.roles.everyone.id, "view", hide ? false : null, reason);
+}
+
+/** Lecture seule : visible, mais ni écriture, ni réaction, ni fichier, ni fil. */
+async function readOnly(channel, reason) {
+  const everyone = channel.guild.roles.everyone.id;
+  for (const k of ["send", "react", "files", "threads"]) await setPerm(channel, everyone, k, false, reason);
+  return setPerm(channel, everyone, "view", null, reason);
+}
+
+/** Efface la règle de @everyone : le salon revient au réglage de sa catégorie. */
+async function resetEveryone(channel, reason) {
+  return channel.permissionOverwrites.delete(channel.guild.roles.everyone.id, reason)
+    .then(() => true).catch(() => false);
+}
+
+/** Applique la même règle à tous les salons d'une catégorie. */
+async function applyToCategory(category, targetId, key, value, reason) {
+  const children = category.guild.channels.cache.filter((c) => c.parentId === category.id);
+  let done = 0;
+  for (const ch of children.values()) {
+    if (!ch.manageable) continue;
+    if (PERMS[key].scope === "text" && !isText(ch)) continue;
+    if (PERMS[key].scope === "voice" && !isVoice(ch)) continue;
+    if (await setPerm(ch, targetId, key, value, reason)) done++;
+    if (done % 5 === 0) await new Promise((r) => setTimeout(r, 1000));
+  }
+  return done;
+}
+
+/** Rend un membre muet dans ce salon précis (ou lui rend la parole). */
+async function muteMemberHere(channel, userId, mute, reason) {
+  const keys = isVoice(channel) ? ["speak"] : ["send"];
+  let ok = true;
+  for (const k of keys) ok = (await setPerm(channel, userId, k, mute ? false : null, reason)) && ok;
+  return ok;
+}
+
+/* ========================================================================== */
+/*                                  RÉSUMÉ                                    */
+/* ========================================================================== */
+
+/** Ligne d'état lisible pour @everyone. */
+function summarize(channel) {
+  const everyone = channel.guild.roles.everyone.id;
+  return permsFor(channel)
+    .map(([key, p]) => `${STATE_ICON[stateOf(channel, everyone, key)]} ${p.emoji} ${p.label}`)
+    .join("  ·  ");
+}
+
+/** Salons du serveur actuellement verrouillés ou masqués. */
+function auditChannels(guild) {
+  const everyone = guild.roles.everyone.id;
+  const locked = [];
+  const hidden = [];
+  for (const ch of guild.channels.cache.values()) {
+    if (isCategory(ch)) continue;
+    const ow = ch.permissionOverwrites?.cache?.get(everyone);
+    if (!ow) continue;
+    if (ow.deny?.has(PermissionFlagsBits.ViewChannel)) hidden.push(ch);
+    else if (ow.deny?.has(PermissionFlagsBits.SendMessages) || ow.deny?.has(PermissionFlagsBits.Speak)) locked.push(ch);
+  }
+  return { locked, hidden };
+}
+
+/* ========================================================================== */
+/*            6 - TICKETS, GIVEAWAYS, COMPTEURS, PANNEAUX PUBLICS             */
 /* ========================================================================== */
 
 // features.js — tickets, giveaways, compteurs vocaux, confessions, alcatraz.
@@ -1913,7 +2081,7 @@ function confessionPanel(guild) {
 }
 
 /* ========================================================================== */
-/*                          6 - RECOMPENSES VOCALES                           */
+/*                          7 - RECOMPENSES VOCALES                           */
 /* ========================================================================== */
 
 // voice.js — récompenses vocales : XP et coins gagnés en restant en vocal.
@@ -2000,7 +2168,7 @@ function voiceSummary(config) {
 }
 
 /* ========================================================================== */
-/*                    7 - INVITATIONS ET ROLE DE CONFIANCE                    */
+/*                    8 - INVITATIONS ET ROLE DE CONFIANCE                    */
 /* ========================================================================== */
 
 // invites.js — suivi des invitations et rôle de confiance « Like ».
@@ -2212,7 +2380,7 @@ function isTrusted(member, config) {
 }
 
 /* ========================================================================== */
-/*                      8 - ACTIONS ET TYPES D ARTICLES                       */
+/*                      9 - ACTIONS ET TYPES D ARTICLES                       */
 /* ========================================================================== */
 
 // actions.js — la logique métier, appelable depuis n'importe quelle interface.
@@ -2548,7 +2716,7 @@ async function actionGrantCoins(guild, target, amount, moderator, reason) {
 }
 
 /* ========================================================================== */
-/*                  9 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
+/*                 10 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
 /* ========================================================================== */
 
 // coinsspace.js — remplissage complet de la catégorie ESPACE COINS.
@@ -2769,7 +2937,7 @@ async function setupCoinsSpace(guild, memberPanelFactory) {
 }
 
 /* ========================================================================== */
-/*                       10 - INSTALLATION AUTOMATIQUE                        */
+/*                       11 - INSTALLATION AUTOMATIQUE                        */
 /* ========================================================================== */
 
 // setup.js — installation automatique. Un bouton, tout est branché.
@@ -3013,7 +3181,7 @@ function setupReport(guild, result) {
 }
 
 /* ========================================================================== */
-/*             11 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
+/*             12 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
 /* ========================================================================== */
 
 // panel.js — l'interface complète. Tout réglage du bot est atteignable ici.
@@ -3036,6 +3204,7 @@ const SECTIONS = [
   { id: "eco", label: "Économie", emoji: "🪙", level: 4, desc: "Coins, boutique, colis", trusted: true },
   { id: "levels", label: "Niveaux", emoji: "📈", level: 4, desc: "XP, récompenses, annonces", trusted: true },
   { id: "voice", label: "Vocal", emoji: "🔊", level: 4, desc: "XP et coins gagnés en vocal", trusted: true },
+  { id: "channels", label: "Droits des salons", emoji: "🔐", level: 4, desc: "Qui peut voir, écrire et parler où", trusted: true },
   { id: "automod", label: "Automod", emoji: "🤖", level: 5, desc: "Filtres de messages", trusted: true },
   { id: "logs", label: "Journaux", emoji: "🗂️", level: 5, desc: "Routage de chaque type de log", ownerOnly: true },
   { id: "config", label: "Configuration", emoji: "⚙️", level: 5, desc: "Rôles, accueil, salons, piège vocal", ownerOnly: true },
@@ -3575,6 +3744,72 @@ async function buildSection(id, i, config, page = null) {
     };
   }
 
+  /* ---------------------------- DROITS DES SALONS ------------------------ */
+  if (id === "channels") {
+    // Fiche d'un salon : p:channels:page:<channelId>
+    if (page && guild.channels.cache.has(page)) {
+      const ch = guild.channels.cache.get(page);
+      const everyone = guild.id;
+      const list = permsFor(ch);
+      const kind = isCategory(ch) ? "Catégorie" : isVoice(ch) ? "Salon vocal" : "Salon textuel";
+
+      const permRows = [];
+      for (let n = 0; n < list.length; n += 5) {
+        permRows.push(row(...list.slice(n, n + 5).map(([key, p]) => {
+          const st = stateOf(ch, everyone, key);
+          return btn(`p:channels:cycle:${ch.id}_${everyone}_${key}`, `${p.label}`,
+            st === "allow" ? ButtonStyle.Success : st === "deny" ? ButtonStyle.Danger : ButtonStyle.Secondary, p.emoji);
+        })));
+      }
+
+      return {
+        embeds: [embed({ guild, author: { name: `🔐  ${ch.name}` }, color: COLORS.primary,
+          description: `${kind}${ch.parent ? ` · dans **${ch.parent.name}**` : ""}\n\n**@everyone :**\n${summarize(ch)}`,
+          fields: [
+            ...(isText(ch) && !isCategory(ch) ? [{ name: "Mode lent", value: ch.rateLimitPerUser ? `${ch.rateLimitPerUser} s` : "aucun", inline: true }] : []),
+            { name: "Règles particulières", value: `${ch.permissionOverwrites?.cache?.size ?? 0} (rôles et membres)`, inline: true },
+            { name: "Légende", value: "✅ autorisé · ⛔ refusé · ⬜ hérité de la catégorie" },
+          ],
+          footer: "Appuie sur un droit pour le faire tourner : hérité → autorisé → refusé" })],
+        components: [
+          ...permRows.slice(0, 2),
+          row(new RoleSelectMenuBuilder().setCustomId(`p:channels:role:${ch.id}`).setPlaceholder("Régler un rôle en particulier…")),
+          row(new UserSelectMenuBuilder().setCustomId(`p:channels:member:${ch.id}`).setPlaceholder("Rendre un membre muet ici…")),
+          row(
+            btn(`p:channels:lock:${ch.id}`, "Verrouiller", ButtonStyle.Danger, "🔒"),
+            btn(`p:channels:unlock:${ch.id}`, "Déverrouiller", ButtonStyle.Success, "🔓"),
+            btn(`p:channels:ro:${ch.id}`, "Lecture seule", ButtonStyle.Secondary, "📖"),
+            btn(`p:channels:reset:${ch.id}`, "Réinitialiser", ButtonStyle.Secondary, "♻️"),
+            btn("p:channels", "Retour", ButtonStyle.Secondary, "◀️"),
+          ),
+        ],
+      };
+    }
+
+    const audit = auditChannels(guild);
+    return {
+      embeds: [embed({ guild, author: { name: "🔐  Droits des salons" }, color: COLORS.primary,
+        description: "Choisis un salon ou une catégorie pour décider qui peut le voir, y écrire et y parler.",
+        fields: [
+          { name: `🔒 Verrouillés (${audit.locked.length})`,
+            value: audit.locked.length ? audit.locked.slice(0, 15).map((c) => `${c}`).join(" ").slice(0, 1000) : "_aucun_" },
+          { name: `🙈 Masqués à @everyone (${audit.hidden.length})`,
+            value: audit.hidden.length ? audit.hidden.slice(0, 15).map((c) => `${c}`).join(" ").slice(0, 1000) : "_aucun_" },
+        ],
+        footer: "Régler une catégorie permet ensuite de l'appliquer à tous ses salons" })],
+      components: [
+        row(new ChannelSelectMenuBuilder().setCustomId("p:channels:pick")
+          .setChannelTypes(ChannelType.GuildText, ChannelType.GuildVoice, ChannelType.GuildAnnouncement,
+            ChannelType.GuildForum, ChannelType.GuildStageVoice, ChannelType.GuildCategory)
+          .setPlaceholder("Choisis un salon ou une catégorie…")),
+        row(btn("p:channels:all:lock", "Tout verrouiller", ButtonStyle.Danger, "🔒"),
+            btn("p:channels:all:unlock", "Tout déverrouiller", ButtonStyle.Success, "🔓"),
+            btn("p:channels", "Actualiser", ButtonStyle.Secondary, "🔄")),
+        backRow(),
+      ],
+    };
+  }
+
   /* --------------------------------- VOCAL ------------------------------- */
   if (id === "voice") {
     const v = config.voice ?? {};
@@ -3724,6 +3959,29 @@ async function buildSection(id, i, config, page = null) {
   return homeView(i, config);
 }
 
+/** Fiche des droits d'un rôle sur un salon. */
+function roleView(guild, ch, roleId, label) {
+  const list = permsFor(ch);
+  const rows = [];
+  for (let n = 0; n < list.length; n += 5) {
+    rows.push(row(...list.slice(n, n + 5).map(([key, p]) => {
+      const st = stateOf(ch, roleId, key);
+      return btn(`p:channels:rcycle:${ch.id}_${roleId}_${key}`, p.label,
+        st === "allow" ? ButtonStyle.Success : st === "deny" ? ButtonStyle.Danger : ButtonStyle.Secondary, p.emoji);
+    })));
+  }
+  return {
+    embeds: [embed({ guild, author: { name: `🔐  ${ch.name} — droits du rôle` }, color: COLORS.primary,
+      description: `${label}\n\n${list.map(([key, p]) => `${STATE_ICON[stateOf(ch, roleId, key)]} ${p.emoji} **${p.label}** — ${STATE_WORD[stateOf(ch, roleId, key)]}`).join("\n")}`,
+      footer: "Hérité = le rôle suit la catégorie et les permissions globales" })],
+    components: [
+      ...rows.slice(0, 3),
+      row(btn(`p:channels:rclear:${ch.id}_${roleId}`, "Supprimer la règle", ButtonStyle.Danger, "🗑️"),
+          btn(`p:channels:page:${ch.id}`, "Retour au salon", ButtonStyle.Secondary, "◀️")),
+    ],
+  };
+}
+
 /* ========================================================================== */
 /*                            FICHE D'UN MEMBRE                               */
 /* ========================================================================== */
@@ -3767,6 +4025,7 @@ async function showMemberCard(i, userId, config) {
           btn(`p:mod:clear:${userId}`, "Effacer casier", ButtonStyle.Secondary, "🧽"),
           btn(`p:mod:coins:${userId}`, "Coins", ButtonStyle.Secondary, "🪙")),
       row(btn(`p:mod:role:${userId}`, "Gérer ses rôles", ButtonStyle.Secondary, "🎭"),
+          btn(`p:mod:mutehere:${userId}`, "Muet dans ce salon", ButtonStyle.Secondary, "🔇"),
           btn("p:mod", "Autre membre", ButtonStyle.Secondary, "🔁"),
           btn("p:home", "Accueil", ButtonStyle.Secondary, "🏠")),
     ],
@@ -3872,6 +4131,18 @@ async function handlePanel(i) {
       author: { name: "🎭  Rôles du membre" }, description: `<@${arg}> — ajoute ou retire un rôle.` })],
       components: [row(new RoleSelectMenuBuilder().setCustomId(`p:mod:rolepick:${arg}`).setPlaceholder("Rôle à basculer…")),
         row(btn(`p:mod:card:${arg}`, "Retour à la fiche", ButtonStyle.Secondary, "◀️"))] });
+
+    if (action === "mutehere") {
+      const ch = i.channel;
+      if (!ch?.manageable) return feedback(i, { ok: false, title: "Salon non modifiable",
+        text: "Je n'ai pas la main sur ce salon.", color: COLORS.danger }, "mod");
+      const key = isVoice(ch) ? "speak" : "send";
+      const muted = stateOf(ch, arg, key) === "deny";
+      await muteMemberHere(ch, arg, !muted, `Panneau 0x — ${i.user.tag}`);
+      return feedback(i, { ok: true, title: muted ? "Parole rendue" : "Réduit au silence ici",
+        text: `<@${arg}> ${muted ? "peut de nouveau écrire" : "ne peut plus écrire"} dans ${ch}.`,
+        color: muted ? COLORS.success : COLORS.warning }, "mod");
+    }
 
     if (action === "rolepick") {
       const member = await i.guild.members.fetch(arg).catch(() => null);
@@ -4202,6 +4473,108 @@ async function handlePanel(i) {
       return feedback(i, { ok: true, title: "Récompense retirée", text: `Plus rien n'est donné au niveau ${i.values[0]}.` }, "levels"); }
   }
 
+  /* ---------------------------- DROITS DES SALONS ------------------------ */
+  if (section === "channels") {
+    const reason = `Panneau 0x — ${i.user.tag}`;
+    const back = (chId) => buildSection("channels", i, config, chId);
+
+    if (action === "pick") return respond(i, await back(i.values[0]));
+
+    if (action === "all") {
+      await i.deferUpdate();
+      const on = arg === "lock";
+      const n = await lockAllChannels(i.guild, on, reason);
+      if (on) setLockdown(i.guildId, 60); else clearLockdown(i.guildId);
+      return feedback(i, { ok: true, title: on ? "Serveur verrouillé" : "Serveur déverrouillé",
+        text: `${n} salon(s) traité(s).`, color: on ? COLORS.danger : COLORS.success }, "channels");
+    }
+
+    const ch = i.guild.channels.cache.get(arg?.split("_")[0]);
+    if (!ch) return feedback(i, { ok: false, title: "Salon introuvable", text: "Il a peut-être été supprimé.", color: COLORS.danger }, "channels");
+    if (!ch.manageable) return feedback(i, { ok: false, title: "Salon non modifiable",
+      text: `Je n'ai pas la main sur ${ch}. Vérifie ma permission « Gérer les salons » et la position de mon rôle.`, color: COLORS.danger }, "channels");
+
+    if (action === "cycle") {
+      const [chId, targetId, key] = arg.split("_");
+      const r = await cyclePerm(ch, targetId, key, reason);
+      if (r.error) return feedback(i, { ok: false, title: "Modification refusée", text: r.error, color: COLORS.danger }, "channels", chId);
+      await log(i.guild, "permissions", embed({ guild: i.guild, color: COLORS.warning,
+        author: { name: "🔐  Droit modifié" },
+        fields: [
+          { name: "Salon", value: `${ch}`, inline: true },
+          { name: "Cible", value: targetId === i.guildId ? "@everyone" : `<@&${targetId}>`, inline: true },
+          { name: "Droit", value: `${PERMS[key].label} → **${STATE_WORD[r.state]}**`, inline: true },
+          { name: "Par", value: i.user.tag, inline: true },
+        ] }));
+      if (isCategory(ch)) {
+        return respond(i, { embeds: [embed({ guild: i.guild, color: COLORS.success,
+          author: { name: `${STATE_ICON[r.state]}  ${PERMS[key].label} — ${STATE_WORD[r.state]}` },
+          description: `Réglé sur la catégorie **${ch.name}**.\nVeux-tu l'appliquer aussi à tous ses salons ?` })],
+          components: [row(
+            btn(`p:channels:cascade:${chId}_${targetId}_${key}_${r.state}`, "Appliquer à toute la catégorie", ButtonStyle.Primary, "⤵️"),
+            btn(`p:channels:page:${chId}`, "Non, revenir", ButtonStyle.Secondary, "◀️"))] });
+      }
+      return respond(i, await back(chId));
+    }
+
+    if (action === "cascade") {
+      const [chId, targetId, key, state] = arg.split("_");
+      await i.deferUpdate();
+      const value = state === "allow" ? true : state === "deny" ? false : null;
+      const n = await applyToCategory(ch, targetId, key, value, reason);
+      return feedback(i, { ok: true, title: "Appliqué à la catégorie",
+        text: `**${PERMS[key].label}** → ${STATE_WORD[state]} sur ${n} salon(s) de **${ch.name}**.` }, "channels", chId);
+    }
+
+    if (["lock", "unlock", "ro", "reset"].includes(action)) {
+      const chId = arg;
+      let title, text;
+      if (action === "lock") { await lockChannel(ch, true, reason); title = "Salon verrouillé"; text = `Plus personne n'écrit ni ne parle dans ${ch}.`; }
+      if (action === "unlock") { await lockChannel(ch, false, reason); title = "Salon déverrouillé"; text = `${ch} est rouvert.`; }
+      if (action === "ro") { await readOnly(ch, reason); title = "Lecture seule"; text = `${ch} reste visible, mais silencieux.`; }
+      if (action === "reset") { await resetEveryone(ch, reason); title = "Permissions réinitialisées"; text = `${ch} suit de nouveau sa catégorie.`; }
+      await log(i.guild, "permissions", embed({ guild: i.guild, color: COLORS.warning,
+        author: { name: `🔐  ${title}` },
+        fields: [{ name: "Salon", value: `${ch}`, inline: true }, { name: "Par", value: i.user.tag, inline: true }] }));
+      return feedback(i, { ok: true, title, text, color: action === "unlock" || action === "reset" ? COLORS.success : COLORS.danger }, "channels", chId);
+    }
+
+    if (action === "role") {
+      const roleId = i.values[0];
+      return respond(i, roleView(i.guild, ch, roleId, `<@&${roleId}>`));
+    }
+
+    if (action === "rcycle") {
+      const [chId, roleId, key] = arg.split("_");
+      const r = await cyclePerm(ch, roleId, key, reason);
+      if (r.error) return feedback(i, { ok: false, title: "Modification refusée", text: r.error, color: COLORS.danger }, "channels", chId);
+      return respond(i, roleView(i.guild, ch, roleId, `<@&${roleId}>`));
+    }
+
+    if (action === "rclear") {
+      const [chId, roleId] = arg.split("_");
+      await ch.permissionOverwrites.delete(roleId, reason).catch(() => null);
+      return feedback(i, { ok: true, title: "Règle supprimée", text: `<@&${roleId}> n'a plus de règle particulière dans ${ch}.` }, "channels", chId);
+    }
+
+    if (action === "member") {
+      const uid = i.values[0];
+      const key = isVoice(ch) ? "speak" : "send";
+      const muted = stateOf(ch, uid, key) === "deny";
+      await muteMemberHere(ch, uid, !muted, reason);
+      await log(i.guild, "permissions", embed({ guild: i.guild, color: muted ? COLORS.success : COLORS.warning,
+        author: { name: muted ? "🔊  Parole rendue" : "🔇  Muet dans un salon" },
+        fields: [
+          { name: "Membre", value: `<@${uid}>`, inline: true },
+          { name: "Salon", value: `${ch}`, inline: true },
+          { name: "Par", value: i.user.tag, inline: true },
+        ] }));
+      return feedback(i, { ok: true, title: muted ? "Parole rendue" : "Membre réduit au silence ici",
+        text: `<@${uid}> ${muted ? "peut de nouveau" : "ne peut plus"} ${isVoice(ch) ? "parler" : "écrire"} dans ${ch}.`,
+        color: muted ? COLORS.success : COLORS.warning }, "channels", ch.id);
+    }
+  }
+
   /* --------------------------------- VOCAL ------------------------------- */
   if (section === "voice") {
     if (action === "t") { await updateConfig(i.guildId, { voice: { enabled: !config.voice.enabled } });
@@ -4460,6 +4833,108 @@ async function handleModal(i, parts, config, level) {
     if (lvl === null || lvl < 1) return feedback(i, { ok: false, title: "Niveau invalide", text: "Entre un nombre supérieur à 0.", color: COLORS.danger }, "levels");
     await updateConfig(i.guildId, { levelRewards: { ...config.levelRewards, [lvl]: arg } });
     return feedback(i, { ok: true, title: "Récompense enregistrée", text: `<@&${arg}> sera donné au niveau **${lvl}**.` }, "levels");
+  }
+
+  /* ---------------------------- DROITS DES SALONS ------------------------ */
+  if (section === "channels") {
+    const reason = `Panneau 0x — ${i.user.tag}`;
+    const back = (chId) => buildSection("channels", i, config, chId);
+
+    if (action === "pick") return respond(i, await back(i.values[0]));
+
+    if (action === "all") {
+      await i.deferUpdate();
+      const on = arg === "lock";
+      const n = await lockAllChannels(i.guild, on, reason);
+      if (on) setLockdown(i.guildId, 60); else clearLockdown(i.guildId);
+      return feedback(i, { ok: true, title: on ? "Serveur verrouillé" : "Serveur déverrouillé",
+        text: `${n} salon(s) traité(s).`, color: on ? COLORS.danger : COLORS.success }, "channels");
+    }
+
+    const ch = i.guild.channels.cache.get(arg?.split("_")[0]);
+    if (!ch) return feedback(i, { ok: false, title: "Salon introuvable", text: "Il a peut-être été supprimé.", color: COLORS.danger }, "channels");
+    if (!ch.manageable) return feedback(i, { ok: false, title: "Salon non modifiable",
+      text: `Je n'ai pas la main sur ${ch}. Vérifie ma permission « Gérer les salons » et la position de mon rôle.`, color: COLORS.danger }, "channels");
+
+    if (action === "cycle") {
+      const [chId, targetId, key] = arg.split("_");
+      const r = await cyclePerm(ch, targetId, key, reason);
+      if (r.error) return feedback(i, { ok: false, title: "Modification refusée", text: r.error, color: COLORS.danger }, "channels", chId);
+      await log(i.guild, "permissions", embed({ guild: i.guild, color: COLORS.warning,
+        author: { name: "🔐  Droit modifié" },
+        fields: [
+          { name: "Salon", value: `${ch}`, inline: true },
+          { name: "Cible", value: targetId === i.guildId ? "@everyone" : `<@&${targetId}>`, inline: true },
+          { name: "Droit", value: `${PERMS[key].label} → **${STATE_WORD[r.state]}**`, inline: true },
+          { name: "Par", value: i.user.tag, inline: true },
+        ] }));
+      if (isCategory(ch)) {
+        return respond(i, { embeds: [embed({ guild: i.guild, color: COLORS.success,
+          author: { name: `${STATE_ICON[r.state]}  ${PERMS[key].label} — ${STATE_WORD[r.state]}` },
+          description: `Réglé sur la catégorie **${ch.name}**.\nVeux-tu l'appliquer aussi à tous ses salons ?` })],
+          components: [row(
+            btn(`p:channels:cascade:${chId}_${targetId}_${key}_${r.state}`, "Appliquer à toute la catégorie", ButtonStyle.Primary, "⤵️"),
+            btn(`p:channels:page:${chId}`, "Non, revenir", ButtonStyle.Secondary, "◀️"))] });
+      }
+      return respond(i, await back(chId));
+    }
+
+    if (action === "cascade") {
+      const [chId, targetId, key, state] = arg.split("_");
+      await i.deferUpdate();
+      const value = state === "allow" ? true : state === "deny" ? false : null;
+      const n = await applyToCategory(ch, targetId, key, value, reason);
+      return feedback(i, { ok: true, title: "Appliqué à la catégorie",
+        text: `**${PERMS[key].label}** → ${STATE_WORD[state]} sur ${n} salon(s) de **${ch.name}**.` }, "channels", chId);
+    }
+
+    if (["lock", "unlock", "ro", "reset"].includes(action)) {
+      const chId = arg;
+      let title, text;
+      if (action === "lock") { await lockChannel(ch, true, reason); title = "Salon verrouillé"; text = `Plus personne n'écrit ni ne parle dans ${ch}.`; }
+      if (action === "unlock") { await lockChannel(ch, false, reason); title = "Salon déverrouillé"; text = `${ch} est rouvert.`; }
+      if (action === "ro") { await readOnly(ch, reason); title = "Lecture seule"; text = `${ch} reste visible, mais silencieux.`; }
+      if (action === "reset") { await resetEveryone(ch, reason); title = "Permissions réinitialisées"; text = `${ch} suit de nouveau sa catégorie.`; }
+      await log(i.guild, "permissions", embed({ guild: i.guild, color: COLORS.warning,
+        author: { name: `🔐  ${title}` },
+        fields: [{ name: "Salon", value: `${ch}`, inline: true }, { name: "Par", value: i.user.tag, inline: true }] }));
+      return feedback(i, { ok: true, title, text, color: action === "unlock" || action === "reset" ? COLORS.success : COLORS.danger }, "channels", chId);
+    }
+
+    if (action === "role") {
+      const roleId = i.values[0];
+      return respond(i, roleView(i.guild, ch, roleId, `<@&${roleId}>`));
+    }
+
+    if (action === "rcycle") {
+      const [chId, roleId, key] = arg.split("_");
+      const r = await cyclePerm(ch, roleId, key, reason);
+      if (r.error) return feedback(i, { ok: false, title: "Modification refusée", text: r.error, color: COLORS.danger }, "channels", chId);
+      return respond(i, roleView(i.guild, ch, roleId, `<@&${roleId}>`));
+    }
+
+    if (action === "rclear") {
+      const [chId, roleId] = arg.split("_");
+      await ch.permissionOverwrites.delete(roleId, reason).catch(() => null);
+      return feedback(i, { ok: true, title: "Règle supprimée", text: `<@&${roleId}> n'a plus de règle particulière dans ${ch}.` }, "channels", chId);
+    }
+
+    if (action === "member") {
+      const uid = i.values[0];
+      const key = isVoice(ch) ? "speak" : "send";
+      const muted = stateOf(ch, uid, key) === "deny";
+      await muteMemberHere(ch, uid, !muted, reason);
+      await log(i.guild, "permissions", embed({ guild: i.guild, color: muted ? COLORS.success : COLORS.warning,
+        author: { name: muted ? "🔊  Parole rendue" : "🔇  Muet dans un salon" },
+        fields: [
+          { name: "Membre", value: `<@${uid}>`, inline: true },
+          { name: "Salon", value: `${ch}`, inline: true },
+          { name: "Par", value: i.user.tag, inline: true },
+        ] }));
+      return feedback(i, { ok: true, title: muted ? "Parole rendue" : "Membre réduit au silence ici",
+        text: `<@${uid}> ${muted ? "peut de nouveau" : "ne peut plus"} ${isVoice(ch) ? "parler" : "écrire"} dans ${ch}.`,
+        color: muted ? COLORS.success : COLORS.warning }, "channels", ch.id);
+    }
   }
 
   /* --------------------------------- VOCAL ------------------------------- */
@@ -4793,7 +5268,7 @@ async function handlePublic(i, parts, config) {
 }
 
 /* ========================================================================== */
-/*                    12 - COMMANDES ET MENUS CONTEXTUELS                     */
+/*                    13 - COMMANDES ET MENUS CONTEXTUELS                     */
 /* ========================================================================== */
 
 // commands.js — trois commandes seulement. Tout le reste passe par /panel.
@@ -5000,7 +5475,7 @@ const contextMenus = [
 ];
 
 /* ========================================================================== */
-/*                     13 - CLIENT, EVENEMENTS, DEMARRAGE                     */
+/*                     14 - CLIENT, EVENEMENTS, DEMARRAGE                     */
 /* ========================================================================== */
 
 // index.js — client, événements, démarrage.
