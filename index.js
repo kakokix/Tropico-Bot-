@@ -23,6 +23,18 @@
 //     "Publier les panneaux" pose ensuite les boutons pour les membres.
 //     Les six interrupteurs principaux sont directement sur l'accueil.
 //
+//   APPUI LONG = RACCOURCIS (menus contextuels, pas de commandes en plus)
+//     Sur un membre  : "Fiche de moderation", "Ses invitations"
+//     Sur un message : "Supprimer et avertir", "Purger jusqu'ici"
+//
+//   APPUI LONG = RACCOURCIS (menus contextuels, pas de commandes en plus)
+//     Sur un membre  : "Fiche de moderation", "Ses invitations"
+//     Sur un message : "Supprimer et avertir", "Purger jusqu'ici"
+//
+//   APPUI LONG = RACCOURCIS (menus contextuels, pas de commandes en plus)
+//     Sur un membre  : "Fiche de moderation", "Ses invitations"
+//     Sur un message : "Supprimer et avertir", "Purger jusqu'ici"
+//
 //   TROIS COMMANDES, TOUT LE RESTE AU DOIGT
 //     /panel   le panneau de contrôle — il ouvre sur la liste de ce qu'il
 //              reste à régler, puis chaque section se pilote au bouton
@@ -66,6 +78,8 @@
 
 import {
   ActionRowBuilder,
+  ApplicationCommandType,
+  ContextMenuCommandBuilder,
   ActivityType,
   AuditLogEvent,
   ButtonBuilder,
@@ -206,6 +220,7 @@ const FUNC_CHANNELS = {
   drops: ["drop-colis"],
   sondages: ["sondages"],
   staffChat: ["chat-staff", "chat-gestion", "chat-admin"],
+  invites: ["invitations", "bienvenue", "welcome"],
 };
 
 /** Types de tickets → catégories existantes du serveur. */
@@ -514,6 +529,8 @@ const DEFAULT_CONFIG = {
   perms: { roles: {}, users: {}, commands: {} },
 
   autoroleId: null,
+  trustedRoleId: null,   // rôle « Like » — accès aux réglages non destructifs
+  invites: { enabled: true, channelId: null, deleteAfterMs: 120_000, baseline: {} },
   welcomeChannelId: null,
   welcomeMessage: "Bienvenue {user} sur **{server}** — tu es le/la {count}ᵉ membre.",
   staffRoleId: null,
@@ -572,7 +589,8 @@ const DEFAULT_CONFIG = {
     dropChance: 0,      // % de chance par message dans le salon de drops
     dropMin: 100,
     dropMax: 800,
-    shop: [],           // [{ id, name, price, roleId, stock }]
+    shop: [],           // [{ id, type, name, price, roleId, amount, hours, stock }]
+    customRoles: {},    // userId -> roleId (rôles personnalisés achetés)
   },
 };
 
@@ -589,6 +607,8 @@ const mem = {
   tickets: [],
   jail: new Map(),
   absences: [],
+  invites: new Map(),
+  boosts: new Map(),
 };
 let seq = 1;
 
@@ -632,6 +652,14 @@ async function initDatabase() {
       kind TEXT NOT NULL, opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), closed_at TIMESTAMPTZ, closed_by TEXT)`);
     await q(`CREATE TABLE IF NOT EXISTS jail (guild_id TEXT, user_id TEXT, roles JSONB NOT NULL DEFAULT '[]'::jsonb,
       until TIMESTAMPTZ, reason TEXT, PRIMARY KEY (guild_id, user_id))`);
+    await q(`CREATE TABLE IF NOT EXISTS boosts (
+      guild_id TEXT NOT NULL, user_id TEXT NOT NULL, multiplier REAL NOT NULL DEFAULT 1,
+      until TIMESTAMPTZ NOT NULL, PRIMARY KEY (guild_id, user_id))`);
+    await q(`CREATE TABLE IF NOT EXISTS invites (
+      guild_id TEXT NOT NULL, user_id TEXT NOT NULL, inviter_id TEXT, code TEXT,
+      joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), left_at TIMESTAMPTZ,
+      PRIMARY KEY (guild_id, user_id))`);
+    await q(`CREATE INDEX IF NOT EXISTS invites_inviter ON invites (guild_id, inviter_id)`);
     await q(`CREATE TABLE IF NOT EXISTS absences (
       id SERIAL PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, reason TEXT NOT NULL,
       until TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
@@ -906,6 +934,114 @@ async function dueJail() {
   if (ready) return (await q("SELECT * FROM jail WHERE until IS NOT NULL AND until<=NOW()")).rows;
   return [...mem.jail.entries()].filter(([, v]) => v.until && new Date(v.until) <= new Date())
     .map(([k, v]) => ({ guild_id: k.split(":")[0], user_id: k.split(":")[1], ...v }));
+}
+
+/* --------------------------- MULTIPLICATEURS D'XP -------------------------- */
+
+async function setBoost(guildId, userId, multiplier, until) {
+  if (ready) await q(`INSERT INTO boosts (guild_id,user_id,multiplier,until) VALUES ($1,$2,$3,$4)
+    ON CONFLICT (guild_id,user_id) DO UPDATE SET multiplier=$3, until=$4`, [guildId, userId, multiplier, until]);
+  else mem.boosts.set(`${guildId}:${userId}`, { multiplier, until });
+}
+
+/** @returns {{multiplier:number, until:Date}|null} */
+async function getBoost(guildId, userId) {
+  if (ready) {
+    const r = await q("SELECT multiplier, until FROM boosts WHERE guild_id=$1 AND user_id=$2 AND until>NOW()", [guildId, userId]);
+    return r.rows[0] ? { multiplier: Number(r.rows[0].multiplier), until: r.rows[0].until } : null;
+  }
+  const b = mem.boosts.get(`${guildId}:${userId}`);
+  return b && new Date(b.until) > new Date() ? b : null;
+}
+
+/** Supprime la sanction la plus récente d'un type donné. @returns {boolean} */
+async function deleteLatestSanction(guildId, userId, type) {
+  if (ready) {
+    const r = await q(`DELETE FROM sanctions WHERE id = (
+      SELECT id FROM sanctions WHERE guild_id=$1 AND user_id=$2 AND type=$3 ORDER BY id DESC LIMIT 1)`,
+      [guildId, userId, type]);
+    return r.rowCount > 0;
+  }
+  const list = mem.sanctions.filter((s) => s.guild_id === guildId && s.user_id === userId && s.type === type);
+  if (!list.length) return false;
+  const last = list.sort((a, b) => b.id - a.id)[0];
+  mem.sanctions = mem.sanctions.filter((s) => s.id !== last.id);
+  return true;
+}
+
+/* ------------------------------- INVITATIONS ------------------------------ */
+
+/** Enregistre l'arrivée et renvoie le total d'invités actifs du parrain. */
+async function recordInvite(guildId, userId, inviterId, code) {
+  if (ready) {
+    await q(`INSERT INTO invites (guild_id,user_id,inviter_id,code,joined_at,left_at)
+      VALUES ($1,$2,$3,$4,NOW(),NULL)
+      ON CONFLICT (guild_id,user_id) DO UPDATE SET inviter_id=$3, code=$4, joined_at=NOW(), left_at=NULL`,
+      [guildId, userId, inviterId, code]);
+  } else {
+    mem.invites.set(`${guildId}:${userId}`, { inviter_id: inviterId, code, joined_at: new Date(), left_at: null });
+  }
+  return inviterCount(guildId, inviterId);
+}
+
+async function markInviteLeft(guildId, userId) {
+  if (ready) {
+    const r = await q("UPDATE invites SET left_at=NOW() WHERE guild_id=$1 AND user_id=$2 AND left_at IS NULL RETURNING inviter_id", [guildId, userId]);
+    return r.rows[0]?.inviter_id ?? null;
+  }
+  const rec = mem.invites.get(`${guildId}:${userId}`);
+  if (!rec || rec.left_at) return null;
+  rec.left_at = new Date();
+  return rec.inviter_id;
+}
+
+async function inviterCount(guildId, inviterId) {
+  if (!inviterId) return 0;
+  if (ready) {
+    const r = await q("SELECT COUNT(*)::int c FROM invites WHERE guild_id=$1 AND inviter_id=$2 AND left_at IS NULL", [guildId, inviterId]);
+    return r.rows[0]?.c ?? 0;
+  }
+  return [...mem.invites.entries()].filter(([k, v]) => k.startsWith(`${guildId}:`) && v.inviter_id === inviterId && !v.left_at).length;
+}
+
+async function inviterStats(guildId, inviterId) {
+  if (ready) {
+    const r = await q(`SELECT COUNT(*) FILTER (WHERE left_at IS NULL)::int active,
+      COUNT(*)::int total FROM invites WHERE guild_id=$1 AND inviter_id=$2`, [guildId, inviterId]);
+    return r.rows[0] ?? { active: 0, total: 0 };
+  }
+  const all = [...mem.invites.entries()].filter(([k, v]) => k.startsWith(`${guildId}:`) && v.inviter_id === inviterId);
+  return { active: all.filter(([, v]) => !v.left_at).length, total: all.length };
+}
+
+async function getInviter(guildId, userId) {
+  if (ready) return (await q("SELECT inviter_id, code, joined_at FROM invites WHERE guild_id=$1 AND user_id=$2", [guildId, userId])).rows[0] ?? null;
+  return mem.invites.get(`${guildId}:${userId}`) ?? null;
+}
+
+async function topInviters(guildId, limit = 10) {
+  if (ready) {
+    const r = await q(`SELECT inviter_id, COUNT(*) FILTER (WHERE left_at IS NULL)::int active, COUNT(*)::int total
+      FROM invites WHERE guild_id=$1 AND inviter_id IS NOT NULL
+      GROUP BY inviter_id ORDER BY active DESC, total DESC LIMIT $2`, [guildId, limit]);
+    return r.rows.map((x) => ({ userId: x.inviter_id, active: x.active, total: x.total }));
+  }
+  const agg = new Map();
+  for (const [k, v] of mem.invites) {
+    if (!k.startsWith(`${guildId}:`) || !v.inviter_id) continue;
+    const cur = agg.get(v.inviter_id) ?? { active: 0, total: 0 };
+    cur.total++; if (!v.left_at) cur.active++;
+    agg.set(v.inviter_id, cur);
+  }
+  return [...agg.entries()].map(([userId, v]) => ({ userId, ...v }))
+    .sort((a, b) => b.active - a.active || b.total - a.total).slice(0, limit);
+}
+
+async function resetInvites(guildId) {
+  if (ready) return (await q("DELETE FROM invites WHERE guild_id=$1", [guildId])).rowCount;
+  let n = 0;
+  for (const k of [...mem.invites.keys()]) if (k.startsWith(`${guildId}:`)) { mem.invites.delete(k); n++; }
+  return n;
 }
 
 /* --------------------------------- ABSENCES ------------------------------- */
@@ -1704,6 +1840,7 @@ function memberPanel(guild) {
         { name: "💼 Travail", value: "Toutes les 30 min", inline: true },
         { name: "🏆 Classement", value: "Top XP et coins", inline: true },
         { name: "🛒 Boutique", value: "Rôles à acheter", inline: true },
+        { name: "🔗 Invitations", value: "Tes filleuls", inline: true },
       ] })],
     components: [
       new ActionRowBuilder().addComponents(
@@ -1718,6 +1855,10 @@ function memberPanel(guild) {
         pbtn("pub:shop", "Boutique", ButtonStyle.Secondary, "🛒"),
         pbtn("pub:pay", "Envoyer des coins", ButtonStyle.Secondary, "🤝"),
       ),
+      new ActionRowBuilder().addComponents(
+        pbtn("pub:invites", "Mes invitations", ButtonStyle.Primary, "🔗"),
+        pbtn("pub:top:invites", "Top invitations", ButtonStyle.Secondary, "🏅"),
+      ),
     ],
   };
 }
@@ -1731,7 +1872,219 @@ function confessionPanel(guild) {
 }
 
 /* ========================================================================== */
-/*                        6 - ACTIONS (LOGIQUE METIER)                        */
+/*                    6 - INVITATIONS ET ROLE DE CONFIANCE                    */
+/* ========================================================================== */
+
+// invites.js — suivi des invitations et rôle de confiance « Like ».
+
+
+/* ========================================================================== */
+/*                          CACHE DES INVITATIONS                             */
+/* ========================================================================== */
+
+// guildId -> Map(code -> { uses, inviterId })
+const inviteCache = new Map();
+
+async function cacheInvites(guild) {
+  if (!guild.members.me?.permissions.has(PermissionFlagsBits.ManageGuild)) {
+    console.warn(`[invites] ${guild.name} : permission « Gérer le serveur » manquante, suivi impossible`);
+    return 0;
+  }
+  const invites = await guild.invites?.fetch().catch(() => null);
+  if (!invites) return 0;
+  const map = new Map();
+  for (const inv of invites.values()) map.set(inv.code, { uses: inv.uses ?? 0, inviterId: inv.inviter?.id ?? null });
+  // URL personnalisée (discord.gg/Naoya)
+  const vanity = await guild.fetchVanityData?.().catch(() => null);
+  if (vanity?.code) map.set(vanity.code, { uses: vanity.uses ?? 0, inviterId: null, vanity: true });
+  inviteCache.set(guild.id, map);
+  return map.size;
+}
+
+function noteInviteCreate(invite) {
+  const map = inviteCache.get(invite.guild?.id);
+  if (map) map.set(invite.code, { uses: invite.uses ?? 0, inviterId: invite.inviter?.id ?? null });
+}
+
+function noteInviteDelete(invite) {
+  inviteCache.get(invite.guild?.id)?.delete(invite.code);
+}
+
+/**
+ * Compare l'état actuel au cache pour retrouver l'invitation utilisée.
+ * @returns {{code:string, inviterId:string|null, vanity?:boolean}|null}
+ */
+async function resolveUsedInvite(guild) {
+  const before = inviteCache.get(guild.id) ?? new Map();
+  const invites = await guild.invites?.fetch().catch(() => null);
+  if (!invites) return null;
+
+  const after = new Map();
+  for (const inv of invites.values()) after.set(inv.code, { uses: inv.uses ?? 0, inviterId: inv.inviter?.id ?? null });
+  const vanity = await guild.fetchVanityData?.().catch(() => null);
+  if (vanity?.code) after.set(vanity.code, { uses: vanity.uses ?? 0, inviterId: null, vanity: true });
+
+  let used = null;
+  for (const [code, now] of after) {
+    const prev = before.get(code);
+    if (prev && now.uses > prev.uses) { used = { code, inviterId: now.inviterId, vanity: now.vanity }; break; }
+  }
+  // Invitation à usage unique consommée puis supprimée par Discord
+  if (!used) {
+    for (const [code, prev] of before) {
+      if (!after.has(code) && !prev.vanity) { used = { code, inviterId: prev.inviterId }; break; }
+    }
+  }
+
+  inviteCache.set(guild.id, after);
+  return used;
+}
+
+/* ========================================================================== */
+/*                       ANNONCE D'ARRIVÉE PAR INVITATION                     */
+/* ========================================================================== */
+
+/** Ajoute le report initial issu des compteurs Discord. */
+function withBaseline(config, userId, n) {
+  return n + Number(config?.invites?.baseline?.[userId] ?? 0);
+}
+
+/**
+ * Recale le classement sur les compteurs réels des liens Discord.
+ * Utile une seule fois, au démarrage du suivi sur un serveur déjà ancien.
+ */
+async function recalibrate(guild) {
+  const invites = await guild.invites?.fetch().catch(() => null);
+  if (!invites) return { ok: false, error: "Lecture des invitations impossible — permission « Gérer le serveur » manquante." };
+
+  const uses = new Map();
+  for (const inv of invites.values()) {
+    if (!inv.inviter) continue;
+    uses.set(inv.inviter.id, (uses.get(inv.inviter.id) ?? 0) + (inv.uses ?? 0));
+  }
+
+  const already = new Map((await topInviters(guild.id, 500)).map((x) => [x.userId, x.active]));
+  const baseline = {};
+  for (const [uid, total] of uses) {
+    const diff = total - (already.get(uid) ?? 0);
+    if (diff > 0) baseline[uid] = diff;
+  }
+
+  await updateConfig(guild.id, { invites: { baseline } });
+  return { ok: true, people: Object.keys(baseline).length, total: [...uses.values()].reduce((a, b) => a + b, 0) };
+}
+
+const ORDINAL = (n) => (n === 1 ? "1ʳᵉ" : `${n}ᵉ`);
+
+/** Traite une arrivée : attribue l'invitation, annonce, programme la suppression. */
+async function handleInviteJoin(member) {
+  const guild = member.guild;
+  const config = await getConfig(guild.id);
+  if (!config.invites?.enabled) return null;
+
+  const used = await resolveUsedInvite(guild);
+  const inviterId = used?.inviterId ?? null;
+  const raw = await recordInvite(guild.id, member.id, inviterId, used?.code ?? null);
+  const total = withBaseline(config, inviterId, raw);
+
+  const channel = config.invites.channelId
+    ? guild.channels.cache.get(config.invites.channelId)
+    : resolveFuncChannel(guild, "invites", config)
+      ?? (config.welcomeChannelId ? guild.channels.cache.get(config.welcomeChannelId) : null);
+
+  if (!channel || !canSend(channel)) return { inviterId, total, posted: false };
+
+  let description;
+  if (inviterId) {
+    description = `${member} a été invité(e) par <@${inviterId}>\nC'est son **${ORDINAL(total)} invité**.`;
+  } else if (used?.vanity) {
+    description = `${member} est arrivé(e) par le lien personnalisé du serveur.`;
+  } else {
+    description = `${member} est arrivé(e) — invitation inconnue.`;
+  }
+
+  const message = await channel.send({
+    embeds: [embed({
+      guild,
+      color: inviterId ? COLORS.success : COLORS.neutral,
+      author: { name: "🔗  Nouvelle arrivée" },
+      description,
+      footer: `Ce message disparaît dans ${Math.round((config.invites.deleteAfterMs ?? 120_000) / 60_000)} min`,
+    })],
+  }).catch(() => null);
+
+  if (message) {
+    setTimeout(() => message.delete().catch(() => null), config.invites.deleteAfterMs ?? 120_000);
+  }
+
+  return { inviterId, total, posted: !!message };
+}
+
+/** Départ : l'invitation ne compte plus. */
+async function handleInviteLeave(member) {
+  return markInviteLeft(member.guild.id, member.id);
+}
+
+/* ========================================================================== */
+/*                        RÔLE DE CONFIANCE « LIKE »                          */
+/* ========================================================================== */
+
+/**
+ * Le rôle « Like me » donne accès aux réglages non destructifs.
+ * La recherche tolère emojis, accents, tirets et casse :
+ * « Like me », « 🩷 • Like Me », « like-me », « LIKEME » sont tous reconnus.
+ */
+function findLikeRole(guild) {
+  const roles = [...guild.roles.cache.values()].filter((r) => r.id !== guild.id && !r.managed);
+  const flat = (r) => norm(r.name).replace(/-/g, "");
+
+  return roles.find((r) => norm(r.name) === "like-me")
+    ?? roles.find((r) => flat(r) === "likeme")
+    ?? roles.find((r) => flat(r).includes("likeme"))
+    ?? roles.find((r) => norm(r.name) === "like")
+    ?? null;
+}
+
+/**
+ * Repère le rôle de confiance et lui donne le niveau 5.
+ * Un rôle choisi à la main dans le panneau n'est jamais écrasé tant qu'il existe.
+ */
+async function syncTrustedRole(guild, { force = false } = {}) {
+  const config = await getConfig(guild.id);
+
+  // Choix manuel toujours valide : on le garde
+  if (!force && config.trustedRoleId && guild.roles.cache.has(config.trustedRoleId)) {
+    const role = guild.roles.cache.get(config.trustedRoleId);
+    const current = Number(config.perms.roles?.[role.id] ?? 0);
+    if (current < 5) {
+      await updateConfig(guild.id, { perms: { roles: { ...config.perms.roles, [role.id]: 5 } } });
+      return { found: true, role, changed: true, manual: true };
+    }
+    return { found: true, role, changed: false, manual: true };
+  }
+
+  const role = findLikeRole(guild);
+  if (!role) {
+    if (config.trustedRoleId) await updateConfig(guild.id, { trustedRoleId: null });
+    return { found: false };
+  }
+
+  const roles = { ...config.perms.roles };
+  if (!roles[role.id] || Number(roles[role.id]) < 5) roles[role.id] = 5;
+  const changed = config.trustedRoleId !== role.id || roles[role.id] !== config.perms.roles?.[role.id];
+  await updateConfig(guild.id, { trustedRoleId: role.id, perms: { roles } });
+  return { found: true, role, changed };
+}
+
+/** A-t-on accès aux sections « safe » ? */
+function isTrusted(member, config) {
+  if (!member) return false;
+  if (isOwner(member.id)) return true;
+  return !!config?.trustedRoleId && member.roles.cache.has(config.trustedRoleId);
+}
+
+/* ========================================================================== */
+/*                      7 - ACTIONS ET TYPES D ARTICLES                       */
 /* ========================================================================== */
 
 // actions.js — la logique métier, appelable depuis n'importe quelle interface.
@@ -1934,34 +2287,102 @@ async function actionWork(guild, user) {
     COLORS.success);
 }
 
-async function actionBuy(guild, member, itemId) {
+/** Catalogue des types d'articles vendables. */
+const ITEM_TYPES = {
+  role:       { label: "Rôle du serveur", emoji: "🎭", needsRole: true,  desc: "Donne un rôle existant" },
+  customrole: { label: "Rôle personnalisé", emoji: "✨", needsRole: false, desc: "L'acheteur choisit son nom et sa couleur" },
+  xp:         { label: "XP", emoji: "📈", needsRole: false, desc: "Crédite directement de l'XP" },
+  multiplier: { label: "Multiplicateur d'XP", emoji: "🚀", needsRole: false, desc: "Double l'XP pendant N heures" },
+  pardon:     { label: "Pardon", emoji: "🕊️", needsRole: false, desc: "Efface le dernier avertissement" },
+};
+
+async function actionBuy(guild, member, itemId, extra = {}) {
   const config = await getConfig(guild.id);
   if (!config.economy.enabled) return no("L'économie est désactivée.");
   const item = config.economy.shop.find((x) => x.id === itemId);
   if (!item) return no("Article introuvable.");
-  const role = guild.roles.cache.get(item.roleId);
-  if (!role) return no("Le rôle lié à cet article n'existe plus. Préviens un gestionnaire.");
-  if (member.roles.cache.has(role.id)) return no("Tu possèdes déjà cet article.");
-  if (role.position >= guild.members.me.roles.highest.position) return no("Je ne peux pas attribuer ce rôle (il est au-dessus du mien).");
   if (item.stock !== null && item.stock !== undefined && item.stock <= 0) return no("Rupture de stock.");
 
   const w = await getWallet(guild.id, member.id);
   if (w.coins < item.price) return no(`Il te manque ${config.economy.currency} **${num(item.price - w.coins)}**.`);
 
+  const type = item.type ?? "role";
+  let detail = "";
+
+  /* ------------------------------ rôle simple ----------------------------- */
+  if (type === "role") {
+    const role = guild.roles.cache.get(item.roleId);
+    if (!role) return no("Le rôle lié à cet article n'existe plus. Préviens un gestionnaire.");
+    if (member.roles.cache.has(role.id)) return no("Tu possèdes déjà cet article.");
+    if (role.position >= guild.members.me.roles.highest.position) return no("Je ne peux pas attribuer ce rôle (il est au-dessus du mien).");
+    await member.roles.add(role.id, `Boutique : ${item.name}`).catch(() => null);
+    detail = `Tu obtiens ${role}.`;
+  }
+
+  /* ---------------------------- rôle personnalisé ------------------------- */
+  else if (type === "customrole") {
+    const name = (extra.name ?? "").trim().slice(0, 60);
+    if (!name) return no("Il faut un nom pour ton rôle personnalisé.");
+    const color = /^#?[0-9a-f]{6}$/i.test(extra.color ?? "") ? Number.parseInt(extra.color.replace("#", ""), 16) : null;
+    const existingId = config.economy.customRoles?.[member.id];
+    let role = existingId ? guild.roles.cache.get(existingId) : null;
+
+    if (role) {
+      await role.edit({ name, ...(color !== null ? { color } : {}) }, `Boutique : ${item.name}`).catch(() => null);
+      detail = `Ton rôle ${role} a été renommé.`;
+    } else {
+      if (guild.roles.cache.size >= 245) return no("Le serveur est proche de la limite de 250 rôles.");
+      role = await guild.roles.create({ name, ...(color !== null ? { color } : {}), reason: `Boutique : ${member.user.tag}` }).catch(() => null);
+      if (!role) return no("Création du rôle impossible — vérifie ma permission « Gérer les rôles ».");
+      await member.roles.add(role.id).catch(() => null);
+      await updateConfig(guild.id, { economy: { customRoles: { ...(config.economy.customRoles ?? {}), [member.id]: role.id } } });
+      detail = `Ton rôle ${role} vient d'être créé rien que pour toi.`;
+    }
+  }
+
+  /* ---------------------------------- XP ---------------------------------- */
+  else if (type === "xp") {
+    const amount = Number(item.amount) || 1000;
+    const r = await addXp(guild.id, member.id, amount);
+    detail = `**${num(amount)} XP** crédités — tu es niveau **${r?.level ?? "?"}**.`;
+  }
+
+  /* --------------------------- multiplicateur d'XP ------------------------ */
+  else if (type === "multiplier") {
+    const mult = Number(item.amount) || 2;
+    const hours = Number(item.hours) || 24;
+    const current = await getBoost(guild.id, member.id);
+    const base = current && new Date(current.until) > new Date() ? new Date(current.until).getTime() : Date.now();
+    const until = new Date(base + hours * 36e5);
+    await setBoost(guild.id, member.id, mult, until);
+    detail = `XP **×${mult}** jusqu'au <t:${Math.floor(until.getTime() / 1000)}:f>.`;
+  }
+
+  /* -------------------------------- pardon -------------------------------- */
+  else if (type === "pardon") {
+    const removed = await deleteLatestSanction(guild.id, member.id, "warn");
+    if (!removed) return no("Tu n'as aucun avertissement à effacer.");
+    const left = await countSanctions(guild.id, member.id, "warn");
+    detail = `Ton dernier avertissement est effacé — il t'en reste **${left}**.`;
+  }
+
+  else return no("Type d'article inconnu.");
+
   await addCoins(guild.id, member.id, -item.price);
-  await member.roles.add(role.id, `Boutique : ${item.name}`).catch(() => null);
   if (item.stock !== null && item.stock !== undefined) {
     await updateConfig(guild.id, { economy: { shop: config.economy.shop.map((x) => (x.id === item.id ? { ...x, stock: x.stock - 1 } : x)) } });
   }
+
   await log(guild, "coins", embed({
     guild, color: COLORS.gold, author: { name: `${ICONS.coin}  Achat boutique` },
     fields: [
       { name: "Membre", value: member.user.tag, inline: true },
-      { name: "Article", value: item.name, inline: true },
+      { name: "Article", value: `${ITEM_TYPES[type]?.emoji ?? ""} ${item.name}`, inline: true },
       { name: "Prix", value: num(item.price), inline: true },
     ],
   }));
-  return ok("Achat validé", `Tu obtiens **${item.name}** ${role} pour ${config.economy.currency} ${num(item.price)}.`, COLORS.gold);
+
+  return ok("Achat validé", `**${item.name}** pour ${config.economy.currency} ${num(item.price)}.\n${detail}`, COLORS.gold);
 }
 
 async function actionPay(guild, from, toUser, amount) {
@@ -1999,7 +2420,7 @@ async function actionGrantCoins(guild, target, amount, moderator, reason) {
 }
 
 /* ========================================================================== */
-/*                        7 - INSTALLATION AUTOMATIQUE                        */
+/*                        8 - INSTALLATION AUTOMATIQUE                        */
 /* ========================================================================== */
 
 // setup.js — installation automatique. Un bouton, tout est branché.
@@ -2069,6 +2490,19 @@ async function autoSetup(guild, user) {
     steps.push(step(false, "Rôle staff des tickets", "À définir dans Configuration — sans lui personne ne voit les tickets"));
   }
 
+  /* 3b — rôle de confiance « Like » ---------------------------------------- */
+  const trusted = await syncTrustedRole(guild).catch(() => ({ found: false }));
+  if (trusted.found) {
+    patch.trustedRoleId = trusted.role.id;
+    patch.perms = patch.perms ?? {};
+    patch.perms.roles = { ...(patch.perms.roles ?? {}), [trusted.role.id]: Math.max(5, Number(patch.perms.roles?.[trusted.role.id] ?? 0)) };
+    steps.push(step(true, "Rôle de confiance « Like me »",
+      `${trusted.role} — accès à la boutique, aux niveaux, aux compteurs, à l'automod et à la modération complète`));
+  } else {
+    steps.push(step(false, "Rôle de confiance « Like me »",
+      "Aucun rôle nommé « Like me » — crée-le, ou désigne-le dans Configuration → Rôles clés"));
+  }
+
   /* 4 — rôle Alcatraz ------------------------------------------------------ */
   let jail = guild.roles.cache.find((r) => /alcatraz|prison|prisonnier|jail/i.test(r.name) && !r.managed);
   if (!jail && me.permissions.has(PermissionFlagsBits.ManageRoles)) {
@@ -2116,6 +2550,31 @@ async function autoSetup(guild, user) {
   const drops = findChannel(guild, FUNC_CHANNELS.drops);
   if (drops) { patch.economy.dropChannelId = drops.id; steps.push(step(true, "Salon des colis", `${drops}`)); }
 
+  /* 8b — invitations ------------------------------------------------------- */
+  const inviteCh = findChannel(guild, FUNC_CHANNELS.invites);
+  const cached = await cacheInvites(guild).catch(() => 0);
+  if (inviteCh) patch.invites = { enabled: true, channelId: inviteCh.id, deleteAfterMs: 120_000 };
+  steps.push(step(!!inviteCh && cached > 0, "Suivi des invitations",
+    inviteCh ? `Annonces dans ${inviteCh} · ${cached} lien(s) en cache · suppression après 2 min`
+      : "Aucun salon #invitations — les annonces iront dans le salon de bienvenue"));
+
+  /* 8c — boutique de départ ------------------------------------------------ */
+  const cfgNow = await getConfig(guild.id);
+  if (!cfgNow.economy.shop?.length) {
+    patch.economy.shop = [
+      { id: "pardon-pardon", type: "pardon", name: "Pardon", price: 5000, roleId: null, amount: null, hours: null, stock: null },
+      { id: "xp-1000-xp", type: "xp", name: "1 000 XP", price: 1500, roleId: null, amount: 1000, hours: null, stock: null },
+      { id: "xp-5000-xp", type: "xp", name: "5 000 XP", price: 6000, roleId: null, amount: 5000, hours: null, stock: null },
+      { id: "multiplier-boost-x2-24h", type: "multiplier", name: "Boost XP ×2 (24 h)", price: 3000, roleId: null, amount: 2, hours: 24, stock: null },
+      { id: "multiplier-boost-x3-6h", type: "multiplier", name: "Boost XP ×3 (6 h)", price: 4000, roleId: null, amount: 3, hours: 6, stock: null },
+      { id: "customrole-role-personnalise", type: "customrole", name: "Rôle personnalisé", price: 25000, roleId: null, amount: null, hours: null, stock: 100 },
+    ];
+    steps.push(step(true, "Boutique garnie",
+      "6 articles de départ : Pardon, 1 000 XP, 5 000 XP, boosts ×2 et ×3, rôle personnalisé — aucun ne dépend d'un rôle existant"));
+  } else {
+    steps.push(step(true, "Boutique", `${cfgNow.economy.shop.length} article(s) déjà en place, rien de touché`));
+  }
+
   /* 9 — catégories de tickets ---------------------------------------------- */
   const cats = TICKET_TYPES.filter((t) => findCategory(guild, t.categories));
   steps.push(step(cats.length === TICKET_TYPES.length, `Catégories de tickets (${cats.length}/${TICKET_TYPES.length})`,
@@ -2129,6 +2588,7 @@ async function autoSetup(guild, user) {
   if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) missingPerms.push("Gérer les salons");
   if (!me.permissions.has(PermissionFlagsBits.BanMembers)) missingPerms.push("Bannir");
   if (!me.permissions.has(PermissionFlagsBits.ModerateMembers)) missingPerms.push("Réduire au silence");
+  if (!me.permissions.has(PermissionFlagsBits.ManageGuild)) missingPerms.push("Gérer le serveur (suivi des invitations)");
   steps.push(step(missingPerms.length === 0, "Permissions du bot",
     missingPerms.length ? `Manquantes : ${missingPerms.join(", ")} — réinvite-moi en Administrateur` : "Toutes présentes"));
 
@@ -2196,10 +2656,10 @@ function setupReport(guild, result) {
 }
 
 /* ========================================================================== */
-/*                          8 - PANNEAU DE CONTROLE                           */
+/*              9 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
 /* ========================================================================== */
 
-// panel.js — l'interface. Tout se pilote ici, au doigt.
+// panel.js — l'interface complète. Tout réglage du bot est atteignable ici.
 
 
 /* ========================================================================== */
@@ -2207,40 +2667,44 @@ function setupReport(guild, result) {
 /* ========================================================================== */
 
 const SECTIONS = [
-  // ownerOnly : sections qui MODIFIENT le bot → réservées au propriétaire
-  { id: "mod", label: "Modération", emoji: "🛡️", level: 1, desc: "Sanctionner, purger, consulter un casier" },
-  { id: "publish", label: "Publications", emoji: "📢", level: 3, desc: "Panneaux, menus de rôles, annonces, sondages" },
-  { id: "tickets", label: "Tickets", emoji: "🎫", level: 4, desc: "Panneau d'ouverture, statistiques" },
+  // trusted : accessible au rôle « Like » et au propriétaire de 0x
+  // ownerOnly : propriétaire de 0x uniquement
+  { id: "mod", label: "Modération", emoji: "🛡️", level: 1, desc: "Sanctionner, purger, mode lent, casiers" },
+  { id: "staff", label: "Équipe", emoji: "🗓️", level: 1, desc: "Absences, effectif, état du serveur" },
+  { id: "invites", label: "Invitations", emoji: "🔗", level: 1, desc: "Classement, parrain d'un membre, réglages" },
+  { id: "publish", label: "Publications", emoji: "📢", level: 3, desc: "Panneaux, rôles, annonces, sondages" },
+  { id: "tickets", label: "Tickets", emoji: "🎫", level: 4, desc: "Panneau, statistiques, compteur" },
   { id: "gw", label: "Giveaways", emoji: "🎁", level: 4, desc: "Lancer, terminer, retirer au sort" },
-  { id: "counters", label: "Compteurs", emoji: "📊", level: 4, desc: "Membres, connectés, vocal", ownerOnly: true },
-  { id: "eco", label: "Économie", emoji: "🪙", level: 4, desc: "Coins, boutique, colis", ownerOnly: true },
-  { id: "levels", label: "Niveaux", emoji: "📈", level: 5, desc: "XP et récompenses de rôle", ownerOnly: true },
-  { id: "automod", label: "Automod", emoji: "🤖", level: 5, desc: "Filtres de messages", ownerOnly: true },
-  { id: "config", label: "Configuration", emoji: "⚙️", level: 5, desc: "Rôles clés, accueil, autorole", ownerOnly: true },
+  { id: "counters", label: "Compteurs", emoji: "📊", level: 4, desc: "Membres, connectés, vocal", trusted: true },
+  { id: "eco", label: "Économie", emoji: "🪙", level: 4, desc: "Coins, boutique, colis", trusted: true },
+  { id: "levels", label: "Niveaux", emoji: "📈", level: 4, desc: "XP, récompenses, annonces", trusted: true },
+  { id: "automod", label: "Automod", emoji: "🤖", level: 5, desc: "Filtres de messages", trusted: true },
+  { id: "logs", label: "Journaux", emoji: "🗂️", level: 5, desc: "Routage de chaque type de log", ownerOnly: true },
+  { id: "config", label: "Configuration", emoji: "⚙️", level: 5, desc: "Rôles, accueil, salons, piège vocal", ownerOnly: true },
   { id: "protect", label: "Protection", emoji: "🚨", level: 6, desc: "Anti-raid, anti-nuke, lockdown", ownerOnly: true },
-  { id: "perms", label: "Permissions", emoji: "🔐", level: 6, desc: "Niveau de chaque rôle", ownerOnly: true },
+  { id: "perms", label: "Permissions", emoji: "🔐", level: 6, desc: "Niveaux des rôles et des sections", ownerOnly: true },
 ];
 
-/** Vue de refus quand quelqu'un touche à une section verrouillée. */
-function lockedView(guild, section) {
-  return {
-    embeds: [embed({
-      guild,
-      color: COLORS.danger,
-      author: { name: "🔒  Section verrouillée" },
-      description: `**${section.emoji} ${section.label}** modifie la configuration de 0x.
-Seul <@${OWNER_ID}> peut y accéder.`,
-      footer: "Verrou par identifiant — ni un administrateur ni le propriétaire du serveur ne peut le contourner",
-    })],
-    components: [backRow()],
-  };
-}
+const sectionLevel = (s, config) => Number(config?.perms?.sections?.[s.id] ?? s.level);
 
-/** Le membre a-t-il le droit d'ouvrir cette section ? */
 function canOpen(section, member, config) {
   if (!section) return false;
   if (section.ownerOnly && !isOwner(member.id)) return false;
-  return permLevel(member, config) >= section.level;
+  if (section.trusted && !isTrusted(member, config)) return false;
+  return permLevel(member, config) >= sectionLevel(section, config);
+}
+
+/** Refus lisible selon le type de verrou. */
+function denyView(guild, section, config) {
+  const trustedName = config?.trustedRoleId ? `<@&${config.trustedRoleId}>` : "**Like me**";
+  return {
+    embeds: [embed({ guild, color: COLORS.danger, author: { name: "🔒  Section verrouillée" },
+      description: section.ownerOnly
+        ? `**${section.emoji} ${section.label}** touche au cœur de 0x.\nSeul <@${OWNER_ID}> peut y accéder.`
+        : `**${section.emoji} ${section.label}** est réservée au rôle ${trustedName} et à <@${OWNER_ID}>.`,
+      footer: section.ownerOnly ? "Verrou par identifiant" : "Verrou par rôle de confiance" })],
+    components: [backRow()],
+  };
 }
 
 const btn = (id, label, style = ButtonStyle.Secondary, emoji) => {
@@ -2248,9 +2712,11 @@ const btn = (id, label, style = ButtonStyle.Secondary, emoji) => {
   if (emoji) b.setEmoji(emoji);
   return b;
 };
-const rows = (...components) => components.map((c) => new ActionRowBuilder().addComponents(c));
-const backRow = () => new ActionRowBuilder().addComponents(btn("p:home", "Retour", ButtonStyle.Secondary, "◀️"));
+const row = (...c) => new ActionRowBuilder().addComponents(...c);
+const backRow = (to = "p:home") => row(btn(to, "Retour", ButtonStyle.Secondary, "◀️"));
 const onOff = (v) => (v ? "🟢 activé" : "🔴 coupé");
+const dot = (v) => (v ? "🟢" : "🔴");
+
 
 async function respond(i, payload) {
   try {
@@ -2262,20 +2728,48 @@ async function respond(i, payload) {
   }
 }
 
-/** Retourne au panneau après une action, avec un bandeau de résultat. */
-async function feedback(i, result, sectionId) {
-  const view = await buildSection(sectionId ?? "home", i, await getConfig(i.guildId));
-  const banner = embed({
-    guild: i.guild,
-    color: result.color ?? COLORS.success,
+async function feedback(i, result, sectionId, page) {
+  const view = await buildSection(sectionId ?? "home", i, await getConfig(i.guildId), page);
+  const banner = embed({ guild: i.guild, color: result.color ?? COLORS.success,
     author: { name: `${result.ok === false ? ICONS.no : ICONS.ok}  ${result.title ?? "Terminé"}` },
-    description: result.text,
-  });
+    description: result.text });
   return respond(i, { embeds: [banner, ...view.embeds], components: view.components });
 }
 
+function modal(id, title, fields) {
+  const m = new ModalBuilder().setCustomId(id).setTitle(title.slice(0, 45));
+  for (const f of fields.slice(0, 5)) {
+    const input = new TextInputBuilder().setCustomId(f.id).setLabel(f.label.slice(0, 45))
+      .setStyle(f.long ? TextInputStyle.Paragraph : TextInputStyle.Short).setRequired(f.required ?? false);
+    if (f.value !== undefined && f.value !== null) input.setValue(String(f.value).slice(0, 4000));
+    if (f.placeholder) input.setPlaceholder(f.placeholder.slice(0, 100));
+    if (f.max) input.setMaxLength(f.max);
+    m.addComponents(row(input));
+  }
+  return m;
+}
+
+/** Modale d'ajout d'article, adaptée au type. */
+function itemModal(type, roleId) {
+  const fields = [
+    { id: "name", label: "Nom affiché en boutique", required: true, max: 60 },
+    { id: "price", label: "Prix en coins", required: true, max: 10 },
+  ];
+  if (type === "xp") fields.push({ id: "amount", label: "XP crédités", required: true, value: "1000", max: 8 });
+  if (type === "multiplier") {
+    fields.push({ id: "amount", label: "Multiplicateur (2 = double)", required: true, value: "2", max: 4 });
+    fields.push({ id: "hours", label: "Durée en heures", required: true, value: "24", max: 4 });
+  }
+  fields.push({ id: "stock", label: "Stock (vide = illimité)", max: 6 });
+  return modal(`pm:eco:additem:${type}_${roleId}`, `Article — ${ITEM_TYPES[type]?.label ?? type}`, fields);
+}
+
+const REASON = { id: "reason", label: "Raison", required: true, max: 400 };
+const DURATION = { id: "duration", label: "Durée (30s, 10m, 2h, 7d)", placeholder: "vide = indéterminée", max: 12 };
+const LEVEL_OPTIONS = [0, 1, 2, 3, 4, 5, 6].map((l) => ({ label: PERM_LABELS[l], value: String(l) }));
+
 /* ========================================================================== */
-/*                             DIAGNOSTIC D'ACCUEIL                           */
+/*                                 DIAGNOSTIC                                 */
 /* ========================================================================== */
 
 async function diagnose(guild, config) {
@@ -2283,39 +2777,30 @@ async function diagnose(guild, config) {
   const push = (ok, label, hint) => items.push({ ok, label, hint });
 
   push(usingDatabase(), "Base de données PostgreSQL",
-    "Ajoute un service Postgres sur Railway puis la variable DATABASE_URL — sinon tout est perdu au redémarrage");
-
+    "Railway → + New → PostgreSQL, puis variable DATABASE_URL — sinon tout est perdu au redémarrage");
   const routed = Object.keys(LOG_ROUTES).filter((k) => resolveLogChannel(guild, k, config)).length;
-  push(routed >= Object.keys(LOG_ROUTES).length * 0.8, `Salons de logs détectés (${routed}/${Object.keys(LOG_ROUTES).length})`,
-    "Lance /logs scan, puis /logs map pour voir ce qui manque");
-
-  push(Object.keys(config.perms.roles).length > 0, "Niveaux de permission attribués",
-    "Panneau → Permissions → Détection automatique");
-
-  push(!!config.staffRoleId, "Rôle staff défini",
-    "Panneau → Configuration — nécessaire pour l'accès aux tickets");
-
-  push(!!config.jailRoleId || !!guild.roles.cache.find((r) => /alcatraz|prison/i.test(r.name)),
-    "Rôle Alcatraz défini", "Panneau → Configuration — nécessaire pour la commande d'enfermement");
-
+  push(routed >= Object.keys(LOG_ROUTES).length * 0.8, `Journaux routés (${routed}/${Object.keys(LOG_ROUTES).length})`,
+    "Section Journaux → Rescanner, puis force les manquants");
+  push(Object.keys(config.perms.roles).length > 0, "Niveaux de permission attribués", "Bouton Tout installer");
+  push(!!config.staffRoleId, "Rôle staff défini", "Configuration → Rôles");
+  push(!!config.jailRoleId, "Rôle Alcatraz défini", "Configuration → Rôles");
   const cats = TICKET_TYPES.filter((t) => findCategory(guild, t.categories)).length;
   push(cats === TICKET_TYPES.length, `Catégories de tickets (${cats}/${TICKET_TYPES.length})`,
-    "Les catégories doivent s'appeler Tickets Staff, Tickets Abus, Tickets Animation, Tickets Coins, Tickets Partenariats, Tickets Couronne");
-
+    "Nomme-les Tickets Staff, Tickets Abus, Tickets Animation, Tickets Coins, Tickets Partenariats, Tickets Couronne");
   const counts = await computeCounts(guild);
-  push(counts.online !== null, "Intent Presence (compteur Connectés)",
-    "Portail développeur → Bot → active Presence Intent");
+  push(counts.online !== null, "Intent Presence", "Portail développeur → Bot → Presence Intent");
   push(counts.cacheRatio > 0.5, `Cache des membres (${Math.round(counts.cacheRatio * 100)}%)`,
-    "Portail développeur → Bot → active Server Members Intent");
-
+    "Portail développeur → Bot → Server Members Intent");
   const me = guild.members.me;
-  push(me.permissions.has(PermissionFlagsBits.ViewAuditLog), "Accès aux logs d'audit",
-    "Nécessaire à l'anti-nuke pour identifier qui agit");
-  push(me.roles.highest.position >= guild.roles.cache.size - 3 || me.permissions.has(PermissionFlagsBits.Administrator),
-    "Position du rôle de 0x", "Paramètres du serveur → Rôles → remonte 0x tout en haut");
-
+  push(me.permissions.has(PermissionFlagsBits.ViewAuditLog), "Logs d'audit", "Nécessaires à l'anti-nuke");
+  push(me.permissions.has(PermissionFlagsBits.Administrator), "Rôle de 0x tout en haut",
+    "Paramètres du serveur → Rôles → remonte 0x");
   return items;
 }
+
+/* ========================================================================== */
+/*                                   ACCUEIL                                  */
+/* ========================================================================== */
 
 async function homeView(i, config) {
   const level = permLevel(i.member, config);
@@ -2324,14 +2809,10 @@ async function homeView(i, config) {
   const counts = await computeCounts(i.guild);
   const problems = checks.filter((c) => !c.ok);
 
-  const dot = (v) => (v ? "🟢" : "🔴");
   const etat = [
-    `${dot(config.automod.enabled)} Automod`,
-    `${dot(config.antiraid.enabled)} Anti-raid`,
-    `${dot(config.antinuke.enabled)} Anti-nuke`,
-    `${dot(config.logsEnabled)} Journaux`,
-    `${dot(config.levelsEnabled)} Niveaux`,
-    `${dot(config.economy.enabled)} Économie`,
+    `${dot(config.automod.enabled)} Automod`, `${dot(config.antiraid.enabled)} Anti-raid`,
+    `${dot(config.antinuke.enabled)} Anti-nuke`, `${dot(config.logsEnabled)} Journaux`,
+    `${dot(config.levelsEnabled)} Niveaux`, `${dot(config.economy.enabled)} Économie`,
   ].join("  ·  ");
 
   const main = embed({
@@ -2340,36 +2821,28 @@ async function homeView(i, config) {
     color: !owner ? COLORS.primary : problems.length ? COLORS.warning : COLORS.success,
     description: [
       `**${i.guild.name}** · ${num(counts.members)} membres · ${counts.voice} en vocal`,
-      `Ton niveau : **${PERM_LABELS[level]}**`,
-      "",
-      etat,
-      "",
-      !owner
-        ? `### ${ICONS.info} Sections opérationnelles`
-        : problems.length
-        ? `### ${ICONS.alert} ${problems.length} point(s) à régler`
+      `Ton niveau : **${PERM_LABELS[level]}**`, "", etat, "",
+      !owner ? `### ${ICONS.info} Sections opérationnelles`
+        : problems.length ? `### ${ICONS.alert} ${problems.length} point(s) à régler`
         : `### ${ICONS.ok} Tout est en place`,
-      ...(!owner
-        ? ["Les réglages de 0x sont verrouillés. Tu as accès aux sections de travail ci-dessous."]
-        : problems.length
-        ? ["Appuie sur **Tout installer** — il règle presque tout seul.", "",
-           ...problems.slice(0, 6).map((p) => `🔴 **${p.label}**\n └ ${p.hint}`)]
+      ...(!owner ? ["Les réglages de 0x sont verrouillés. Tu as accès aux sections de travail ci-dessous."]
+        : problems.length ? ["Appuie sur **Tout installer** — il règle presque tout seul.", "",
+            ...problems.slice(0, 6).map((p) => `🔴 **${p.label}**\n └ ${p.hint}`)]
         : ["Aucune action requise."]),
     ].join("\n"),
-    footer: owner ? "Tout installer = détection et branchement automatiques" : undefined,
   });
 
   const allowed = SECTIONS.filter((s) => canOpen(s, i.member, config));
   const components = [];
 
   if (owner) {
-    components.push(new ActionRowBuilder().addComponents(
+    components.push(row(
       btn("p:setup:run", "Tout installer", ButtonStyle.Success, "⚡"),
       btn("p:setup:publish", "Publier les panneaux", ButtonStyle.Primary, "📢"),
       btn("p:setup:defaults", "Réglages recommandés", ButtonStyle.Secondary, "🎚️"),
       btn("p:home", "Rafraîchir", ButtonStyle.Secondary, "🔄"),
     ));
-    components.push(new ActionRowBuilder().addComponents(
+    components.push(row(
       btn("p:sw:automod", "Automod", config.automod.enabled ? ButtonStyle.Success : ButtonStyle.Danger),
       btn("p:sw:antiraid", "Anti-raid", config.antiraid.enabled ? ButtonStyle.Success : ButtonStyle.Danger),
       btn("p:sw:antinuke", "Anti-nuke", config.antinuke.enabled ? ButtonStyle.Success : ButtonStyle.Danger),
@@ -2378,14 +2851,12 @@ async function homeView(i, config) {
     ));
   }
 
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId("p:go")
-    .setPlaceholder(allowed.length ? "Réglages détaillés…" : "Aucune section accessible à ton niveau")
+  components.push(row(new StringSelectMenuBuilder().setCustomId("p:go")
+    .setPlaceholder(allowed.length ? "Ouvrir une section…" : "Aucune section accessible à ton niveau")
     .setDisabled(!allowed.length)
     .addOptions(allowed.length
       ? allowed.map((s) => ({ label: s.label, value: s.id, emoji: s.emoji, description: s.desc.slice(0, 100) }))
-      : [{ label: "—", value: "none" }]);
-  components.push(new ActionRowBuilder().addComponents(menu));
+      : [{ label: "—", value: "none" }])));
 
   return { embeds: [main], components };
 }
@@ -2394,15 +2865,17 @@ async function homeView(i, config) {
 /*                            CONSTRUCTION DES VUES                           */
 /* ========================================================================== */
 
-async function buildSection(id, i, config) {
+async function buildSection(id, i, config, page = null) {
   const guild = i.guild;
   const level = permLevel(i.member, config);
   const section = SECTIONS.find((s) => s.id === id);
+
   if (id !== "home" && section) {
-    if (section.ownerOnly && !isOwner(i.user.id)) return lockedView(guild, section);
-    if (level < section.level) {
+    if (section.ownerOnly && !isOwner(i.user.id)) return denyView(guild, section, config);
+    if (section.trusted && !isTrusted(i.member, config)) return denyView(guild, section, config);
+    if (level < sectionLevel(section, config)) {
       return { embeds: [embed({ guild, color: COLORS.danger, author: { name: `${ICONS.no}  Accès refusé` },
-        description: `Cette section demande **${PERM_LABELS[section.level]}**.` })], components: [backRow()] };
+        description: `Cette section demande **${PERM_LABELS[sectionLevel(section, config)]}**.` })], components: [backRow()] };
     }
   }
 
@@ -2412,42 +2885,167 @@ async function buildSection(id, i, config) {
   if (id === "mod") {
     return {
       embeds: [embed({ guild, author: { name: `${ICONS.shield}  Modération` }, color: COLORS.primary,
-        description: "Choisis un membre pour ouvrir sa fiche : avertissement, timeout, expulsion, bannissement, Alcatraz, casier.",
+        description: "Choisis un membre pour ouvrir sa fiche complète, ou agis directement sur un salon.",
         footer: "Tu ne peux agir que sur un niveau de perm inférieur au tien" })],
       components: [
-        new ActionRowBuilder().addComponents(
-          new UserSelectMenuBuilder().setCustomId("p:mod:pick").setPlaceholder("Sélectionne un membre…")),
-        new ActionRowBuilder().addComponents(
-          btn("p:mod:purge", "Purger ce salon", ButtonStyle.Danger, "🧹"),
+        row(new UserSelectMenuBuilder().setCustomId("p:mod:pick").setPlaceholder("Sélectionne un membre…")),
+        row(
+          btn("p:mod:purge", "Purger ici", ButtonStyle.Danger, "🧹"),
+          btn("p:mod:purgeother", "Purger ailleurs", ButtonStyle.Danger, "🧹"),
+          btn("p:mod:slow", "Mode lent", ButtonStyle.Secondary, "🐌"),
+          btn("p:mod:lock", "Verrouiller ce salon", ButtonStyle.Secondary, "🔒"),
           btn("p:mod:unban", "Débannir un ID", ButtonStyle.Secondary, "♻️"),
-          btn("p:mod:lock", isLockdown(guild.id) ? "Lockdown actif" : "Verrouiller le salon", ButtonStyle.Secondary, "🔒"),
         ),
         backRow(),
       ],
     };
   }
 
+  /* -------------------------------- ÉQUIPE ------------------------------- */
+  if (id === "staff") {
+    const abs = await listAbsences(guild.id);
+    const counts = await computeCounts(guild);
+    const staffRole = config.staffRoleId ? guild.roles.cache.get(config.staffRoleId) : null;
+    return {
+      embeds: [embed({ guild, author: { name: "🗓️  Équipe" }, color: COLORS.primary,
+        fields: [
+          { name: "Membres", value: num(counts.members), inline: true },
+          { name: "Connectés", value: counts.online === null ? "n/d" : num(counts.online), inline: true },
+          { name: "En vocal", value: `${counts.voice}`, inline: true },
+          { name: "Salons", value: `${guild.channels.cache.size}`, inline: true },
+          { name: "Rôles", value: `${guild.roles.cache.size}`, inline: true },
+          { name: "Rôle staff", value: staffRole ? `${staffRole}` : "_non défini_", inline: true },
+          { name: `Absences en cours (${abs.length})`,
+            value: abs.length ? abs.map((a) => `<@${a.user_id}> — ${a.reason}${a.until ? ` · retour ${ts(a.until)}` : ""}`).join("\n").slice(0, 1000) : "_aucune_" },
+        ] })],
+      components: [row(
+        btn("p:staff:absence", "Déclarer une absence", ButtonStyle.Primary, "🛌"),
+        btn("p:staff", "Actualiser", ButtonStyle.Secondary, "🔄"),
+        btn("p:home", "Retour", ButtonStyle.Secondary, "◀️"))],
+    };
+  }
+
   /* ---------------------------- CONFIGURATION ---------------------------- */
   if (id === "config") {
     const show = (v, kind = "role") => (v ? (kind === "role" ? `<@&${v}>` : `<#${v}>`) : "_non défini_");
-    return {
-      embeds: [embed({ guild, author: { name: "⚙️  Configuration générale" }, color: COLORS.primary,
+
+    if (page === "roles") return {
+      embeds: [embed({ guild, author: { name: "⚙️  Rôles clés" }, color: COLORS.primary, fields: [
+        { name: "Rôle staff", value: show(config.staffRoleId), inline: true },
+        { name: "Rôle Alcatraz", value: show(config.jailRoleId), inline: true },
+        { name: "Autorole", value: show(config.autoroleId), inline: true },
+        { name: "Rôle de confiance", value: show(config.trustedRoleId), inline: true },
+      ], footer: "Le rôle de confiance (« Like me ») ouvre Compteurs, Économie, Niveaux et Automod" })],
+      components: [
+        row(new RoleSelectMenuBuilder().setCustomId("p:config:staff").setPlaceholder("Rôle staff (accès aux tickets)")),
+        row(new RoleSelectMenuBuilder().setCustomId("p:config:jail").setPlaceholder("Rôle Alcatraz (prison)")),
+        row(new RoleSelectMenuBuilder().setCustomId("p:config:autorole").setPlaceholder("Autorole donné à l'arrivée")),
+        row(new RoleSelectMenuBuilder().setCustomId("p:config:trusted").setPlaceholder("Rôle de confiance (« Like me »)")),
+        backRow("p:config"),
+      ],
+    };
+
+    if (page === "welcome") return {
+      embeds: [embed({ guild, author: { name: "👋  Arrivées et départs" }, color: COLORS.primary, fields: [
+        { name: "Salon d'accueil", value: show(config.welcomeChannelId, "ch"), inline: true },
+        { name: "Salon des départs", value: show(config.goodbyeChannelId, "ch"), inline: true },
+        { name: "Message d'accueil", value: `\`${config.welcomeMessage}\`` },
+        { name: "Message de départ", value: `\`${config.goodbyeMessage}\`` },
+      ], footer: "Variables : {user} {tag} {server} {count}" })],
+      components: [
+        row(new ChannelSelectMenuBuilder().setCustomId("p:config:welcome").setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon de bienvenue")),
+        row(new ChannelSelectMenuBuilder().setCustomId("p:config:goodbye").setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon des départs")),
+        row(btn("p:config:msgw", "Texte d'accueil", ButtonStyle.Primary, "✏️"),
+            btn("p:config:msgg", "Texte de départ", ButtonStyle.Primary, "✏️"),
+            btn("p:config:clearw", "Couper l'accueil", ButtonStyle.Danger, "🗑️")),
+        backRow("p:config"),
+      ],
+    };
+
+    if (page === "chans") {
+      const lines = Object.keys(FUNC_CHANNELS).map((k) => {
+        const ch = resolveFuncChannel(guild, k, config);
+        return `${ch ? "✅" : "🔴"} \`${k}\`${config.funcOverrides?.[k] ? "*" : ""} → ${ch ? `<#${ch.id}>` : "_non trouvé_"}`;
+      });
+      return {
+        embeds: [embed({ guild, author: { name: "📂  Salons fonctionnels" }, color: COLORS.primary,
+          description: lines.join("\n"), footer: "`*` = forcé manuellement. Sinon détecté par nom." })],
+        components: [
+          row(new StringSelectMenuBuilder().setCustomId("p:config:funcpick").setPlaceholder("Forcer un salon fonctionnel…")
+            .addOptions(Object.keys(FUNC_CHANNELS).map((k) => ({ label: k, value: k })))),
+          row(btn("p:config:funcreset", "Tout remettre en auto", ButtonStyle.Danger, "🔄")),
+          backRow("p:config"),
+        ],
+      };
+    }
+
+    if (page === "trap") return {
+      embeds: [embed({ guild, author: { name: "🪤  Piège vocal" }, color: COLORS.danger,
+        description: "Un salon vocal interdit : quiconque le rejoint est expulsé du vocal puis sanctionné. Le staff et le propriétaire de 0x sont exemptés.",
         fields: [
-          { name: "Rôle staff", value: show(config.staffRoleId), inline: true },
-          { name: "Rôle Alcatraz", value: show(config.jailRoleId), inline: true },
-          { name: "Autorole", value: show(config.autoroleId), inline: true },
-          { name: "Salon d'accueil", value: show(config.welcomeChannelId, "ch"), inline: true },
-          { name: "Message d'accueil", value: `\`${config.welcomeMessage}\`` },
+          { name: "Salon piégé", value: config.trapVoiceId ? `<#${config.trapVoiceId}>` : "_aucun_", inline: true },
+          { name: "Sanction", value: config.trapAction === "ban" ? "Bannissement" : config.trapAction === "kick" ? "Expulsion" : "Désactivé", inline: true },
         ] })],
       components: [
-        new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("p:config:staff").setPlaceholder("Rôle staff (accès tickets)")),
-        new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("p:config:jail").setPlaceholder("Rôle Alcatraz (prison)")),
-        new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("p:config:autorole").setPlaceholder("Autorole à l'arrivée")),
-        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:config:welcome")
-          .setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon de bienvenue")),
-        new ActionRowBuilder().addComponents(
-          btn("p:config:msg", "Message d'accueil", ButtonStyle.Primary, "✏️"),
-          btn("p:home", "Retour", ButtonStyle.Secondary, "◀️")),
+        row(new ChannelSelectMenuBuilder().setCustomId("p:config:trapch").setChannelTypes(ChannelType.GuildVoice).setPlaceholder("Salon vocal piégé")),
+        row(new StringSelectMenuBuilder().setCustomId("p:config:trapact").setPlaceholder("Que faire à celui qui entre ?")
+          .addOptions([{ label: "Désactivé", value: "off" }, { label: "Expulser du serveur", value: "kick" }, { label: "Bannir", value: "ban" }])),
+        backRow("p:config"),
+      ],
+    };
+
+    if (page === "danger") return {
+      embeds: [embed({ guild, author: { name: "🔥  Zone rouge" }, color: COLORS.danger,
+        description: "**Réinitialiser** efface tous les réglages de 0x sur ce serveur : rôles clés, perms, automod, protections, boutique, forçages de salons.\n\nLes données des membres (XP, coins, sanctions, tickets) ne sont pas touchées." })],
+      components: [row(btn("p:config:reset", "Réinitialiser la configuration", ButtonStyle.Danger, "⚠️"), btn("p:config", "Annuler", ButtonStyle.Secondary, "◀️"))],
+    };
+
+    return {
+      embeds: [embed({ guild, author: { name: "⚙️  Configuration" }, color: COLORS.primary, fields: [
+        { name: "Rôles clés", value: `${dot(config.staffRoleId)} staff · ${dot(config.jailRoleId)} Alcatraz · ${dot(config.autoroleId)} autorole`, inline: true },
+        { name: "Arrivées / départs", value: `${dot(config.welcomeChannelId)} accueil · ${dot(config.goodbyeChannelId)} départs`, inline: true },
+        { name: "Piège vocal", value: config.trapAction !== "off" && config.trapVoiceId ? `🟢 ${config.trapAction}` : "🔴 coupé", inline: true },
+      ] })],
+      components: [
+        row(btn("p:config:page:roles", "Rôles clés", ButtonStyle.Primary, "🎭"),
+            btn("p:config:page:welcome", "Arrivées / départs", ButtonStyle.Primary, "👋"),
+            btn("p:config:page:chans", "Salons fonctionnels", ButtonStyle.Primary, "📂")),
+        row(btn("p:config:page:trap", "Piège vocal", ButtonStyle.Secondary, "🪤"),
+            btn("p:config:page:danger", "Zone rouge", ButtonStyle.Danger, "🔥")),
+        backRow(),
+      ],
+    };
+  }
+
+  /* ------------------------------- JOURNAUX ------------------------------ */
+  if (id === "logs") {
+    const keys = Object.keys(LOG_ROUTES);
+    const lines = keys.map((k) => {
+      const ch = resolveLogChannel(guild, k, config);
+      return `${ch ? "✅" : "🔴"} \`${k}\`${config.logOverrides?.[k] ? "*" : ""}`;
+    });
+    const found = keys.filter((k) => resolveLogChannel(guild, k, config)).length;
+    const third = Math.ceil(lines.length / 3);
+    const half = Math.ceil(keys.length / 2);
+    return {
+      embeds: [embed({ guild, author: { name: "🗂️  Journaux" }, color: found === keys.length ? COLORS.success : COLORS.warning,
+        description: `**${found}/${keys.length}** types routés · journalisation ${onOff(config.logsEnabled)}\n\`*\` = forcé manuellement`,
+        fields: [
+          { name: "\u200b", value: lines.slice(0, third).join("\n"), inline: true },
+          { name: "\u200b", value: lines.slice(third, third * 2).join("\n"), inline: true },
+          { name: "\u200b", value: lines.slice(third * 2).join("\n"), inline: true },
+        ], footer: "Un type non trouvé est simplement ignoré — rien ne casse" })],
+      components: [
+        row(new StringSelectMenuBuilder().setCustomId("p:logs:pick").setPlaceholder("Forcer un type de journal (A → M)…")
+          .addOptions(keys.slice(0, half).map((k) => ({ label: k, value: k,
+            description: (resolveLogChannel(guild, k, config)?.name ?? "non routé").slice(0, 100) })))),
+        row(new StringSelectMenuBuilder().setCustomId("p:logs:pick2").setPlaceholder("Forcer un type de journal (M → Z)…")
+          .addOptions(keys.slice(half).map((k) => ({ label: k, value: k,
+            description: (resolveLogChannel(guild, k, config)?.name ?? "non routé").slice(0, 100) })))),
+        row(btn("p:logs:scan", "Rescanner les salons", ButtonStyle.Primary, "🔄"),
+            btn("p:logs:toggle", config.logsEnabled ? "Couper les journaux" : "Activer les journaux", config.logsEnabled ? ButtonStyle.Danger : ButtonStyle.Success),
+            btn("p:logs:reset", "Tout remettre en auto", ButtonStyle.Secondary, "♻️")),
+        backRow(),
       ],
     };
   }
@@ -2459,30 +3057,29 @@ async function buildSection(id, i, config) {
       embeds: [embed({ guild, author: { name: "🤖  Automod" }, color: a.enabled ? COLORS.success : COLORS.neutral,
         description: `État général : **${onOff(a.enabled)}**`,
         fields: [
-          { name: "Invitations Discord", value: onOff(a.antiInvite), inline: true },
-          { name: "Tous les liens", value: onOff(a.antiLink), inline: true },
-          { name: "Flood", value: a.antiSpam ? `🟢 ${a.spamThreshold} msg / ${Math.round(a.spamWindowMs / 1000)}s` : "🔴 coupé", inline: true },
+          { name: "Invitations", value: onOff(a.antiInvite), inline: true },
+          { name: "Liens", value: onOff(a.antiLink), inline: true },
+          { name: "Flood", value: a.antiSpam ? `🟢 ${a.spamThreshold}/${Math.round(a.spamWindowMs / 1000)}s → ${a.spamTimeoutMinutes}min` : "🔴 coupé", inline: true },
           { name: "Mentions max", value: a.maxMentions ? `${a.maxMentions}` : "illimité", inline: true },
           { name: "Majuscules", value: a.capsPercent ? `${a.capsPercent}%` : "coupé", inline: true },
           { name: "Émojis max", value: a.maxEmojis ? `${a.maxEmojis}` : "illimité", inline: true },
           { name: "Mots interdits", value: `${a.bannedWords.length}`, inline: true },
-          { name: "Rôles exemptés", value: a.exemptRoles.length ? a.exemptRoles.map((r) => `<@&${r}>`).join(" ") : "_aucun_" },
-          { name: "Salons ignorés", value: a.ignoredChannels.length ? a.ignoredChannels.map((c) => `<#${c}>`).join(" ") : "_aucun_" },
+          { name: "Prévenir en salon", value: onOff(a.warnOnDelete), inline: true },
+          { name: "Rôles exemptés", value: a.exemptRoles.length ? a.exemptRoles.map((r) => `<@&${r}>`).join(" ").slice(0, 1000) : "_aucun_" },
+          { name: "Salons ignorés", value: a.ignoredChannels.length ? a.ignoredChannels.map((c) => `<#${c}>`).join(" ").slice(0, 1000) : "_aucun_" },
         ] })],
       components: [
-        new ActionRowBuilder().addComponents(
+        row(
           btn("p:automod:t:enabled", "Automod", a.enabled ? ButtonStyle.Success : ButtonStyle.Danger),
           btn("p:automod:t:antiInvite", "Invitations", a.antiInvite ? ButtonStyle.Success : ButtonStyle.Danger),
           btn("p:automod:t:antiLink", "Liens", a.antiLink ? ButtonStyle.Success : ButtonStyle.Danger),
           btn("p:automod:t:antiSpam", "Flood", a.antiSpam ? ButtonStyle.Success : ButtonStyle.Danger),
+          btn("p:automod:t:warnOnDelete", "Prévenir", a.warnOnDelete ? ButtonStyle.Success : ButtonStyle.Danger),
         ),
-        new ActionRowBuilder().addComponents(
-          btn("p:automod:seuils", "Régler les seuils", ButtonStyle.Primary, "🎚️"),
-          btn("p:automod:mots", "Mots interdits", ButtonStyle.Primary, "🚫"),
-        ),
-        new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("p:automod:exempt")
-          .setPlaceholder("Ajouter/retirer un rôle exempté")),
-        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:automod:ignore")
+        row(btn("p:automod:seuils", "Régler les seuils", ButtonStyle.Primary, "🎚️"),
+            btn("p:automod:mots", "Mots interdits", ButtonStyle.Primary, "🚫")),
+        row(new RoleSelectMenuBuilder().setCustomId("p:automod:exempt").setPlaceholder("Ajouter/retirer un rôle exempté")),
+        row(new ChannelSelectMenuBuilder().setCustomId("p:automod:ignore")
           .setChannelTypes(ChannelType.GuildText, ChannelType.GuildCategory).setPlaceholder("Ajouter/retirer un salon ignoré")),
         backRow(),
       ],
@@ -2493,28 +3090,22 @@ async function buildSection(id, i, config) {
   if (id === "protect") {
     const { antiraid: ar, antinuke: an } = config;
     return {
-      embeds: [embed({ guild, author: { name: `${ICONS.alert}  Protection` }, color: COLORS.danger,
-        fields: [
-          { name: "Anti-raid", value: ar.enabled
-            ? `🟢 ${ar.joinThreshold} arrivées / ${Math.round(ar.joinWindowMs / 1000)}s\nComptes < ${ar.minAccountAgeDays}j signalés\nRéaction : **${ar.onRaid}**` : "🔴 coupé", inline: true },
-          { name: "Anti-nuke", value: an.enabled
-            ? `🟢 salons ${an.channelDeleteMax} · rôles ${an.roleDeleteMax} · bans ${an.banMax}\nFenêtre ${Math.round(an.windowMs / 1000)}s\nSanction : **${an.punishment}**` : "🔴 coupé", inline: true },
-          { name: "Lockdown", value: isLockdown(guild.id) ? "🔒 **actif**" : "🔓 inactif", inline: true },
-          { name: "Liste blanche anti-nuke", value: an.whitelist.length ? an.whitelist.map((u) => `<@${u}>`).join(" ") : "_vide_" },
-        ] })],
+      embeds: [embed({ guild, author: { name: `${ICONS.alert}  Protection` }, color: COLORS.danger, fields: [
+        { name: "Anti-raid", value: ar.enabled
+          ? `🟢 ${ar.joinThreshold} arrivées / ${Math.round(ar.joinWindowMs / 1000)}s\nComptes < ${ar.minAccountAgeDays}j signalés\nRéaction : **${ar.onRaid}** (${ar.lockdownMinutes} min)` : "🔴 coupé", inline: true },
+        { name: "Anti-nuke", value: an.enabled
+          ? `🟢 salons ${an.channelDeleteMax} · rôles ${an.roleDeleteMax}\nbans ${an.banMax} · kicks ${an.kickMax}\nFenêtre ${Math.round(an.windowMs / 1000)}s · **${an.punishment}**` : "🔴 coupé", inline: true },
+        { name: "Lockdown", value: isLockdown(guild.id) ? "🔒 **actif**" : "🔓 inactif", inline: true },
+        { name: "Liste blanche anti-nuke", value: an.whitelist.length ? an.whitelist.map((u) => `<@${u}>`).join(" ").slice(0, 1000) : "_vide_" },
+      ] })],
       components: [
-        new ActionRowBuilder().addComponents(
-          btn("p:protect:t:antiraid", "Anti-raid", ar.enabled ? ButtonStyle.Success : ButtonStyle.Danger),
-          btn("p:protect:t:antinuke", "Anti-nuke", an.enabled ? ButtonStyle.Success : ButtonStyle.Danger),
-          btn("p:protect:lock:on", "Verrouiller tout", ButtonStyle.Danger, "🔒"),
-          btn("p:protect:lock:off", "Déverrouiller", ButtonStyle.Success, "🔓"),
-        ),
-        new ActionRowBuilder().addComponents(
-          btn("p:protect:raidcfg", "Réglages anti-raid", ButtonStyle.Primary, "🎚️"),
-          btn("p:protect:nukecfg", "Réglages anti-nuke", ButtonStyle.Primary, "🎚️"),
-        ),
-        new ActionRowBuilder().addComponents(new UserSelectMenuBuilder().setCustomId("p:protect:wl")
-          .setPlaceholder("Ajouter/retirer de la liste blanche")),
+        row(btn("p:protect:t:antiraid", "Anti-raid", ar.enabled ? ButtonStyle.Success : ButtonStyle.Danger),
+            btn("p:protect:t:antinuke", "Anti-nuke", an.enabled ? ButtonStyle.Success : ButtonStyle.Danger),
+            btn("p:protect:lock:on", "Verrouiller tout", ButtonStyle.Danger, "🔒"),
+            btn("p:protect:lock:off", "Déverrouiller", ButtonStyle.Success, "🔓")),
+        row(btn("p:protect:raidcfg", "Réglages anti-raid", ButtonStyle.Primary, "🎚️"),
+            btn("p:protect:nukecfg", "Réglages anti-nuke", ButtonStyle.Primary, "🎚️")),
+        row(new UserSelectMenuBuilder().setCustomId("p:protect:wl").setPlaceholder("Ajouter/retirer de la liste blanche")),
         backRow(),
       ],
     };
@@ -2522,6 +3113,20 @@ async function buildSection(id, i, config) {
 
   /* ----------------------------- PERMISSIONS ----------------------------- */
   if (id === "perms") {
+    if (page === "sections") {
+      return {
+        embeds: [embed({ guild, author: { name: "🔐  Niveau requis par section" }, color: COLORS.gold,
+          description: SECTIONS.map((s) => `${s.emoji} **${s.label}** — ${PERM_LABELS[sectionLevel(s, config)]}${config.perms.sections?.[s.id] !== undefined ? " *" : ""}${s.ownerOnly ? " 🔒" : ""}`).join("\n"),
+          footer: "🔒 = propriétaire uniquement, quel que soit le niveau · * = modifié" })],
+        components: [
+          row(new StringSelectMenuBuilder().setCustomId("p:perms:secpick").setPlaceholder("Changer le niveau d'une section…")
+            .addOptions(SECTIONS.map((s) => ({ label: s.label, value: s.id, emoji: s.emoji,
+              description: PERM_LABELS[sectionLevel(s, config)].slice(0, 100) })))),
+          row(btn("p:perms:secreset", "Remettre les niveaux d'origine", ButtonStyle.Danger, "♻️")),
+          backRow("p:perms"),
+        ],
+      };
+    }
     const byLevel = {};
     for (const [rid, lvl] of Object.entries(config.perms.roles)) {
       const role = guild.roles.cache.get(rid);
@@ -2531,17 +3136,15 @@ async function buildSection(id, i, config) {
       embeds: [embed({ guild, author: { name: `${ICONS.shield}  Permissions` }, color: COLORS.gold,
         description: [6, 5, 4, 3, 2, 1].map((l) => `**${PERM_LABELS[l]}**\n${byLevel[l]?.join(" ") ?? "_aucun rôle_"}`).join("\n\n"),
         fields: Object.keys(config.perms.users).length
-          ? [{ name: "Forçages individuels", value: Object.entries(config.perms.users).map(([u, l]) => `\`${l}\` <@${u}>`).join("\n").slice(0, 1000) }]
-          : [],
-        footer: "Le propriétaire du serveur est toujours niveau 6" })],
+          ? [{ name: "Forçages individuels", value: Object.entries(config.perms.users).map(([u, l]) => `\`${l}\` <@${u}>`).join("\n").slice(0, 1000) }] : [],
+        footer: "Le propriétaire du serveur est niveau 6 · celui de 0x est niveau 7" })],
       components: [
-        new ActionRowBuilder().addComponents(
-          btn("p:perms:auto", "Détection automatique", ButtonStyle.Primary, "🪄"),
-          btn("p:perms:cmds", "Niveau des commandes", ButtonStyle.Secondary, "📋"),
-          btn("p:perms:reset", "Réinitialiser", ButtonStyle.Danger, "🗑️"),
-        ),
-        new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("p:perms:role").setPlaceholder("Choisir un rôle à classer")),
-        new ActionRowBuilder().addComponents(new UserSelectMenuBuilder().setCustomId("p:perms:user").setPlaceholder("Forcer le niveau d'une personne")),
+        row(btn("p:perms:auto", "Détection automatique", ButtonStyle.Primary, "🪄"),
+            btn("p:perms:page:sections", "Niveau des sections", ButtonStyle.Secondary, "📋"),
+            btn("p:perms:reset", "Réinitialiser", ButtonStyle.Danger, "🗑️")),
+        row(new RoleSelectMenuBuilder().setCustomId("p:perms:role").setPlaceholder("Classer un rôle…")),
+        row(new RoleSelectMenuBuilder().setCustomId("p:perms:preview").setPlaceholder("Voir ce qu'un rôle peut ouvrir…")),
+        row(new UserSelectMenuBuilder().setCustomId("p:perms:user").setPlaceholder("Forcer le niveau d'une personne…")),
         backRow(),
       ],
     };
@@ -2550,22 +3153,20 @@ async function buildSection(id, i, config) {
   /* -------------------------------- TICKETS ------------------------------ */
   if (id === "tickets") {
     const s = await ticketStats(guild.id);
-    const cats = TICKET_TYPES.map((t) => `${findCategory(guild, t.categories) ? "✅" : "🔴"} ${t.emoji} ${t.label}`);
     return {
       embeds: [embed({ guild, author: { name: `${ICONS.ticket}  Tickets` }, color: COLORS.primary,
-        description: cats.join("\n"),
+        description: TICKET_TYPES.map((t) => `${findCategory(guild, t.categories) ? "✅" : "🔴"} ${t.emoji} ${t.label}`).join("\n"),
         fields: [
           { name: "Ouverts", value: `${s.open}`, inline: true },
           { name: "7 jours", value: `${s.week}`, inline: true },
           { name: "Total", value: `${s.total}`, inline: true },
-          { name: "Rôle staff", value: config.staffRoleId ? `<@&${config.staffRoleId}>` : "_non défini — à faire dans Configuration_" },
+          { name: "Rôle staff", value: config.staffRoleId ? `<@&${config.staffRoleId}>` : "_à définir dans Configuration_" },
         ] })],
       components: [
-        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:tickets:publish")
-          .setChannelTypes(ChannelType.GuildText).setPlaceholder("Publier le panneau de tickets dans…")),
-        new ActionRowBuilder().addComponents(
-          btn("p:tickets:refresh", "Actualiser le compteur", ButtonStyle.Primary, "🔄"),
-          btn("p:home", "Retour", ButtonStyle.Secondary, "◀️")),
+        row(new ChannelSelectMenuBuilder().setCustomId("p:tickets:publish").setChannelTypes(ChannelType.GuildText)
+          .setPlaceholder("Publier le panneau de tickets dans…")),
+        row(btn("p:tickets:refresh", "Actualiser le compteur", ButtonStyle.Primary, "🔄"),
+            btn("p:home", "Retour", ButtonStyle.Secondary, "◀️")),
       ],
     };
   }
@@ -2576,80 +3177,76 @@ async function buildSection(id, i, config) {
     const labels = { members: "Membres (bots exclus)", online: "Connectés", voice: "En vocal" };
     return {
       embeds: [embed({ guild, author: { name: "📊  Compteurs vocaux" }, color: COLORS.primary,
-        description: report.map((r) => {
-          const good = ["mis à jour", "à jour", "inchangé"].includes(r.status);
-          return `${good ? "✅" : "⚠️"} **${labels[r.key]}** — ${r.value ?? "—"}\n └ _${r.status}_`;
-        }).join("\n"),
+        description: report.map((r) => `${["mis à jour", "à jour", "inchangé"].includes(r.status) ? "✅" : "⚠️"} **${labels[r.key]}** — ${r.value ?? "—"}\n └ _${r.status}_`).join("\n"),
         fields: [
           { name: "Cache membres", value: `${num(guild.members.cache.size)} / ${num(guild.memberCount)}`, inline: true },
           { name: "États vocaux", value: `${guild.voiceStates.cache.size}`, inline: true },
           { name: "Presence", value: counts.online === null ? "🔴 intent manquant" : "🟢 disponible", inline: true },
-        ],
-        footer: "Discord limite les renommages à 2 par 10 min et par salon" })],
+        ], footer: "Discord limite les renommages à 2 par 10 min et par salon" })],
       components: [
-        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:counters:set:members")
-          .setChannelTypes(ChannelType.GuildVoice).setPlaceholder("Salon du compteur Membres")),
-        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:counters:set:online")
-          .setChannelTypes(ChannelType.GuildVoice).setPlaceholder("Salon du compteur Connectés")),
-        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:counters:set:voice")
-          .setChannelTypes(ChannelType.GuildVoice).setPlaceholder("Salon du compteur Vocal")),
-        new ActionRowBuilder().addComponents(
-          btn("p:counters:force", "Forcer la mise à jour", ButtonStyle.Primary, "🔄"),
-          btn("p:home", "Retour", ButtonStyle.Secondary, "◀️")),
+        row(new ChannelSelectMenuBuilder().setCustomId("p:counters:set:members").setChannelTypes(ChannelType.GuildVoice).setPlaceholder("Salon du compteur Membres")),
+        row(new ChannelSelectMenuBuilder().setCustomId("p:counters:set:online").setChannelTypes(ChannelType.GuildVoice).setPlaceholder("Salon du compteur Connectés")),
+        row(new ChannelSelectMenuBuilder().setCustomId("p:counters:set:voice").setChannelTypes(ChannelType.GuildVoice).setPlaceholder("Salon du compteur Vocal")),
+        row(btn("p:counters:force", "Forcer la mise à jour", ButtonStyle.Primary, "🔄"),
+            btn("p:counters:clear", "Tout délier", ButtonStyle.Danger, "🔗"),
+            btn("p:home", "Retour", ButtonStyle.Secondary, "◀️")),
       ],
     };
   }
 
   /* -------------------------------- NIVEAUX ------------------------------ */
   if (id === "levels") {
-    const rewards = Object.entries(config.levelRewards).sort((a, b) => a[0] - b[0])
-      .map(([lvl, rid]) => `Niveau **${lvl}** → <@&${rid}>`);
+    const rewards = Object.entries(config.levelRewards).sort((a, b) => a[0] - b[0]);
+    const comps = [
+      row(btn("p:levels:t", config.levelsEnabled ? "Couper les niveaux" : "Activer les niveaux",
+        config.levelsEnabled ? ButtonStyle.Danger : ButtonStyle.Success),
+        btn("p:home", "Retour", ButtonStyle.Secondary, "◀️")),
+      row(new RoleSelectMenuBuilder().setCustomId("p:levels:reward").setPlaceholder("Ajouter une récompense : choisis le rôle…")),
+      row(new ChannelSelectMenuBuilder().setCustomId("p:levels:channel").setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon des annonces de niveau")),
+    ];
+    if (rewards.length) comps.push(row(new StringSelectMenuBuilder().setCustomId("p:levels:delreward")
+      .setPlaceholder("Retirer une récompense…")
+      .addOptions(rewards.slice(0, 25).map(([lvl, rid]) => ({ label: `Niveau ${lvl}`, value: String(lvl),
+        description: (guild.roles.cache.get(rid)?.name ?? rid).slice(0, 100) })))));
     return {
       embeds: [embed({ guild, author: { name: `${ICONS.level}  Niveaux` }, color: COLORS.primary,
         description: `Système d'XP : **${onOff(config.levelsEnabled)}**\nAnnonces : ${resolveFuncChannel(guild, "levelUp", config) ?? "_salon du message_"}`,
-        fields: [{ name: "Récompenses", value: rewards.length ? rewards.join("\n") : "_aucune_" }] })],
-      components: [
-        new ActionRowBuilder().addComponents(
-          btn("p:levels:t", config.levelsEnabled ? "Couper les niveaux" : "Activer les niveaux",
-            config.levelsEnabled ? ButtonStyle.Danger : ButtonStyle.Success),
-          btn("p:home", "Retour", ButtonStyle.Secondary, "◀️")),
-        new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("p:levels:reward")
-          .setPlaceholder("Rôle à offrir à un niveau…")),
-        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:levels:channel")
-          .setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon des annonces de niveau")),
-      ],
+        fields: [{ name: "Récompenses", value: rewards.length ? rewards.map(([l, r]) => `Niveau **${l}** → <@&${r}>`).join("\n") : "_aucune_" }],
+        footer: "15 à 25 XP par message, une fois par minute" })],
+      components: comps,
     };
   }
 
   /* -------------------------------- ÉCONOMIE ----------------------------- */
   if (id === "eco") {
     const e = config.economy;
-    const items = e.shop.map((x) => `**${x.name}** — ${e.currency} ${num(x.price)} → <@&${x.roleId}>${x.stock != null ? ` · stock ${x.stock}` : ""}`);
     const comps = [
-      new ActionRowBuilder().addComponents(
-        btn("p:eco:t", e.enabled ? "Couper l'économie" : "Activer l'économie", e.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
+      row(btn("p:eco:t", e.enabled ? "Couper l'économie" : "Activer l'économie", e.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
         btn("p:eco:montants", "Montants", ButtonStyle.Primary, "🎚️"),
-        btn("p:eco:drop", "Lâcher un colis", ButtonStyle.Primary, "📦"),
-      ),
-      new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("p:eco:additem")
-        .setPlaceholder("Ajouter un article : choisis le rôle offert")),
-      new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:eco:dropch")
-        .setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon des colis automatiques")),
+        btn("p:eco:drop", "Lâcher un colis", ButtonStyle.Primary, "📦")),
+      row(new StringSelectMenuBuilder().setCustomId("p:eco:addtype").setPlaceholder("Ajouter un article : quel type ?")
+        .addOptions(Object.entries(ITEM_TYPES).map(([k, v]) => ({ label: v.label, value: k, emoji: v.emoji, description: v.desc.slice(0, 100) })))),
+      row(new ChannelSelectMenuBuilder().setCustomId("p:eco:dropch").setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon des colis automatiques")),
     ];
-    if (e.shop.length) {
-      comps.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId("p:eco:del")
-        .setPlaceholder("Retirer un article de la boutique")
-        .addOptions(e.shop.slice(0, 25).map((x) => ({ label: x.name.slice(0, 100), value: x.id, description: `${num(x.price)} coins` })))));
-    }
+    if (e.shop.length) comps.push(row(new StringSelectMenuBuilder().setCustomId("p:eco:del")
+      .setPlaceholder("Retirer un article…")
+      .addOptions(e.shop.slice(0, 25).map((x) => ({ label: x.name.slice(0, 100), value: x.id,
+        emoji: ITEM_TYPES[x.type ?? "role"]?.emoji, description: `${num(x.price)} coins` })))));
     comps.push(backRow());
     return {
       embeds: [embed({ guild, author: { name: `${ICONS.coin}  Économie` }, color: COLORS.gold,
         description: `État : **${onOff(e.enabled)}** · monnaie ${e.currency}`,
         fields: [
           { name: "Quotidien", value: num(e.dailyAmount), inline: true },
-          { name: "Travail", value: `${num(e.workMin)} – ${num(e.workMax)}`, inline: true },
-          { name: "Colis", value: e.dropChannelId ? `<#${e.dropChannelId}> · ${e.dropChance}%` : "_manuel_", inline: true },
-          { name: "Boutique", value: items.length ? items.join("\n") : "_vide_" },
+          { name: "Travail", value: `${num(e.workMin)}–${num(e.workMax)} / ${Math.round(e.workCooldownMs / 60000)}min`, inline: true },
+          { name: "Colis", value: e.dropChannelId ? `<#${e.dropChannelId}> · ${e.dropChance}% · ${num(e.dropMin)}–${num(e.dropMax)}` : "_manuel_", inline: true },
+          { name: `Boutique (${e.shop.length})`, value: e.shop.length ? e.shop.map((x) => {
+            const ty = ITEM_TYPES[x.type ?? "role"];
+            const what = (x.type ?? "role") === "role" ? ` → <@&${x.roleId}>`
+              : x.type === "xp" ? ` → ${num(x.amount ?? 0)} XP`
+              : x.type === "multiplier" ? ` → ×${x.amount ?? 2} pendant ${x.hours ?? 24}h` : "";
+            return `${ty?.emoji ?? ""} **${x.name}** — ${e.currency} ${num(x.price)}${what}${x.stock != null ? ` · stock ${x.stock}` : ""}`;
+          }).join("\n").slice(0, 1000) : "_vide — ajoute des articles ci-dessous_" },
         ] })],
       components: comps,
     };
@@ -2658,20 +3255,59 @@ async function buildSection(id, i, config) {
   /* ------------------------------- GIVEAWAYS ----------------------------- */
   if (id === "gw") {
     const active = await listActiveGiveaways(guild.id);
-    const comps = [new ActionRowBuilder().addComponents(
-      btn("p:gw:new", "Lancer un giveaway", ButtonStyle.Success, "🎁"),
+    const comps = [row(btn("p:gw:new", "Lancer un giveaway", ButtonStyle.Success, "🎁"),
       btn("p:home", "Retour", ButtonStyle.Secondary, "◀️"))];
-    if (active.length) {
-      comps.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId("p:gw:pick")
-        .setPlaceholder("Agir sur un giveaway en cours")
-        .addOptions(active.slice(0, 25).map((g) => ({ label: g.prize.slice(0, 100), value: String(g.id), description: `fin ${new Date(g.ends_at).toLocaleString("fr-FR")}` })))));
-    }
+    if (active.length) comps.push(row(new StringSelectMenuBuilder().setCustomId("p:gw:pick")
+      .setPlaceholder("Agir sur un giveaway en cours…")
+      .addOptions(active.slice(0, 25).map((g) => ({ label: g.prize.slice(0, 100), value: String(g.id),
+        description: `fin ${new Date(g.ends_at).toLocaleString("fr-FR")}`.slice(0, 100) })))));
     return {
       embeds: [embed({ guild, author: { name: `${ICONS.gift}  Giveaways` }, color: COLORS.gold,
         description: active.length
-          ? active.map((g) => `\`#${g.id}\` **${g.prize}** — ${g.winners} gagnant(s), fin ${ts(g.ends_at)}`).join("\n")
-          : "_Aucun giveaway en cours._",
-        footer: "Le giveaway est publié dans le salon où tu as ouvert le panneau" })],
+          ? active.map((g) => `\`#${g.id}\` **${g.prize}** — ${g.winners} gagnant(s), <#${g.channel_id}>, fin ${ts(g.ends_at)}${g.required_role ? ` · <@&${g.required_role}>` : ""}`).join("\n")
+          : "_Aucun giveaway en cours._" })],
+      components: comps,
+    };
+  }
+
+  /* ------------------------------ INVITATIONS ---------------------------- */
+  if (id === "invites") {
+    const top = (await topInviters(guild.id, 25))
+      .map((x) => ({ ...x, active: withBaseline(config, x.userId, x.active), total: withBaseline(config, x.userId, x.total) }))
+      .sort((a, b) => b.active - a.active).slice(0, 10);
+    const inv = config.invites ?? {};
+    const medals = ["🥇", "🥈", "🥉"];
+    const chan = inv.channelId ? `<#${inv.channelId}>` : (resolveFuncChannel(guild, "invites", config) ?? "_aucun_");
+    const trusted = isTrusted(i.member, config);
+
+    const comps = [row(
+      btn("p:invites:who", "Qui a invité qui ?", ButtonStyle.Primary, "🔍"),
+      btn("p:invites:me", "Mes invitations", ButtonStyle.Secondary, "👤"),
+      btn("p:invites", "Actualiser", ButtonStyle.Secondary, "🔄"),
+    )];
+    if (trusted) {
+      comps.push(row(
+        btn("p:invites:t", inv.enabled ? "Couper le suivi" : "Activer le suivi", inv.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
+        btn("p:invites:delay", "Délai de suppression", ButtonStyle.Primary, "⏱️"),
+        btn("p:invites:recal", "Recaler sur les liens Discord", ButtonStyle.Primary, "🎯"),
+        btn("p:invites:reset", "Remettre le classement à zéro", ButtonStyle.Danger, "🗑️"),
+      ));
+      comps.push(row(new ChannelSelectMenuBuilder().setCustomId("p:invites:chan")
+        .setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon des annonces d'invitation")));
+    }
+    comps.push(backRow());
+
+    return {
+      embeds: [embed({ guild, author: { name: "🔗  Invitations" }, color: COLORS.primary,
+        description: top.length
+          ? top.map((x, n) => `${medals[n] ?? `**${n + 1}.**`} <@${x.userId}> — **${x.active}** actif(s)${x.total !== x.active ? ` · ${x.total} au total` : ""}`).join("\n")
+          : "_Personne n'a encore d'invitation enregistrée._",
+        fields: [
+          { name: "Suivi", value: onOff(inv.enabled), inline: true },
+          { name: "Salon d'annonce", value: String(chan), inline: true },
+          { name: "Suppression après", value: `${Math.round((inv.deleteAfterMs ?? 120000) / 60000)} min`, inline: true },
+        ],
+        footer: "Un invité qui quitte le serveur ne compte plus" })],
       components: comps,
     };
   }
@@ -2680,446 +3316,23 @@ async function buildSection(id, i, config) {
   if (id === "publish") {
     return {
       embeds: [embed({ guild, author: { name: "📢  Publications" }, color: COLORS.primary,
-        description: [
-          "**Panneau membres** — boutons Niveau, Solde, Daily, Travail, Classement, Boutique",
-          "**Panneau tickets** — menu d'ouverture de ticket",
-          "**Panneau confession** — bouton de confession anonyme",
-          "**Menu de rôles** — rôles à cocher",
-          "",
-          "Choisis quoi publier, puis le salon.",
-        ].join("\n") })],
+        description: ["**Espace membre** — niveau, solde, quotidien, travail, classements, boutique",
+          "**Tickets** — menu des 6 catégories", "**Confessions** — bouton anonyme",
+          "**Menu de rôles** — rôles à cocher", "", "Chaque publication demande ensuite le salon cible."].join("\n") })],
       components: [
-        new ActionRowBuilder().addComponents(
-          btn("p:setup:publish", "Tout publier automatiquement", ButtonStyle.Success, "⚡"),
-        ),
-        new ActionRowBuilder().addComponents(
-          btn("p:publish:pick:member", "Panneau membres", ButtonStyle.Primary, "🧭"),
-          btn("p:publish:pick:ticket", "Panneau tickets", ButtonStyle.Primary, "🎫"),
-          btn("p:publish:pick:confess", "Confessions", ButtonStyle.Primary, "🕵️"),
-        ),
-        new ActionRowBuilder().addComponents(
-          btn("p:publish:roles", "Menu de rôles", ButtonStyle.Secondary, "🎭"),
-          btn("p:publish:say", "Annonce", ButtonStyle.Secondary, "📣"),
-          btn("p:publish:poll", "Sondage", ButtonStyle.Secondary, "📊"),
-        ),
+        row(btn("p:setup:publish", "Tout publier automatiquement", ButtonStyle.Success, "⚡")),
+        row(btn("p:publish:pick:member", "Espace membre", ButtonStyle.Primary, "🧭"),
+            btn("p:publish:pick:ticket", "Tickets", ButtonStyle.Primary, "🎫"),
+            btn("p:publish:pick:confess", "Confessions", ButtonStyle.Primary, "🕵️")),
+        row(btn("p:publish:pick:roles", "Menu de rôles", ButtonStyle.Secondary, "🎭"),
+            btn("p:publish:pick:say", "Annonce", ButtonStyle.Secondary, "📣"),
+            btn("p:publish:pick:poll", "Sondage", ButtonStyle.Secondary, "📊")),
         backRow(),
       ],
     };
   }
 
   return homeView(i, config);
-}
-
-/* ========================================================================== */
-/*                                  MODALES                                   */
-/* ========================================================================== */
-
-function modal(id, title, fields) {
-  const m = new ModalBuilder().setCustomId(id).setTitle(title.slice(0, 45));
-  for (const f of fields) {
-    const input = new TextInputBuilder()
-      .setCustomId(f.id).setLabel(f.label.slice(0, 45))
-      .setStyle(f.long ? TextInputStyle.Paragraph : TextInputStyle.Short)
-      .setRequired(f.required ?? false);
-    if (f.value) input.setValue(String(f.value).slice(0, 4000));
-    if (f.placeholder) input.setPlaceholder(f.placeholder.slice(0, 100));
-    if (f.max) input.setMaxLength(f.max);
-    m.addComponents(new ActionRowBuilder().addComponents(input));
-  }
-  return m;
-}
-
-const REASON = { id: "reason", label: "Raison", required: true, max: 400 };
-const DURATION = { id: "duration", label: "Durée (30s, 10m, 2h, 7d)", placeholder: "vide = indéterminée", max: 12 };
-
-/* ========================================================================== */
-/*                                  ROUTEUR                                   */
-/* ========================================================================== */
-
-async function handlePanel(i) {
-  const id = i.customId;
-  if (!id.startsWith("p:") && !id.startsWith("pm:") && !id.startsWith("pub:")) return false;
-
-  const config = await getConfig(i.guildId);
-  const level = permLevel(i.member, config);
-  const parts = id.split(":");
-
-  /* ---------------------------- PANNEAUX PUBLICS -------------------------- */
-  if (parts[0] === "pub") return handlePublic(i, parts, config);
-
-  /* -------------------------------- MODALES ------------------------------- */
-  if (parts[0] === "pm") return handleModal(i, parts, config, level);
-
-  /* ------------------------------ NAVIGATION ------------------------------ */
-  if (id === "p:home") return respond(i, await buildSection("home", i, config));
-  if (id === "p:go") return respond(i, await buildSection(i.values[0], i, config));
-
-  // Installation automatique et interrupteurs : propriétaire uniquement
-  if (parts[1] === "setup" || parts[1] === "sw") {
-    if (!isOwner(i.user.id)) {
-      return respond(i, { embeds: [embed({ guild: i.guild, color: COLORS.danger,
-        author: { name: "🔒  Verrouillé" },
-        description: `Seul <@${OWNER_ID}> peut modifier la configuration de 0x.` })], components: [backRow()] });
-    }
-
-    if (parts[1] === "sw") {
-      const key = parts[2];
-      if (key === "logs") await updateConfig(i.guildId, { logsEnabled: !config.logsEnabled });
-      else if (key === "levels") await updateConfig(i.guildId, { levelsEnabled: !config.levelsEnabled });
-      else await updateConfig(i.guildId, { [key]: { enabled: !config[key].enabled } });
-      return respond(i, await buildSection("home", i, await getConfig(i.guildId)));
-    }
-
-    if (parts[2] === "run") {
-      await i.deferUpdate();
-      const result = await autoSetup(i.guild, i.user);
-      const view = await buildSection("home", i, await getConfig(i.guildId));
-      return respond(i, { embeds: [setupReport(i.guild, result)], components: view.components });
-    }
-
-    if (parts[2] === "publish") {
-      await i.deferUpdate();
-      const done = await publishAll(i.guild);
-      return feedback(i, done.length
-        ? { ok: true, title: `${done.length} panneau(x) publié(s)`, text: done.join("\n") }
-        : { ok: false, title: "Rien publié", text: "Aucun salon cible trouvé. Passe par Publications pour choisir toi-même.", color: COLORS.warning });
-    }
-
-    if (parts[2] === "defaults") {
-      await updateConfig(i.guildId, structuredClone(RECOMMENDED));
-      return feedback(i, { ok: true, title: "Réglages recommandés appliqués",
-        text: "Automod, anti-raid, anti-nuke, journaux, niveaux et économie sont calibrés pour un serveur de ta taille." });
-    }
-  }
-
-  const section = parts[1];
-  const action = parts[2];
-  const arg = parts[3];
-  const sec = SECTIONS.find((s) => s.id === section);
-  if (sec?.ownerOnly && !isOwner(i.user.id)) return respond(i, lockedView(i.guild, sec));
-  if (level < (sec?.level ?? 6)) {
-    return respond(i, { embeds: [embed({ guild: i.guild, color: COLORS.danger,
-      author: { name: `${ICONS.no}  Accès refusé` }, description: `Cette section demande **${PERM_LABELS[sec?.level ?? 6]}**.` })],
-      components: [backRow()] });
-  }
-
-  /* ------------------------------ MODÉRATION ------------------------------ */
-  if (section === "mod") {
-    if (action === "pick") return showMemberCard(i, i.values[0], config);
-    if (action === "card") return showMemberCard(i, arg, config);
-
-    if (action === "purge") return i.showModal(modal("pm:mod:purge", "Purger le salon",
-      [{ id: "amount", label: "Nombre de messages (1-100)", required: true, max: 3 },
-       { id: "user", label: "Limiter à un identifiant (optionnel)", max: 25 }]));
-
-    if (action === "unban") return i.showModal(modal("pm:mod:unban", "Débannir",
-      [{ id: "userid", label: "Identifiant de l'utilisateur", required: true, max: 25 }, REASON]));
-
-    if (action === "lock") {
-      const locked = i.channel.permissionOverwrites.cache.get(i.guild.id)?.deny.has(PermissionFlagsBits.SendMessages);
-      await i.channel.permissionOverwrites.edit(i.guild.roles.everyone, { SendMessages: locked ? null : false });
-      return feedback(i, { ok: true, title: locked ? "Salon déverrouillé" : "Salon verrouillé",
-        text: `${i.channel} — ${locked ? "les membres peuvent réécrire" : "plus personne ne peut écrire"}.`,
-        color: locked ? COLORS.success : COLORS.danger }, "mod");
-    }
-
-    const target = await i.guild.members.fetch(arg).catch(() => null);
-    if (["warn", "timeout", "kick", "ban", "jail", "free", "untimeout", "coins", "clear"].includes(action)) {
-      if (!target) return feedback(i, { ok: false, title: "Introuvable", text: "Ce membre a quitté le serveur.", color: COLORS.danger }, "mod");
-      const problem = checkTarget(i.guild, i.member, target, config);
-      if (problem && !["free", "untimeout"].includes(action))
-        return feedback(i, { ok: false, title: "Action refusée", text: problem, color: COLORS.danger }, "mod");
-    }
-
-    const gate = { warn: 1, timeout: 2, untimeout: 2, kick: 2, ban: 3, jail: 2, free: 2, clear: 4, coins: 4, hist: 1 };
-    if (level < (gate[action] ?? 6))
-      return feedback(i, { ok: false, title: "Niveau insuffisant", text: `Cette action demande **${PERM_LABELS[gate[action]]}**.`, color: COLORS.danger }, "mod");
-
-    if (action === "warn") return i.showModal(modal(`pm:mod:warn:${arg}`, "Avertir", [REASON]));
-    if (action === "timeout") return i.showModal(modal(`pm:mod:timeout:${arg}`, "Réduire au silence",
-      [{ ...DURATION, required: true, placeholder: "10m" }, REASON]));
-    if (action === "kick") return i.showModal(modal(`pm:mod:kick:${arg}`, "Expulser", [REASON]));
-    if (action === "ban") return i.showModal(modal(`pm:mod:ban:${arg}`, "Bannir",
-      [REASON, { id: "purge", label: "Purger ses messages (0-7 jours)", placeholder: "0", max: 1 }]));
-    if (action === "jail") return i.showModal(modal(`pm:mod:jail:${arg}`, "Envoyer en Alcatraz", [REASON, DURATION]));
-    if (action === "coins") return i.showModal(modal(`pm:mod:coins:${arg}`, "Ajuster les coins",
-      [{ id: "amount", label: "Montant (négatif pour retirer)", required: true, max: 10 }, { id: "reason", label: "Raison", max: 200 }]));
-
-    if (action === "untimeout") return feedback(i, await actionUntimeout(i.guild, target, i.user), "mod");
-    if (action === "free") return feedback(i, await actionFree(i.guild, target, i.user), "mod");
-    if (action === "clear") return feedback(i, await actionClearSanctions(i.guild, target), "mod");
-    if (action === "hist") {
-      const h = await actionHistory(i.guild, await i.guild.members.fetch(arg).catch(() => null) ?? { id: arg, user: { tag: arg } });
-      return respond(i, { embeds: [embed({ guild: i.guild, color: h.color, author: { name: `📋  ${h.title}` }, description: h.text })],
-        components: [new ActionRowBuilder().addComponents(btn(`p:mod:card:${arg}`, "Retour à la fiche", ButtonStyle.Secondary, "◀️"))] });
-    }
-  }
-
-  /* ---------------------------- CONFIGURATION ----------------------------- */
-  if (section === "config") {
-    if (action === "staff") { await updateConfig(i.guildId, { staffRoleId: i.values[0] }); return feedback(i, { ok: true, title: "Rôle staff défini", text: `<@&${i.values[0]}> a désormais accès aux tickets.` }, "config"); }
-    if (action === "jail") { await updateConfig(i.guildId, { jailRoleId: i.values[0] }); return feedback(i, { ok: true, title: "Rôle Alcatraz défini", text: `<@&${i.values[0]}> sera le rôle de prison.` }, "config"); }
-    if (action === "autorole") {
-      const role = i.guild.roles.cache.get(i.values[0]);
-      if (role.position >= i.guild.members.me.roles.highest.position)
-        return feedback(i, { ok: false, title: "Rôle trop haut", text: "Ce rôle est au-dessus du mien, je ne pourrai pas l'attribuer.", color: COLORS.danger }, "config");
-      await updateConfig(i.guildId, { autoroleId: role.id });
-      return feedback(i, { ok: true, title: "Autorole défini", text: `${role} sera donné à chaque arrivée.` }, "config");
-    }
-    if (action === "welcome") { await updateConfig(i.guildId, { welcomeChannelId: i.values[0] }); return feedback(i, { ok: true, title: "Salon d'accueil défini", text: `<#${i.values[0]}>` }, "config"); }
-    if (action === "msg") return i.showModal(modal("pm:config:msg", "Message d'accueil",
-      [{ id: "text", label: "Variables : {user} {tag} {server} {count}", required: true, long: true, value: config.welcomeMessage, max: 500 }]));
-  }
-
-  /* -------------------------------- AUTOMOD ------------------------------- */
-  if (section === "automod") {
-    if (action === "t") {
-      const v = !config.automod[arg];
-      await updateConfig(i.guildId, { automod: { [arg]: v } });
-      return respond(i, await buildSection("automod", i, await getConfig(i.guildId)));
-    }
-    if (action === "seuils") {
-      const a = config.automod;
-      return i.showModal(modal("pm:automod:seuils", "Seuils de l'automod", [
-        { id: "spam", label: "Flood : messages / secondes", value: `${a.spamThreshold}/${Math.round(a.spamWindowMs / 1000)}`, max: 8 },
-        { id: "mentions", label: "Mentions max (0 = illimité)", value: `${a.maxMentions}`, max: 3 },
-        { id: "caps", label: "Majuscules % (0 = coupé)", value: `${a.capsPercent}`, max: 3 },
-        { id: "emojis", label: "Émojis max (0 = illimité)", value: `${a.maxEmojis}`, max: 3 },
-      ]));
-    }
-    if (action === "mots") return i.showModal(modal("pm:automod:mots", "Mots interdits",
-      [{ id: "words", label: "Séparés par des virgules", long: true, value: config.automod.bannedWords.join(", "), max: 2000 }]));
-    if (action === "exempt" || action === "ignore") {
-      const key = action === "exempt" ? "exemptRoles" : "ignoredChannels";
-      const list = [...config.automod[key]];
-      const v = i.values[0];
-      const idx = list.indexOf(v);
-      idx === -1 ? list.push(v) : list.splice(idx, 1);
-      await updateConfig(i.guildId, { automod: { [key]: list } });
-      return respond(i, await buildSection("automod", i, await getConfig(i.guildId)));
-    }
-  }
-
-  /* ------------------------------ PROTECTION ------------------------------ */
-  if (section === "protect") {
-    if (action === "t") {
-      const v = !config[arg].enabled;
-      await updateConfig(i.guildId, { [arg]: { enabled: v } });
-      return respond(i, await buildSection("protect", i, await getConfig(i.guildId)));
-    }
-    if (action === "lock") {
-      const on = arg === "on";
-      await i.deferUpdate();
-      const n = await lockAllChannels(i.guild, on, `Panneau — ${i.user.tag}`);
-      on ? setLockdown(i.guildId, 60) : clearLockdown(i.guildId);
-      await log(i.guild, "raid", embed({ guild: i.guild, color: on ? COLORS.danger : COLORS.success,
-        author: { name: on ? "🔒  Lockdown activé" : "🔓  Lockdown levé" },
-        fields: [{ name: "Par", value: i.user.tag, inline: true }, { name: "Salons", value: `${n}`, inline: true }] }));
-      return feedback(i, { ok: true, title: on ? "Serveur verrouillé" : "Serveur déverrouillé", text: `${n} salon(s) traité(s).`,
-        color: on ? COLORS.danger : COLORS.success }, "protect");
-    }
-    if (action === "raidcfg") {
-      const ar = config.antiraid;
-      return i.showModal(modal("pm:protect:raid", "Réglages anti-raid", [
-        { id: "threshold", label: "Arrivées déclenchant l'alerte", value: `${ar.joinThreshold}`, max: 3 },
-        { id: "window", label: "Fenêtre (secondes)", value: `${Math.round(ar.joinWindowMs / 1000)}`, max: 4 },
-        { id: "age", label: "Âge minimum du compte (jours, 0=off)", value: `${ar.minAccountAgeDays}`, max: 3 },
-        { id: "mode", label: "Réaction : lockdown / kick / off", value: ar.onRaid, max: 10 },
-      ]));
-    }
-    if (action === "nukecfg") {
-      const an = config.antinuke;
-      return i.showModal(modal("pm:protect:nuke", "Réglages anti-nuke", [
-        { id: "chan", label: "Suppressions de salons max", value: `${an.channelDeleteMax}`, max: 3 },
-        { id: "role", label: "Suppressions de rôles max", value: `${an.roleDeleteMax}`, max: 3 },
-        { id: "ban", label: "Bannissements max", value: `${an.banMax}`, max: 3 },
-        { id: "window", label: "Fenêtre (secondes)", value: `${Math.round(an.windowMs / 1000)}`, max: 4 },
-        { id: "mode", label: "Sanction : strip / ban / alert", value: an.punishment, max: 10 },
-      ]));
-    }
-    if (action === "wl") {
-      const list = [...config.antinuke.whitelist];
-      const v = i.values[0];
-      const idx = list.indexOf(v);
-      idx === -1 ? list.push(v) : list.splice(idx, 1);
-      await updateConfig(i.guildId, { antinuke: { whitelist: list } });
-      return feedback(i, { ok: true, title: idx === -1 ? "Ajouté à la liste blanche" : "Retiré de la liste blanche",
-        text: `<@${v}> ${idx === -1 ? "ne déclenchera plus" : "déclenchera de nouveau"} l'anti-nuke.` }, "protect");
-    }
-  }
-
-  /* ------------------------------ PERMISSIONS ----------------------------- */
-  if (section === "perms") {
-    if (action === "auto") {
-      const found = autoDetectRoles(i.guild);
-      if (!found.length) return feedback(i, { ok: false, title: "Rien détecté",
-        text: "Aucun nom de rôle reconnu. Classe-les à la main avec le menu Rôle ci-dessous.", color: COLORS.warning }, "perms");
-      const roles = { ...config.perms.roles };
-      for (const f of found) roles[f.role.id] = f.level;
-      await updateConfig(i.guildId, { perms: { roles } });
-      return feedback(i, { ok: true, title: `${found.length} rôle(s) classés`,
-        text: found.map((f) => `\`${f.level}\` ${f.role}`).join("\n") }, "perms");
-    }
-    if (action === "reset") { await updateConfig(i.guildId, { perms: { roles: {}, users: {}, commands: {} } }); return feedback(i, { ok: true, title: "Perms réinitialisées", text: "Tout est remis à zéro." }, "perms"); }
-    if (action === "cmds") {
-      const byLevel = {};
-      for (const s of SECTIONS) (byLevel[s.level] ??= []).push(`${s.emoji} ${s.label}`);
-      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: "📋  Niveau requis par section" },
-        fields: [6, 5, 4, 3, 2, 1].filter((l) => byLevel[l]).map((l) => ({ name: PERM_LABELS[l], value: byLevel[l].join("\n") })),
-        footer: "Dans Modération : avertir 1 · timeout/kick/alcatraz 2 · bannir 3 · casier 4" })],
-        components: [new ActionRowBuilder().addComponents(btn("p:perms", "Retour", ButtonStyle.Secondary, "◀️"))] });
-    }
-    if (action === "role" || action === "user") {
-      const targetId = i.values[0];
-      if (action === "user" && isOwner(targetId))
-        return feedback(i, { ok: false, title: "Impossible", text: `<@${OWNER_ID}> est propriétaire de 0x : son niveau ne se modifie pas.`, color: COLORS.danger }, "perms");
-      const kind = action;
-      const menu = new StringSelectMenuBuilder().setCustomId(`p:perms:lvl:${kind}_${targetId}`)
-        .setPlaceholder("Choisis le niveau…")
-        .addOptions([0, 1, 2, 3, 4, 5, 6].map((l) => ({ label: PERM_LABELS[l], value: String(l) })));
-      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: `${ICONS.shield}  Niveau à attribuer` },
-        description: kind === "role" ? `Rôle : <@&${targetId}>` : `Membre : <@${targetId}>`,
-        footer: "Niveau 0 = retirer du système" })],
-        components: [new ActionRowBuilder().addComponents(menu), new ActionRowBuilder().addComponents(btn("p:perms", "Annuler", ButtonStyle.Secondary, "◀️"))] });
-    }
-    if (action === "lvl") {
-      const [kind, targetId] = arg.split("_");
-      const lvl = Number(i.values[0]);
-      if (kind === "role") {
-        const roles = { ...config.perms.roles };
-        if (lvl === 0) delete roles[targetId]; else roles[targetId] = lvl;
-        await updateConfig(i.guildId, { perms: { roles } });
-        return feedback(i, { ok: true, title: "Niveau attribué", text: `<@&${targetId}> → **${PERM_LABELS[lvl]}**` }, "perms");
-      }
-      const users = { ...config.perms.users };
-      if (lvl === 0) delete users[targetId]; else users[targetId] = lvl;
-      await updateConfig(i.guildId, { perms: { users } });
-      return feedback(i, { ok: true, title: "Forçage appliqué", text: `<@${targetId}> → **${PERM_LABELS[lvl]}**` }, "perms");
-    }
-  }
-
-  /* -------------------------------- TICKETS ------------------------------- */
-  if (section === "tickets") {
-    if (action === "publish") {
-      const ch = i.guild.channels.cache.get(i.values[0]);
-      if (!canSend(ch)) return feedback(i, { ok: false, title: "Salon inaccessible", text: `Je ne peux pas écrire dans ${ch}.`, color: COLORS.danger }, "tickets");
-      await ch.send({ embeds: [embed({ guild: i.guild, author: { name: `${ICONS.ticket}  Centre d'aide` }, color: COLORS.primary,
-        description: "Choisis le type de ticket dans le menu. Un salon privé sera créé avec le staff concerné.\n\nLes ouvertures abusives sont sanctionnées." })],
-        components: ticketPanelComponents() });
-      return feedback(i, { ok: true, title: "Panneau publié", text: `Le menu de tickets est en ligne dans ${ch}.` }, "tickets");
-    }
-    if (action === "refresh") { await refreshTicketCounter(i.guild); return feedback(i, { ok: true, title: "Compteur actualisé", text: "Le salon compteur-tickets est à jour." }, "tickets"); }
-  }
-
-  /* ------------------------------- COMPTEURS ------------------------------ */
-  if (section === "counters") {
-    if (action === "set") { await updateConfig(i.guildId, { counters: { ...config.counters, [arg]: i.values[0] } }); return feedback(i, { ok: true, title: "Compteur rattaché", text: `**${arg}** → <#${i.values[0]}>` }, "counters"); }
-    if (action === "force") { await i.deferUpdate(); await updateCounters(i.guild, true); return respond(i, await buildSection("counters", i, config)); }
-  }
-
-  /* -------------------------------- NIVEAUX ------------------------------- */
-  if (section === "levels") {
-    if (action === "t") { await updateConfig(i.guildId, { levelsEnabled: !config.levelsEnabled }); return respond(i, await buildSection("levels", i, await getConfig(i.guildId))); }
-    if (action === "channel") { await updateConfig(i.guildId, { funcOverrides: { ...config.funcOverrides, levelUp: i.values[0] } }); return feedback(i, { ok: true, title: "Salon défini", text: `Les montées de niveau seront annoncées dans <#${i.values[0]}>.` }, "levels"); }
-    if (action === "reward") return i.showModal(modal(`pm:levels:reward:${i.values[0]}`, "Récompense de niveau",
-      [{ id: "level", label: "À quel niveau donner ce rôle ?", required: true, placeholder: "10", max: 3 }]));
-  }
-
-  /* -------------------------------- ÉCONOMIE ------------------------------ */
-  if (section === "eco") {
-    if (action === "t") { await updateConfig(i.guildId, { economy: { enabled: !config.economy.enabled } }); return respond(i, await buildSection("eco", i, await getConfig(i.guildId))); }
-    if (action === "montants") {
-      const e = config.economy;
-      return i.showModal(modal("pm:eco:montants", "Montants de l'économie", [
-        { id: "currency", label: "Symbole de la monnaie", value: e.currency, max: 8 },
-        { id: "daily", label: "Récompense quotidienne", value: `${e.dailyAmount}`, max: 8 },
-        { id: "work", label: "Travail : min-max", value: `${e.workMin}-${e.workMax}`, max: 16 },
-        { id: "drop", label: "Colis : min-max", value: `${e.dropMin}-${e.dropMax}`, max: 16 },
-        { id: "chance", label: "Chance de colis par message (%)", value: `${e.dropChance}`, max: 3 },
-      ]));
-    }
-    if (action === "additem") return i.showModal(modal(`pm:eco:additem:${i.values[0]}`, "Nouvel article", [
-      { id: "name", label: "Nom de l'article", required: true, max: 60 },
-      { id: "price", label: "Prix en coins", required: true, max: 10 },
-      { id: "stock", label: "Stock (vide = illimité)", max: 6 },
-    ]));
-    if (action === "del") {
-      const shop = config.economy.shop.filter((x) => x.id !== i.values[0]);
-      await updateConfig(i.guildId, { economy: { shop } });
-      return feedback(i, { ok: true, title: "Article retiré", text: "La boutique a été mise à jour." }, "eco");
-    }
-    if (action === "dropch") { await updateConfig(i.guildId, { economy: { dropChannelId: i.values[0] } }); return feedback(i, { ok: true, title: "Salon des colis", text: `Les colis tomberont dans <#${i.values[0]}>.` }, "eco"); }
-    if (action === "drop") {
-      const e = config.economy;
-      const ch = e.dropChannelId ? i.guild.channels.cache.get(e.dropChannelId) : resolveFuncChannel(i.guild, "drops", config) ?? i.channel;
-      const amount = e.dropMin + Math.floor(Math.random() * (e.dropMax - e.dropMin + 1));
-      const msg = await launchDrop(i.guild, ch, amount);
-      return feedback(i, msg ? { ok: true, title: "Colis lâché", text: `${num(amount)} coins à récupérer dans ${ch}.`, color: COLORS.gold }
-        : { ok: false, title: "Échec", text: `Impossible d'écrire dans ${ch}.`, color: COLORS.danger }, "eco");
-    }
-  }
-
-  /* ------------------------------- GIVEAWAYS ------------------------------ */
-  if (section === "gw") {
-    if (action === "new") return i.showModal(modal("pm:gw:new", "Nouveau giveaway", [
-      { id: "prize", label: "Ce qui est à gagner", required: true, max: 200 },
-      { id: "duration", label: "Durée (30m, 6h, 2d)", required: true, max: 10 },
-      { id: "winners", label: "Nombre de gagnants", value: "1", max: 2 },
-    ]));
-    if (action === "pick") {
-      const gid = i.values[0];
-      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: `${ICONS.gift}  Giveaway #${gid}` },
-        description: "Que veux-tu faire ?" })],
-        components: [new ActionRowBuilder().addComponents(
-          btn(`p:gw:end:${gid}`, "Terminer maintenant", ButtonStyle.Danger, "🏁"),
-          btn(`p:gw:reroll:${gid}`, "Retirer au sort", ButtonStyle.Primary, "🎲"),
-          btn("p:gw", "Retour", ButtonStyle.Secondary, "◀️"))] });
-    }
-    if (action === "end" || action === "reroll") {
-      const g = await getGiveaway(Number(arg));
-      if (!g) return feedback(i, { ok: false, title: "Introuvable", text: "Ce giveaway n'existe plus.", color: COLORS.danger }, "gw");
-      await i.deferUpdate();
-      const w = await drawGiveaway(i.client, g, action === "reroll" ? 1 : null);
-      return feedback(i, { ok: true, title: action === "reroll" ? "Nouveau tirage" : "Giveaway terminé",
-        text: w.length ? `Gagnant(s) : ${w.map((x) => `<@${x}>`).join(", ")}` : "Aucun participant.", color: COLORS.gold }, "gw");
-    }
-  }
-
-  /* ------------------------------ PUBLICATIONS ---------------------------- */
-  if (section === "publish") {
-    if (action === "pick") {
-      const what = arg;
-      const labels = { member: "Panneau membres", ticket: "Panneau tickets", confess: "Panneau confessions" };
-      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: `📢  ${labels[what]}` },
-        description: "Dans quel salon veux-tu le publier ?" })],
-        components: [
-          new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId(`p:publish:go:${what}`)
-            .setChannelTypes(ChannelType.GuildText).setPlaceholder("Choisis le salon…")),
-          new ActionRowBuilder().addComponents(btn("p:publish", "Annuler", ButtonStyle.Secondary, "◀️")),
-        ] });
-    }
-    if (action === "go") {
-      const ch = i.guild.channels.cache.get(i.values[0]);
-      if (!canSend(ch)) return feedback(i, { ok: false, title: "Salon inaccessible", text: `Je ne peux pas écrire dans ${ch}.`, color: COLORS.danger }, "publish");
-      if (arg === "member") await ch.send(memberPanel(i.guild));
-      else if (arg === "confess") await ch.send(confessionPanel(i.guild));
-      else await ch.send({ embeds: [embed({ guild: i.guild, author: { name: `${ICONS.ticket}  Centre d'aide` },
-        description: "Choisis le type de ticket dans le menu ci-dessous." })], components: ticketPanelComponents() });
-      return feedback(i, { ok: true, title: "Publié", text: `Le panneau est en ligne dans ${ch}.` }, "publish");
-    }
-    if (action === "roles") return i.showModal(modal("pm:publish:roles", "Menu de rôles", [
-      { id: "title", label: "Titre du menu", required: true, max: 100 },
-      { id: "roles", label: "Rôles : mentions ou IDs séparés par ,", required: true, long: true, max: 500 },
-    ]));
-    if (action === "say") return i.showModal(modal("pm:publish:say", "Annonce",
-      [{ id: "text", label: "Texte de l'annonce", required: true, long: true, max: 3000 },
-       { id: "title", label: "Titre (vide = message simple)", max: 100 }]));
-    if (action === "poll") return i.showModal(modal("pm:publish:poll", "Sondage",
-      [{ id: "question", label: "Question", required: true, max: 200 },
-       { id: "options", label: "Choix séparés par des virgules", required: true, long: true, max: 500 }]));
-  }
-
-  return respond(i, await buildSection(section, i, config));
 }
 
 /* ========================================================================== */
@@ -3134,14 +3347,12 @@ async function showMemberCard(i, userId, config) {
   const all = await countSanctions(i.guild.id, userId);
   const lvl = await getUserLevel(i.guild.id, userId);
   const wallet = await getWallet(i.guild.id, userId);
-  const targetLevel = permLevel(member, config);
   const muted = member.communicationDisabledUntil && member.communicationDisabledUntil > new Date();
 
   const card = embed({
-    guild: i.guild,
-    author: { name: `${ICONS.shield}  ${member.user.tag}` },
+    guild: i.guild, author: { name: `${ICONS.shield}  ${member.user.tag}` },
     color: muted ? COLORS.warning : COLORS.primary,
-    description: `\`${member.id}\` · **${PERM_LABELS[targetLevel]}**${muted ? `\n${ICONS.timeout} Muet jusqu'à ${ts(member.communicationDisabledUntil)}` : ""}`,
+    description: `\`${member.id}\` · **${PERM_LABELS[permLevel(member, config)]}**${muted ? `\n${ICONS.timeout} Muet jusqu'à ${ts(member.communicationDisabledUntil)}` : ""}`,
     fields: [
       { name: "Avertissements", value: `${warns}`, inline: true },
       { name: "Sanctions totales", value: `${all}`, inline: true },
@@ -3156,26 +3367,555 @@ async function showMemberCard(i, userId, config) {
   return respond(i, {
     embeds: [card],
     components: [
-      new ActionRowBuilder().addComponents(
-        btn(`p:mod:warn:${userId}`, "Avertir", ButtonStyle.Secondary, "⚠️"),
-        btn(`p:mod:timeout:${userId}`, "Timeout", ButtonStyle.Secondary, "🔇"),
-        btn(`p:mod:untimeout:${userId}`, "Rendre la parole", ButtonStyle.Secondary, "🔊"),
-        btn(`p:mod:kick:${userId}`, "Expulser", ButtonStyle.Danger, "👢"),
-        btn(`p:mod:ban:${userId}`, "Bannir", ButtonStyle.Danger, "⛔"),
-      ),
-      new ActionRowBuilder().addComponents(
-        btn(`p:mod:jail:${userId}`, "Alcatraz", ButtonStyle.Danger, "🤚"),
-        btn(`p:mod:free:${userId}`, "Libérer", ButtonStyle.Success, "🕊️"),
-        btn(`p:mod:hist:${userId}`, "Casier", ButtonStyle.Primary, "📋"),
-        btn(`p:mod:clear:${userId}`, "Effacer casier", ButtonStyle.Secondary, "🧽"),
-        btn(`p:mod:coins:${userId}`, "Coins", ButtonStyle.Secondary, "🪙"),
-      ),
-      new ActionRowBuilder().addComponents(
-        btn("p:mod", "Autre membre", ButtonStyle.Secondary, "🔁"),
-        btn("p:home", "Accueil", ButtonStyle.Secondary, "🏠"),
-      ),
+      row(btn(`p:mod:warn:${userId}`, "Avertir", ButtonStyle.Secondary, "⚠️"),
+          btn(`p:mod:timeout:${userId}`, "Timeout", ButtonStyle.Secondary, "🔇"),
+          btn(`p:mod:untimeout:${userId}`, "Rendre la parole", ButtonStyle.Secondary, "🔊"),
+          btn(`p:mod:kick:${userId}`, "Expulser", ButtonStyle.Danger, "👢"),
+          btn(`p:mod:ban:${userId}`, "Bannir", ButtonStyle.Danger, "⛔")),
+      row(btn(`p:mod:jail:${userId}`, "Alcatraz", ButtonStyle.Danger, "🤚"),
+          btn(`p:mod:free:${userId}`, "Libérer", ButtonStyle.Success, "🕊️"),
+          btn(`p:mod:hist:${userId}`, "Casier", ButtonStyle.Primary, "📋"),
+          btn(`p:mod:clear:${userId}`, "Effacer casier", ButtonStyle.Secondary, "🧽"),
+          btn(`p:mod:coins:${userId}`, "Coins", ButtonStyle.Secondary, "🪙")),
+      row(btn(`p:mod:role:${userId}`, "Gérer ses rôles", ButtonStyle.Secondary, "🎭"),
+          btn("p:mod", "Autre membre", ButtonStyle.Secondary, "🔁"),
+          btn("p:home", "Accueil", ButtonStyle.Secondary, "🏠")),
     ],
   });
+}
+
+/* ========================================================================== */
+/*                                  ROUTEUR                                   */
+/* ========================================================================== */
+
+async function handlePanel(i) {
+  const id = i.customId;
+  if (!id?.startsWith("p:") && !id?.startsWith("pm:") && !id?.startsWith("pub:")) return false;
+
+  const config = await getConfig(i.guildId);
+  const level = permLevel(i.member, config);
+  const parts = id.split(":");
+
+  if (parts[0] === "pub") return handlePublic(i, parts, config);
+  if (parts[0] === "pm") return handleModal(i, parts, config, level);
+
+  if (id === "p:home") return respond(i, await buildSection("home", i, config));
+  if (id === "p:go") return respond(i, await buildSection(i.values[0], i, config));
+
+  /* -------- installation, interrupteurs : propriétaire uniquement -------- */
+  if (parts[1] === "setup" || parts[1] === "sw") {
+    if (!isOwner(i.user.id)) return respond(i, { embeds: [embed({ guild: i.guild, color: COLORS.danger,
+      author: { name: "🔒  Verrouillé" }, description: `Seul <@${OWNER_ID}> peut modifier la configuration de 0x.` })],
+      components: [backRow()] });
+
+    if (parts[1] === "sw") {
+      const key = parts[2];
+      if (key === "logs") await updateConfig(i.guildId, { logsEnabled: !config.logsEnabled });
+      else if (key === "levels") await updateConfig(i.guildId, { levelsEnabled: !config.levelsEnabled });
+      else await updateConfig(i.guildId, { [key]: { enabled: !config[key].enabled } });
+      return respond(i, await buildSection("home", i, await getConfig(i.guildId)));
+    }
+    if (parts[2] === "run") {
+      await i.deferUpdate();
+      const result = await autoSetup(i.guild, i.user);
+      const view = await buildSection("home", i, await getConfig(i.guildId));
+      return respond(i, { embeds: [setupReport(i.guild, result)], components: view.components });
+    }
+    if (parts[2] === "publish") {
+      await i.deferUpdate();
+      const done = await publishAll(i.guild);
+      return feedback(i, done.length ? { ok: true, title: `${done.length} panneau(x) publié(s)`, text: done.join("\n") }
+        : { ok: false, title: "Rien publié", text: "Aucun salon cible trouvé. Passe par Publications.", color: COLORS.warning });
+    }
+    if (parts[2] === "defaults") {
+      await updateConfig(i.guildId, structuredClone(RECOMMENDED));
+      return feedback(i, { ok: true, title: "Réglages recommandés appliqués",
+        text: "Automod, anti-raid, anti-nuke, journaux, niveaux et économie sont calibrés pour un serveur de ta taille." });
+    }
+  }
+
+  const section = parts[1];
+  const action = parts[2];
+  const arg = parts[3];
+  const sec = SECTIONS.find((s) => s.id === section);
+  if (sec?.ownerOnly && !isOwner(i.user.id)) return respond(i, denyView(i.guild, sec, config));
+  if (sec?.trusted && !isTrusted(i.member, config)) return respond(i, denyView(i.guild, sec, config));
+  if (level < sectionLevel(sec ?? { level: 6 }, config)) {
+    return respond(i, { embeds: [embed({ guild: i.guild, color: COLORS.danger,
+      author: { name: `${ICONS.no}  Accès refusé` },
+      description: `Cette section demande **${PERM_LABELS[sectionLevel(sec ?? { level: 6 }, config)]}**.` })], components: [backRow()] });
+  }
+
+  if (action === "page") return respond(i, await buildSection(section, i, config, arg));
+
+  /* ------------------------------ MODÉRATION ----------------------------- */
+  if (section === "mod") {
+    if (action === "pick") return showMemberCard(i, i.values[0], config);
+    if (action === "card") return showMemberCard(i, arg, config);
+
+    if (action === "purge") return i.showModal(modal(`pm:mod:purge:${i.channelId}`, "Purger ce salon",
+      [{ id: "amount", label: "Nombre de messages (1-100)", required: true, max: 3 },
+       { id: "user", label: "Limiter à un identifiant (optionnel)", max: 25 }]));
+
+    if (action === "purgeother") return respond(i, { embeds: [embed({ guild: i.guild,
+      author: { name: "🧹  Purger un autre salon" }, description: "Choisis le salon à nettoyer." })],
+      components: [row(new ChannelSelectMenuBuilder().setCustomId("p:mod:purgech").setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon à purger…")), backRow("p:mod")] });
+
+    if (action === "purgech") return i.showModal(modal(`pm:mod:purge:${i.values[0]}`, "Purger le salon",
+      [{ id: "amount", label: "Nombre de messages (1-100)", required: true, max: 3 },
+       { id: "user", label: "Limiter à un identifiant (optionnel)", max: 25 }]));
+
+    if (action === "slow") return i.showModal(modal(`pm:mod:slow:${i.channelId}`, "Mode lent",
+      [{ id: "seconds", label: "Secondes entre messages (0 = couper)", required: true, value: `${i.channel.rateLimitPerUser ?? 0}`, max: 5 }]));
+
+    if (action === "unban") return i.showModal(modal("pm:mod:unban", "Débannir",
+      [{ id: "userid", label: "Identifiant de l'utilisateur", required: true, max: 25 }, REASON]));
+
+    if (action === "lock") {
+      const locked = i.channel.permissionOverwrites.cache.get(i.guild.id)?.deny.has(PermissionFlagsBits.SendMessages);
+      await i.channel.permissionOverwrites.edit(i.guild.roles.everyone, { SendMessages: locked ? null : false });
+      return feedback(i, { ok: true, title: locked ? "Salon déverrouillé" : "Salon verrouillé",
+        text: `${i.channel} — ${locked ? "les membres peuvent réécrire" : "plus personne ne peut écrire"}.`,
+        color: locked ? COLORS.success : COLORS.danger }, "mod");
+    }
+
+    if (action === "role") return respond(i, { embeds: [embed({ guild: i.guild,
+      author: { name: "🎭  Rôles du membre" }, description: `<@${arg}> — ajoute ou retire un rôle.` })],
+      components: [row(new RoleSelectMenuBuilder().setCustomId(`p:mod:rolepick:${arg}`).setPlaceholder("Rôle à basculer…")),
+        row(btn(`p:mod:card:${arg}`, "Retour à la fiche", ButtonStyle.Secondary, "◀️"))] });
+
+    if (action === "rolepick") {
+      const member = await i.guild.members.fetch(arg).catch(() => null);
+      const role = i.guild.roles.cache.get(i.values[0]);
+      if (!member || !role) return feedback(i, { ok: false, title: "Introuvable", text: "Membre ou rôle absent.", color: COLORS.danger }, "mod");
+      if (role.position >= i.guild.members.me.roles.highest.position || role.managed)
+        return feedback(i, { ok: false, title: "Rôle inutilisable", text: `${role} est au-dessus du mien ou géré par une intégration.`, color: COLORS.danger }, "mod");
+      const had = member.roles.cache.has(role.id);
+      await (had ? member.roles.remove(role.id, i.user.tag) : member.roles.add(role.id, i.user.tag)).catch(() => null);
+      return feedback(i, { ok: true, title: had ? "Rôle retiré" : "Rôle ajouté", text: `${role} — **${member.user.tag}**` }, "mod");
+    }
+
+    const gate = { warn: 1, hist: 1, timeout: 2, untimeout: 2, kick: 2, jail: 2, free: 2, role: 2, rolepick: 2, ban: 3, clear: 4, coins: 4, delsanc: 4 };
+    if (gate[action] !== undefined && level < gate[action])
+      return feedback(i, { ok: false, title: "Niveau insuffisant", text: `Cette action demande **${PERM_LABELS[gate[action]]}**.`, color: COLORS.danger }, "mod");
+
+    const target = await i.guild.members.fetch(arg).catch(() => null);
+    if (["warn", "timeout", "kick", "ban", "jail", "coins", "clear"].includes(action)) {
+      if (!target) return feedback(i, { ok: false, title: "Introuvable", text: "Ce membre a quitté le serveur.", color: COLORS.danger }, "mod");
+      const problem = checkTarget(i.guild, i.member, target, config);
+      if (problem) return feedback(i, { ok: false, title: "Action refusée", text: problem, color: COLORS.danger }, "mod");
+    }
+
+    if (action === "warn") return i.showModal(modal(`pm:mod:warn:${arg}`, "Avertir", [REASON]));
+    if (action === "timeout") return i.showModal(modal(`pm:mod:timeout:${arg}`, "Réduire au silence",
+      [{ ...DURATION, required: true, placeholder: "10m" }, REASON]));
+    if (action === "kick") return i.showModal(modal(`pm:mod:kick:${arg}`, "Expulser", [REASON]));
+    if (action === "ban") return i.showModal(modal(`pm:mod:ban:${arg}`, "Bannir",
+      [REASON, { id: "purge", label: "Purger ses messages (0-7 jours)", placeholder: "0", max: 1 }]));
+    if (action === "jail") return i.showModal(modal(`pm:mod:jail:${arg}`, "Envoyer en Alcatraz", [REASON, DURATION]));
+    if (action === "coins") return i.showModal(modal(`pm:mod:coins:${arg}`, "Ajuster les coins",
+      [{ id: "amount", label: "Montant (négatif pour retirer)", required: true, max: 10 }, { id: "reason", label: "Raison", max: 200 }]));
+
+    if (action === "untimeout") return feedback(i, await actionUntimeout(i.guild, target, i.user), "mod");
+    if (action === "free") return feedback(i, await actionFree(i.guild, target, i.user), "mod");
+    if (action === "clear") return feedback(i, await actionClearSanctions(i.guild, target), "mod");
+    if (action === "delsanc") return feedback(i, await actionDeleteSanction(i.guild, Number(i.values[0])), "mod");
+
+    if (action === "hist") {
+      const t2 = target ?? { id: arg, user: { tag: arg } };
+      const h = await actionHistory(i.guild, t2);
+      const rows2 = await listSanctions(i.guild.id, arg, null, 25);
+      const comps = [];
+      if (rows2.length && level >= 4) comps.push(row(new StringSelectMenuBuilder().setCustomId("p:mod:delsanc")
+        .setPlaceholder("Supprimer une sanction précise…")
+        .addOptions(rows2.slice(0, 25).map((r) => ({ label: `#${r.id} · ${r.type}`, value: String(r.id),
+          description: r.reason.slice(0, 100) })))));
+      comps.push(row(btn(`p:mod:card:${arg}`, "Retour à la fiche", ButtonStyle.Secondary, "◀️")));
+      return respond(i, { embeds: [embed({ guild: i.guild, color: h.color, author: { name: `📋  ${h.title}` }, description: h.text })], components: comps });
+    }
+  }
+
+  /* -------------------------------- ÉQUIPE ------------------------------- */
+  if (section === "staff") {
+    if (action === "absence") return i.showModal(modal("pm:staff:absence", "Déclarer une absence",
+      [{ id: "reason", label: "Motif", required: true, max: 300 },
+       { id: "duration", label: "Durée (3d, 2sem) — vide = indéterminée", max: 12 }]));
+    return respond(i, await buildSection("staff", i, config));
+  }
+
+  /* ---------------------------- CONFIGURATION ---------------------------- */
+  if (section === "config") {
+    const set = async (patch, title, text) => { await updateConfig(i.guildId, patch); return feedback(i, { ok: true, title, text }, "config", page(i)); };
+    function page(x) { return x._page ?? null; }
+
+    if (action === "staff") { await updateConfig(i.guildId, { staffRoleId: i.values[0] }); return feedback(i, { ok: true, title: "Rôle staff défini", text: `<@&${i.values[0]}> voit désormais les tickets.` }, "config", "roles"); }
+    if (action === "jail") { await updateConfig(i.guildId, { jailRoleId: i.values[0] }); return feedback(i, { ok: true, title: "Rôle Alcatraz défini", text: `<@&${i.values[0]}>` }, "config", "roles"); }
+    if (action === "autorole") {
+      const role = i.guild.roles.cache.get(i.values[0]);
+      if (role.position >= i.guild.members.me.roles.highest.position)
+        return feedback(i, { ok: false, title: "Rôle trop haut", text: "Ce rôle est au-dessus du mien.", color: COLORS.danger }, "config", "roles");
+      await updateConfig(i.guildId, { autoroleId: role.id });
+      return feedback(i, { ok: true, title: "Autorole défini", text: `${role} sera donné à chaque arrivée.` }, "config", "roles");
+    }
+    if (action === "trusted") {
+      const rid = i.values[0];
+      await updateConfig(i.guildId, { trustedRoleId: rid, perms: { roles: { ...config.perms.roles, [rid]: Math.max(5, Number(config.perms.roles?.[rid] ?? 0)) } } });
+      return feedback(i, { ok: true, title: "Rôle de confiance défini",
+        text: `<@&${rid}> accède maintenant aux Compteurs, à l'Économie, aux Niveaux et à l'Automod, et passe niveau 5.` }, "config", "roles");
+    }
+    if (action === "welcome") { await updateConfig(i.guildId, { welcomeChannelId: i.values[0] }); return feedback(i, { ok: true, title: "Salon d'accueil", text: `<#${i.values[0]}>` }, "config", "welcome"); }
+    if (action === "goodbye") { await updateConfig(i.guildId, { goodbyeChannelId: i.values[0] }); return feedback(i, { ok: true, title: "Salon des départs", text: `<#${i.values[0]}>` }, "config", "welcome"); }
+    if (action === "clearw") { await updateConfig(i.guildId, { welcomeChannelId: null, goodbyeChannelId: null }); return feedback(i, { ok: true, title: "Messages coupés", text: "Plus aucun message d'arrivée ni de départ." }, "config", "welcome"); }
+    if (action === "msgw") return i.showModal(modal("pm:config:msgw", "Message d'accueil",
+      [{ id: "text", label: "{user} {tag} {server} {count}", required: true, long: true, value: config.welcomeMessage, max: 500 }]));
+    if (action === "msgg") return i.showModal(modal("pm:config:msgg", "Message de départ",
+      [{ id: "text", label: "{user} {tag} {server} {count}", required: true, long: true, value: config.goodbyeMessage, max: 500 }]));
+
+    if (action === "funcpick") return respond(i, { embeds: [embed({ guild: i.guild,
+      author: { name: "📂  Forcer un salon" }, description: `Fonction : \`${i.values[0]}\`` })],
+      components: [row(new ChannelSelectMenuBuilder().setCustomId(`p:config:funcset:${i.values[0]}`)
+        .setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon cible…")), backRow("p:config:page:chans")] });
+    if (action === "funcset") { await updateConfig(i.guildId, { funcOverrides: { ...config.funcOverrides, [arg]: i.values[0] } });
+      return feedback(i, { ok: true, title: "Salon forcé", text: `\`${arg}\` → <#${i.values[0]}>` }, "config", "chans"); }
+    if (action === "funcreset") { await updateConfig(i.guildId, { funcOverrides: {} }); return feedback(i, { ok: true, title: "Retour en automatique", text: "Les salons fonctionnels sont de nouveau détectés par leur nom." }, "config", "chans"); }
+
+    if (action === "trapch") { await updateConfig(i.guildId, { trapVoiceId: i.values[0] }); return feedback(i, { ok: true, title: "Salon piégé", text: `<#${i.values[0]}> — choisis maintenant la sanction.` , color: COLORS.warning }, "config", "trap"); }
+    if (action === "trapact") { const a = i.values[0]; await updateConfig(i.guildId, { trapAction: a, ...(a === "off" ? { trapVoiceId: null } : {}) });
+      return feedback(i, { ok: true, title: a === "off" ? "Piège désactivé" : "Piège armé",
+        text: a === "off" ? "Le salon n'est plus piégé." : `Toute personne entrant sera **${a === "ban" ? "bannie" : "expulsée"}**.`,
+        color: a === "off" ? COLORS.success : COLORS.danger }, "config", "trap"); }
+
+    if (action === "reset") { await updateConfig(i.guildId, structuredClone(DEFAULT_CONFIG)); return feedback(i, { ok: true, title: "Configuration réinitialisée", text: "Tous les réglages sont revenus à leur valeur d'origine." }, "config"); }
+  }
+
+  /* ------------------------------- JOURNAUX ------------------------------ */
+  if (section === "logs") {
+    if (action === "pick" || action === "pick2") return respond(i, { embeds: [embed({ guild: i.guild,
+      author: { name: "🗂️  Forcer un journal" }, description: `Type : \`${i.values[0]}\`\nActuellement : ${resolveLogChannel(i.guild, i.values[0], config) ?? "_non routé_"}` })],
+      components: [row(new ChannelSelectMenuBuilder().setCustomId(`p:logs:set:${i.values[0]}`)
+        .setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon cible…")), backRow("p:logs")] });
+    if (action === "set") { await updateConfig(i.guildId, { logOverrides: { ...config.logOverrides, [arg]: i.values[0] } });
+      return feedback(i, { ok: true, title: "Journal routé", text: `\`${arg}\` → <#${i.values[0]}>` }, "logs"); }
+    if (action === "reset") { await updateConfig(i.guildId, { logOverrides: {} }); return feedback(i, { ok: true, title: "Retour en automatique", text: "Détection par nom de salon rétablie." }, "logs"); }
+    if (action === "toggle") { await updateConfig(i.guildId, { logsEnabled: !config.logsEnabled }); return respond(i, await buildSection("logs", i, await getConfig(i.guildId))); }
+    if (action === "scan") { const r = buildIndex(i.guild); return feedback(i, { ok: true, title: "Scan terminé", text: `${r.channels} salons et ${r.categories} catégories indexés.` }, "logs"); }
+  }
+
+  /* -------------------------------- AUTOMOD ------------------------------ */
+  if (section === "automod") {
+    if (action === "t") { await updateConfig(i.guildId, { automod: { [arg]: !config.automod[arg] } });
+      return respond(i, await buildSection("automod", i, await getConfig(i.guildId))); }
+    if (action === "seuils") { const a = config.automod;
+      return i.showModal(modal("pm:automod:seuils", "Seuils de l'automod", [
+        { id: "spam", label: "Flood : messages/secondes/minutes", value: `${a.spamThreshold}/${Math.round(a.spamWindowMs / 1000)}/${a.spamTimeoutMinutes}`, max: 12 },
+        { id: "mentions", label: "Mentions max (0 = illimité)", value: `${a.maxMentions}`, max: 3 },
+        { id: "caps", label: "Majuscules % (0 = coupé)", value: `${a.capsPercent}`, max: 3 },
+        { id: "emojis", label: "Émojis max (0 = illimité)", value: `${a.maxEmojis}`, max: 3 },
+      ])); }
+    if (action === "mots") return i.showModal(modal("pm:automod:mots", "Mots interdits",
+      [{ id: "words", label: "Séparés par des virgules", long: true, value: config.automod.bannedWords.join(", "), max: 2000 }]));
+    if (action === "exempt" || action === "ignore") {
+      const key = action === "exempt" ? "exemptRoles" : "ignoredChannels";
+      const list = [...config.automod[key]]; const v = i.values[0];
+      const idx = list.indexOf(v); idx === -1 ? list.push(v) : list.splice(idx, 1);
+      await updateConfig(i.guildId, { automod: { [key]: list } });
+      return respond(i, await buildSection("automod", i, await getConfig(i.guildId)));
+    }
+  }
+
+  /* ------------------------------ PROTECTION ----------------------------- */
+  if (section === "protect") {
+    if (action === "t") { await updateConfig(i.guildId, { [arg]: { enabled: !config[arg].enabled } });
+      return respond(i, await buildSection("protect", i, await getConfig(i.guildId))); }
+    if (action === "lock") {
+      const on = arg === "on";
+      await i.deferUpdate();
+      const n = await lockAllChannels(i.guild, on, `Panneau — ${i.user.tag}`);
+      on ? setLockdown(i.guildId, 60) : clearLockdown(i.guildId);
+      await log(i.guild, "raid", embed({ guild: i.guild, color: on ? COLORS.danger : COLORS.success,
+        author: { name: on ? "🔒  Lockdown activé" : "🔓  Lockdown levé" },
+        fields: [{ name: "Par", value: i.user.tag, inline: true }, { name: "Salons", value: `${n}`, inline: true }] }));
+      return feedback(i, { ok: true, title: on ? "Serveur verrouillé" : "Serveur déverrouillé", text: `${n} salon(s) traité(s).`, color: on ? COLORS.danger : COLORS.success }, "protect");
+    }
+    if (action === "raidcfg") { const ar = config.antiraid;
+      return i.showModal(modal("pm:protect:raid", "Réglages anti-raid", [
+        { id: "threshold", label: "Arrivées déclenchant l'alerte", value: `${ar.joinThreshold}`, max: 3 },
+        { id: "window", label: "Fenêtre (secondes)", value: `${Math.round(ar.joinWindowMs / 1000)}`, max: 4 },
+        { id: "age", label: "Âge minimum du compte (jours, 0=off)", value: `${ar.minAccountAgeDays}`, max: 3 },
+        { id: "mode", label: "Réaction : lockdown / kick / off", value: ar.onRaid, max: 10 },
+        { id: "lockmin", label: "Durée du lockdown (minutes)", value: `${ar.lockdownMinutes}`, max: 4 },
+      ])); }
+    if (action === "nukecfg") { const an = config.antinuke;
+      return i.showModal(modal("pm:protect:nuke", "Réglages anti-nuke", [
+        { id: "chan", label: "Suppressions de salons max", value: `${an.channelDeleteMax}`, max: 3 },
+        { id: "role", label: "Suppressions de rôles max", value: `${an.roleDeleteMax}`, max: 3 },
+        { id: "bankick", label: "Bans max / kicks max", value: `${an.banMax}/${an.kickMax}`, max: 8 },
+        { id: "window", label: "Fenêtre (secondes)", value: `${Math.round(an.windowMs / 1000)}`, max: 4 },
+        { id: "mode", label: "Sanction : strip / ban / alert", value: an.punishment, max: 10 },
+      ])); }
+    if (action === "wl") {
+      const list = [...config.antinuke.whitelist]; const v = i.values[0];
+      const idx = list.indexOf(v); idx === -1 ? list.push(v) : list.splice(idx, 1);
+      await updateConfig(i.guildId, { antinuke: { whitelist: list } });
+      return feedback(i, { ok: true, title: idx === -1 ? "Ajouté à la liste blanche" : "Retiré de la liste blanche",
+        text: `<@${v}> ${idx === -1 ? "ne déclenchera plus" : "déclenchera de nouveau"} l'anti-nuke.` }, "protect");
+    }
+  }
+
+  /* ------------------------------ PERMISSIONS ---------------------------- */
+  if (section === "perms") {
+    if (action === "auto") {
+      const found = autoDetectRoles(i.guild);
+      if (!found.length) return feedback(i, { ok: false, title: "Rien détecté", text: "Classe les rôles à la main avec le menu ci-dessous.", color: COLORS.warning }, "perms");
+      const roles = { ...config.perms.roles };
+      for (const f of found) roles[f.role.id] = f.level;
+      await updateConfig(i.guildId, { perms: { roles } });
+      return feedback(i, { ok: true, title: `${found.length} rôle(s) classés`, text: found.map((f) => `\`${f.level}\` ${f.role}`).join("\n") }, "perms");
+    }
+    if (action === "reset") { await updateConfig(i.guildId, { perms: { roles: {}, users: {}, commands: {}, sections: {} } });
+      return feedback(i, { ok: true, title: "Perms réinitialisées", text: "Rôles, forçages et niveaux de section remis à zéro." }, "perms"); }
+    if (action === "secreset") { await updateConfig(i.guildId, { perms: { sections: {} } });
+      return feedback(i, { ok: true, title: "Niveaux d'origine rétablis", text: "Chaque section retrouve son niveau par défaut." }, "perms", "sections"); }
+    if (action === "secpick") return respond(i, { embeds: [embed({ guild: i.guild,
+      author: { name: "🔐  Niveau de la section" }, description: `Section : **${SECTIONS.find((s) => s.id === i.values[0])?.label}**` })],
+      components: [row(new StringSelectMenuBuilder().setCustomId(`p:perms:seclvl:${i.values[0]}`).setPlaceholder("Niveau requis…").addOptions(LEVEL_OPTIONS)),
+        backRow("p:perms:page:sections")] });
+    if (action === "seclvl") { await updateConfig(i.guildId, { perms: { sections: { ...config.perms.sections, [arg]: Number(i.values[0]) } } });
+      return feedback(i, { ok: true, title: "Niveau modifié", text: `**${SECTIONS.find((s) => s.id === arg)?.label}** demande maintenant **${PERM_LABELS[i.values[0]]}**.` }, "perms", "sections"); }
+    if (action === "preview") {
+      const rid = i.values[0];
+      const role = i.guild.roles.cache.get(rid);
+      const lvl = Number(config.perms.roles?.[rid] ?? 0);
+      const fake = { id: "preview", guild: i.guild, roles: { cache: { has: (x) => x === rid } }, permissions: { has: () => false } };
+      const lines = SECTIONS.map((s) => {
+        const need = sectionLevel(s, config);
+        let why = "";
+        if (s.ownerOnly) why = "🔒 propriétaire de 0x";
+        else if (s.trusted && !isTrusted(fake, config)) why = `🔒 rôle ${config.trustedRoleId ? `<@&${config.trustedRoleId}>` : "Like me"}`;
+        else if (lvl < need) why = `⬆️ demande ${PERM_LABELS[need]}`;
+        return `${why ? "🔴" : "✅"} ${s.emoji} **${s.label}**${why ? ` — ${why}` : ""}`;
+      });
+      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: "👁️  Accès du rôle" },
+        color: COLORS.primary, description: `${role} — **${PERM_LABELS[lvl]}**\n\n${lines.join("\n")}`,
+        footer: "Monte le niveau du rôle, ou baisse celui d'une section" })],
+        components: [row(btn("p:perms:page:sections", "Changer le niveau d'une section", ButtonStyle.Primary, "📋"),
+          btn("p:perms", "Retour", ButtonStyle.Secondary, "◀️"))] });
+    }
+    if (action === "role" || action === "user") {
+      const targetId = i.values[0];
+      if (action === "user" && isOwner(targetId))
+        return feedback(i, { ok: false, title: "Impossible", text: `<@${OWNER_ID}> est propriétaire de 0x : son niveau ne se modifie pas.`, color: COLORS.danger }, "perms");
+      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: `${ICONS.shield}  Niveau à attribuer` },
+        description: action === "role" ? `Rôle : <@&${targetId}>` : `Membre : <@${targetId}>`, footer: "Niveau 0 = retirer du système" })],
+        components: [row(new StringSelectMenuBuilder().setCustomId(`p:perms:lvl:${action}_${targetId}`).setPlaceholder("Choisis le niveau…").addOptions(LEVEL_OPTIONS)),
+          row(btn("p:perms", "Annuler", ButtonStyle.Secondary, "◀️"))] });
+    }
+    if (action === "lvl") {
+      const [kind, targetId] = arg.split("_");
+      const lvl = Number(i.values[0]);
+      const key = kind === "role" ? "roles" : "users";
+      const map = { ...config.perms[key] };
+      if (lvl === 0) delete map[targetId]; else map[targetId] = lvl;
+      await updateConfig(i.guildId, { perms: { [key]: map } });
+      return feedback(i, { ok: true, title: "Niveau attribué",
+        text: `${kind === "role" ? `<@&${targetId}>` : `<@${targetId}>`} → **${PERM_LABELS[lvl]}**` }, "perms");
+    }
+  }
+
+  /* ------------------------------ INVITATIONS ---------------------------- */
+  if (section === "invites") {
+    const trusted = isTrusted(i.member, config);
+
+    if (action === "me") {
+      const raw = await inviterStats(i.guildId, i.user.id);
+      const s = { active: withBaseline(config, i.user.id, raw.active), total: withBaseline(config, i.user.id, raw.total) };
+      const parrain = await getInviter(i.guildId, i.user.id);
+      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: `🔗  Invitations de ${i.user.username}` },
+        color: COLORS.primary,
+        description: `## ${s.active} invité(s) actif(s)`,
+        fields: [
+          { name: "Total historique", value: `${s.total}`, inline: true },
+          { name: "Partis depuis", value: `${s.total - s.active}`, inline: true },
+          { name: "Toi, invité(e) par", value: parrain?.inviter_id ? `<@${parrain.inviter_id}>` : "_inconnu_", inline: true },
+        ] })], components: [row(btn("p:invites", "Retour", ButtonStyle.Secondary, "◀️"))] });
+    }
+
+    if (action === "who") return respond(i, { embeds: [embed({ guild: i.guild,
+      author: { name: "🔍  Qui a invité qui ?" }, description: "Choisis un membre pour voir son parrain et ses filleuls." })],
+      components: [row(new UserSelectMenuBuilder().setCustomId("p:invites:whopick").setPlaceholder("Sélectionne un membre…")), backRow("p:invites")] });
+
+    if (action === "whopick") {
+      const uid = i.values[0];
+      const rawS = await inviterStats(i.guildId, uid);
+      const s = { active: withBaseline(config, uid, rawS.active), total: withBaseline(config, uid, rawS.total) };
+      const parrain = await getInviter(i.guildId, uid);
+      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: "🔍  Fiche invitation" },
+        description: `<@${uid}>`,
+        fields: [
+          { name: "Invité par", value: parrain?.inviter_id ? `<@${parrain.inviter_id}>` : "_inconnu_", inline: true },
+          { name: "Arrivé", value: parrain?.joined_at ? ts(parrain.joined_at) : "—", inline: true },
+          { name: "Code utilisé", value: parrain?.code ? `\`${parrain.code}\`` : "—", inline: true },
+          { name: "Ses invités actifs", value: `${s.active}`, inline: true },
+          { name: "Son total", value: `${s.total}`, inline: true },
+        ] })], components: [row(btn("p:invites:who", "Un autre", ButtonStyle.Secondary, "🔁"), btn("p:invites", "Retour", ButtonStyle.Secondary, "◀️"))] });
+    }
+
+    if (!trusted) return respond(i, denyView(i.guild, sec, config));
+
+    if (action === "t") { await updateConfig(i.guildId, { invites: { enabled: !config.invites.enabled } });
+      return respond(i, await buildSection("invites", i, await getConfig(i.guildId))); }
+    if (action === "chan") { await updateConfig(i.guildId, { invites: { channelId: i.values[0] } });
+      return feedback(i, { ok: true, title: "Salon défini", text: `Les annonces d'invitation iront dans <#${i.values[0]}>.` }, "invites"); }
+    if (action === "delay") return i.showModal(modal("pm:invites:delay", "Suppression automatique",
+      [{ id: "minutes", label: "Minutes avant suppression (0 = garder)", required: true, value: `${Math.round((config.invites.deleteAfterMs ?? 120000) / 60000)}`, max: 4 }]));
+    if (action === "recal") {
+      await i.deferUpdate();
+      const r = await recalibrate(i.guild);
+      return feedback(i, r.ok
+        ? { ok: true, title: "Classement recalé", text: `${r.people} personne(s) recréditée(s) — ${num(r.total)} utilisation(s) de liens reprises depuis Discord.` }
+        : { ok: false, title: "Recalage impossible", text: r.error, color: COLORS.danger }, "invites");
+    }
+    if (action === "reset") { await updateConfig(i.guildId, { invites: { baseline: {} } }); const n = await resetInvites(i.guildId);
+      return feedback(i, { ok: true, title: "Classement remis à zéro", text: `${n} enregistrement(s) effacé(s).` }, "invites"); }
+  }
+
+  /* -------------------------------- TICKETS ------------------------------ */
+  if (section === "tickets") {
+    if (action === "publish") {
+      const ch = i.guild.channels.cache.get(i.values[0]);
+      if (!canSend(ch)) return feedback(i, { ok: false, title: "Salon inaccessible", text: `Je ne peux pas écrire dans ${ch}.`, color: COLORS.danger }, "tickets");
+      await ch.send({ embeds: [embed({ guild: i.guild, author: { name: `${ICONS.ticket}  Centre d'aide` }, color: COLORS.primary,
+        description: "Choisis le type de ticket dans le menu. Un salon privé sera créé avec le staff concerné.\n\nLes ouvertures abusives sont sanctionnées." })],
+        components: ticketPanelComponents() });
+      return feedback(i, { ok: true, title: "Panneau publié", text: `Le menu est en ligne dans ${ch}.` }, "tickets");
+    }
+    if (action === "refresh") { await refreshTicketCounter(i.guild); return feedback(i, { ok: true, title: "Compteur actualisé", text: "Le salon compteur-tickets est à jour." }, "tickets"); }
+  }
+
+  /* ------------------------------- COMPTEURS ----------------------------- */
+  if (section === "counters") {
+    if (action === "set") { await updateConfig(i.guildId, { counters: { ...config.counters, [arg]: i.values[0] } });
+      return feedback(i, { ok: true, title: "Compteur rattaché", text: `**${arg}** → <#${i.values[0]}>` }, "counters"); }
+    if (action === "clear") { await updateConfig(i.guildId, { counters: { members: null, online: null, voice: null } });
+      return feedback(i, { ok: true, title: "Compteurs déliés", text: "Retour à la détection par le motif « Nom : nombre »." }, "counters"); }
+    if (action === "force") { await i.deferUpdate(); await updateCounters(i.guild, true); return respond(i, await buildSection("counters", i, config)); }
+  }
+
+  /* -------------------------------- NIVEAUX ------------------------------ */
+  if (section === "levels") {
+    if (action === "t") { await updateConfig(i.guildId, { levelsEnabled: !config.levelsEnabled }); return respond(i, await buildSection("levels", i, await getConfig(i.guildId))); }
+    if (action === "channel") { await updateConfig(i.guildId, { funcOverrides: { ...config.funcOverrides, levelUp: i.values[0] } });
+      return feedback(i, { ok: true, title: "Salon défini", text: `Les montées de niveau iront dans <#${i.values[0]}>.` }, "levels"); }
+    if (action === "reward") return i.showModal(modal(`pm:levels:reward:${i.values[0]}`, "Récompense de niveau",
+      [{ id: "level", label: "À quel niveau donner ce rôle ?", required: true, placeholder: "10", max: 3 }]));
+    if (action === "delreward") { const r = { ...config.levelRewards }; delete r[i.values[0]];
+      await updateConfig(i.guildId, { levelRewards: r });
+      return feedback(i, { ok: true, title: "Récompense retirée", text: `Plus rien n'est donné au niveau ${i.values[0]}.` }, "levels"); }
+  }
+
+  /* -------------------------------- ÉCONOMIE ----------------------------- */
+  if (section === "eco") {
+    if (action === "t") { await updateConfig(i.guildId, { economy: { enabled: !config.economy.enabled } }); return respond(i, await buildSection("eco", i, await getConfig(i.guildId))); }
+    if (action === "montants") { const e = config.economy;
+      return i.showModal(modal("pm:eco:montants", "Montants de l'économie", [
+        { id: "currency", label: "Symbole de la monnaie", value: e.currency, max: 8 },
+        { id: "daily", label: "Récompense quotidienne", value: `${e.dailyAmount}`, max: 8 },
+        { id: "work", label: "Travail : min-max-minutes", value: `${e.workMin}-${e.workMax}-${Math.round(e.workCooldownMs / 60000)}`, max: 20 },
+        { id: "drop", label: "Colis : min-max", value: `${e.dropMin}-${e.dropMax}`, max: 16 },
+        { id: "chance", label: "Chance de colis par message (%)", value: `${e.dropChance}`, max: 3 },
+      ])); }
+    if (action === "addtype") {
+      const type = i.values[0];
+      if (ITEM_TYPES[type]?.needsRole) return respond(i, { embeds: [embed({ guild: i.guild,
+        author: { name: `${ITEM_TYPES[type].emoji}  ${ITEM_TYPES[type].label}` }, description: "Quel rôle sera offert à l'achat ?" })],
+        components: [row(new RoleSelectMenuBuilder().setCustomId(`p:eco:additem:${type}`).setPlaceholder("Rôle offert…")), backRow("p:eco")] });
+      return i.showModal(itemModal(type, "none"));
+    }
+    if (action === "additem") return i.showModal(itemModal(arg, i.values[0]));
+    if (action === "del") { await updateConfig(i.guildId, { economy: { shop: config.economy.shop.filter((x) => x.id !== i.values[0]) } });
+      return feedback(i, { ok: true, title: "Article retiré", text: "La boutique est à jour." }, "eco"); }
+    if (action === "dropch") { await updateConfig(i.guildId, { economy: { dropChannelId: i.values[0] } });
+      return feedback(i, { ok: true, title: "Salon des colis", text: `Les colis tomberont dans <#${i.values[0]}>.` }, "eco"); }
+    if (action === "drop") {
+      const e = config.economy;
+      const ch = e.dropChannelId ? i.guild.channels.cache.get(e.dropChannelId) : resolveFuncChannel(i.guild, "drops", config) ?? i.channel;
+      const amount = e.dropMin + Math.floor(Math.random() * (e.dropMax - e.dropMin + 1));
+      const msg = await launchDrop(i.guild, ch, amount);
+      return feedback(i, msg ? { ok: true, title: "Colis lâché", text: `${num(amount)} coins à récupérer dans ${ch}.`, color: COLORS.gold }
+        : { ok: false, title: "Échec", text: `Impossible d'écrire dans ${ch}.`, color: COLORS.danger }, "eco");
+    }
+  }
+
+  /* ------------------------------- GIVEAWAYS ----------------------------- */
+  if (section === "gw") {
+    if (action === "new") return respond(i, { embeds: [embed({ guild: i.guild, author: { name: `${ICONS.gift}  Nouveau giveaway` },
+      description: "Dans quel salon le publier ?" })],
+      components: [row(new ChannelSelectMenuBuilder().setCustomId("p:gw:ch").setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon du giveaway…")), backRow("p:gw")] });
+    if (action === "ch") return respond(i, { embeds: [embed({ guild: i.guild, author: { name: `${ICONS.gift}  Rôle requis ?` },
+      description: `Salon : <#${i.values[0]}>\n\nChoisis un rôle obligatoire, ou continue sans condition.` })],
+      components: [row(new RoleSelectMenuBuilder().setCustomId(`p:gw:role:${i.values[0]}`).setPlaceholder("Rôle requis (facultatif)…")),
+        row(btn(`p:gw:norole:${i.values[0]}`, "Ouvert à tous", ButtonStyle.Success, "🌍"), btn("p:gw", "Annuler", ButtonStyle.Secondary, "◀️"))] });
+    if (action === "role") return i.showModal(modal(`pm:gw:new:${arg}_${i.values[0]}`, "Nouveau giveaway", [
+      { id: "prize", label: "Ce qui est à gagner", required: true, max: 200 },
+      { id: "duration", label: "Durée (30m, 6h, 2d)", required: true, max: 10 },
+      { id: "winners", label: "Nombre de gagnants", value: "1", max: 2 }]));
+    if (action === "norole") return i.showModal(modal(`pm:gw:new:${arg}_none`, "Nouveau giveaway", [
+      { id: "prize", label: "Ce qui est à gagner", required: true, max: 200 },
+      { id: "duration", label: "Durée (30m, 6h, 2d)", required: true, max: 10 },
+      { id: "winners", label: "Nombre de gagnants", value: "1", max: 2 }]));
+    if (action === "pick") return respond(i, { embeds: [embed({ guild: i.guild,
+      author: { name: `${ICONS.gift}  Giveaway #${i.values[0]}` }, description: "Que veux-tu faire ?" })],
+      components: [row(btn(`p:gw:end:${i.values[0]}`, "Terminer maintenant", ButtonStyle.Danger, "🏁"),
+        btn(`p:gw:reroll:${i.values[0]}`, "Retirer au sort", ButtonStyle.Primary, "🎲"),
+        btn("p:gw", "Retour", ButtonStyle.Secondary, "◀️"))] });
+    if (action === "end" || action === "reroll") {
+      const g = await getGiveaway(Number(arg));
+      if (!g) return feedback(i, { ok: false, title: "Introuvable", text: "Ce giveaway n'existe plus.", color: COLORS.danger }, "gw");
+      await i.deferUpdate();
+      const w = await drawGiveaway(i.client, g, action === "reroll" ? 1 : null);
+      return feedback(i, { ok: true, title: action === "reroll" ? "Nouveau tirage" : "Giveaway terminé",
+        text: w.length ? `Gagnant(s) : ${w.map((x) => `<@${x}>`).join(", ")}` : "Aucun participant.", color: COLORS.gold }, "gw");
+    }
+  }
+
+  /* ------------------------------ PUBLICATIONS --------------------------- */
+  if (section === "publish") {
+    if (action === "pick") {
+      const labels = { member: "Espace membre", ticket: "Tickets", confess: "Confessions", roles: "Menu de rôles", say: "Annonce", poll: "Sondage" };
+      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: `📢  ${labels[arg]}` }, description: "Dans quel salon ?" })],
+        components: [row(new ChannelSelectMenuBuilder().setCustomId(`p:publish:go:${arg}`)
+          .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+          .setMinValues(1).setMaxValues(10)
+          .setPlaceholder("Choisis un ou plusieurs salons…")), backRow("p:publish")] });
+    }
+    if (action === "go") {
+      const targets = i.values.map((id) => i.guild.channels.cache.get(id)).filter(Boolean);
+      const usable = targets.filter((c) => canSend(c));
+      if (!usable.length) return feedback(i, { ok: false, title: "Salons inaccessibles",
+        text: `Je ne peux écrire dans aucun des salons choisis.`, color: COLORS.danger }, "publish");
+      const chId = i.values.join("+");
+      if (arg === "roles") return i.showModal(modal(`pm:publish:roles:${chId}`, "Menu de rôles", [
+        { id: "title", label: "Titre du menu", required: true, max: 100 },
+        { id: "roles", label: "Rôles : mentions ou IDs, séparés par ,", required: true, long: true, max: 500 }]));
+      if (arg === "say") return i.showModal(modal(`pm:publish:say:${chId}`, "Annonce", [
+        { id: "text", label: "Texte", required: true, long: true, max: 3000 },
+        { id: "title", label: "Titre (vide = message simple)", max: 100 }]));
+      if (arg === "poll") return i.showModal(modal(`pm:publish:poll:${chId}`, "Sondage", [
+        { id: "question", label: "Question", required: true, max: 200 },
+        { id: "options", label: "Choix séparés par des virgules", required: true, long: true, max: 500 }]));
+      for (const ch of usable) {
+        if (arg === "member") await ch.send(memberPanel(i.guild)).catch(() => null);
+        else if (arg === "confess") await ch.send(confessionPanel(i.guild)).catch(() => null);
+        else await ch.send({ embeds: [embed({ guild: i.guild, author: { name: `${ICONS.ticket}  Centre d'aide` },
+          description: "Choisis le type de ticket dans le menu ci-dessous." })], components: ticketPanelComponents() }).catch(() => null);
+      }
+      const skipped = targets.length - usable.length;
+      return feedback(i, { ok: true, title: `Publié dans ${usable.length} salon(s)`,
+        text: usable.map((c) => `${c}`).join(" ") + (skipped ? `\n\n⚠️ ${skipped} salon(s) ignoré(s) — je n'y ai pas accès.` : "") }, "publish");
+    }
+  }
+
+  return respond(i, await buildSection(section, i, config));
 }
 
 /* ========================================================================== */
@@ -3185,172 +3925,300 @@ async function showMemberCard(i, userId, config) {
 async function handleModal(i, parts, config, level) {
   const [, section, action, arg] = parts;
   const sec = SECTIONS.find((s) => s.id === section);
-  if (sec?.ownerOnly && !isOwner(i.user.id)) return respond(i, lockedView(i.guild, sec));
+  if (sec?.ownerOnly && !isOwner(i.user.id)) return respond(i, denyView(i.guild, sec, config));
+  if (sec?.trusted && !isTrusted(i.member, config)) return respond(i, denyView(i.guild, sec, config));
   const f = (id) => i.fields.getTextInputValue(id)?.trim() ?? "";
+  const int = (id) => { const n = parseInt(f(id), 10); return Number.isFinite(n) ? n : null; };
 
+  /* ---------------------------------- MOD -------------------------------- */
   if (section === "mod") {
     if (action === "purge") {
-      const amount = Math.min(100, Math.max(1, parseInt(f("amount"), 10) || 0));
-      const uid = f("user").replace(/\D/g, "") || null;
-      return feedback(i, await actionPurge(i.channel, amount, uid, i.user), "mod");
+      const ch = i.guild.channels.cache.get(arg) ?? i.channel;
+      return feedback(i, await actionPurge(ch, Math.min(100, Math.max(1, int("amount") ?? 0)), f("user").replace(/\D/g, "") || null, i.user), "mod");
+    }
+    if (action === "slow") {
+      const ch = i.guild.channels.cache.get(arg) ?? i.channel;
+      const s = Math.max(0, Math.min(21600, int("seconds") ?? 0));
+      await ch.setRateLimitPerUser(s, i.user.tag).catch(() => null);
+      return feedback(i, { ok: true, title: s ? "Mode lent activé" : "Mode lent coupé", text: `${ch} — ${s ? `${s} seconde(s) entre chaque message` : "plus de limite"}.` }, "mod");
     }
     if (action === "unban") return feedback(i, await actionUnban(i.guild, f("userid").replace(/\D/g, ""), i.user, f("reason") || "Non précisée"), "mod");
 
     const target = await i.guild.members.fetch(arg).catch(() => null);
     if (!target) return feedback(i, { ok: false, title: "Introuvable", text: "Ce membre a quitté le serveur.", color: COLORS.danger }, "mod");
+    const problem = checkTarget(i.guild, i.member, target, config);
+    if (problem) return feedback(i, { ok: false, title: "Action refusée", text: problem, color: COLORS.danger }, "mod");
     const reason = f("reason") || "Non précisée";
 
     if (action === "warn") return feedback(i, await actionWarn(i.guild, target, i.user, reason), "mod");
     if (action === "timeout") return feedback(i, await actionTimeout(i.guild, target, i.user, parseDuration(f("duration")), reason), "mod");
     if (action === "kick") return feedback(i, await actionKick(i.guild, target, i.user, reason), "mod");
-    if (action === "ban") return feedback(i, await actionBan(i.guild, target, i.user, reason, Math.min(7, Math.max(0, parseInt(f("purge"), 10) || 0))), "mod");
+    if (action === "ban") return feedback(i, await actionBan(i.guild, target, i.user, reason, Math.min(7, Math.max(0, int("purge") ?? 0))), "mod");
     if (action === "jail") return feedback(i, await actionJail(i.guild, target, i.user, reason, parseDuration(f("duration"))), "mod");
     if (action === "coins") {
-      const amount = parseInt(f("amount"), 10);
-      if (!Number.isFinite(amount)) return feedback(i, { ok: false, title: "Montant invalide", text: "Entre un nombre entier.", color: COLORS.danger }, "mod");
+      const amount = int("amount");
+      if (amount === null) return feedback(i, { ok: false, title: "Montant invalide", text: "Entre un nombre entier.", color: COLORS.danger }, "mod");
       return feedback(i, await actionGrantCoins(i.guild, target, amount, i.user, f("reason")), "mod");
     }
   }
 
-  if (section === "config" && action === "msg") {
-    await updateConfig(i.guildId, { welcomeMessage: f("text") });
-    return feedback(i, { ok: true, title: "Message d'accueil enregistré", text: f("text") }, "config");
+  /* --------------------------------- STAFF ------------------------------- */
+  if (section === "staff" && action === "absence") {
+    const ms = parseDuration(f("duration"));
+    const until = ms ? new Date(Date.now() + ms) : null;
+    await addAbsence(i.guildId, i.user.id, f("reason"), until);
+    const ch = resolveFuncChannel(i.guild, "absences", config);
+    const e = embed({ guild: i.guild, color: COLORS.neutral, author: { name: "🛌  Absence déclarée" },
+      fields: [{ name: "Membre", value: `${i.user}`, inline: true },
+        { name: "Retour", value: until ? ts(until) : "Non précisé", inline: true },
+        { name: "Motif", value: f("reason") }] });
+    if (ch && canSend(ch)) await ch.send({ embeds: [e] }).catch(() => null);
+    return feedback(i, { ok: true, title: "Absence enregistrée", text: ch ? `Publiée dans ${ch}.` : "Aucun salon #absences trouvé — enregistrée quand même." }, "staff");
   }
 
+  /* -------------------------------- CONFIG ------------------------------- */
+  if (section === "config") {
+    if (action === "msgw") { await updateConfig(i.guildId, { welcomeMessage: f("text") }); return feedback(i, { ok: true, title: "Message d'accueil enregistré", text: f("text") }, "config", "welcome"); }
+    if (action === "msgg") { await updateConfig(i.guildId, { goodbyeMessage: f("text") }); return feedback(i, { ok: true, title: "Message de départ enregistré", text: f("text") }, "config", "welcome"); }
+  }
+
+  /* -------------------------------- AUTOMOD ------------------------------ */
   if (section === "automod") {
     if (action === "seuils") {
-      const [thr, win] = f("spam").split("/").map((x) => parseInt(x, 10));
+      const [thr, win, mins] = f("spam").split("/").map((x) => parseInt(x, 10));
       const patch = {};
       if (Number.isFinite(thr) && thr >= 3) patch.spamThreshold = Math.min(30, thr);
       if (Number.isFinite(win) && win >= 3) patch.spamWindowMs = Math.min(120, win) * 1000;
-      const m = parseInt(f("mentions"), 10); if (Number.isFinite(m)) patch.maxMentions = Math.min(30, Math.max(0, m));
-      const c = parseInt(f("caps"), 10); if (Number.isFinite(c)) patch.capsPercent = Math.min(100, Math.max(0, c));
-      const e = parseInt(f("emojis"), 10); if (Number.isFinite(e)) patch.maxEmojis = Math.min(50, Math.max(0, e));
+      if (Number.isFinite(mins) && mins >= 1) patch.spamTimeoutMinutes = Math.min(1440, mins);
+      const m = int("mentions"); if (m !== null) patch.maxMentions = Math.min(30, Math.max(0, m));
+      const c = int("caps"); if (c !== null) patch.capsPercent = Math.min(100, Math.max(0, c));
+      const e = int("emojis"); if (e !== null) patch.maxEmojis = Math.min(50, Math.max(0, e));
       await updateConfig(i.guildId, { automod: patch });
       return feedback(i, { ok: true, title: "Seuils enregistrés", text: "L'automod applique déjà les nouvelles valeurs." }, "automod");
     }
     if (action === "mots") {
-      const words = f("words").split(",").map((w) => w.trim().toLowerCase()).filter(Boolean);
-      await updateConfig(i.guildId, { automod: { bannedWords: [...new Set(words)] } });
+      const words = [...new Set(f("words").split(",").map((w) => w.trim().toLowerCase()).filter(Boolean))];
+      await updateConfig(i.guildId, { automod: { bannedWords: words } });
       return feedback(i, { ok: true, title: "Liste enregistrée", text: `${words.length} mot(s) interdit(s).` }, "automod");
     }
   }
 
+  /* ------------------------------- PROTECT ------------------------------- */
   if (section === "protect") {
     if (action === "raid") {
       const patch = {};
-      const t = parseInt(f("threshold"), 10); if (Number.isFinite(t)) patch.joinThreshold = Math.max(3, Math.min(50, t));
-      const w = parseInt(f("window"), 10); if (Number.isFinite(w)) patch.joinWindowMs = Math.max(5, Math.min(120, w)) * 1000;
-      const a = parseInt(f("age"), 10); if (Number.isFinite(a)) patch.minAccountAgeDays = Math.max(0, Math.min(90, a));
+      const t = int("threshold"); if (t !== null) patch.joinThreshold = Math.max(3, Math.min(50, t));
+      const w = int("window"); if (w !== null) patch.joinWindowMs = Math.max(5, Math.min(120, w)) * 1000;
+      const a = int("age"); if (a !== null) patch.minAccountAgeDays = Math.max(0, Math.min(90, a));
+      const l = int("lockmin"); if (l !== null) patch.lockdownMinutes = Math.max(1, Math.min(1440, l));
       const m = f("mode").toLowerCase(); if (["lockdown", "kick", "off"].includes(m)) patch.onRaid = m;
       await updateConfig(i.guildId, { antiraid: patch });
       return feedback(i, { ok: true, title: "Anti-raid enregistré", text: "Les nouveaux seuils sont actifs." }, "protect");
     }
     if (action === "nuke") {
       const patch = {};
-      const c = parseInt(f("chan"), 10); if (Number.isFinite(c)) patch.channelDeleteMax = Math.max(1, Math.min(20, c));
-      const r = parseInt(f("role"), 10); if (Number.isFinite(r)) patch.roleDeleteMax = Math.max(1, Math.min(20, r));
-      const b = parseInt(f("ban"), 10); if (Number.isFinite(b)) patch.banMax = Math.max(1, Math.min(30, b));
-      const w = parseInt(f("window"), 10); if (Number.isFinite(w)) patch.windowMs = Math.max(5, Math.min(120, w)) * 1000;
+      const c = int("chan"); if (c !== null) patch.channelDeleteMax = Math.max(1, Math.min(20, c));
+      const r = int("role"); if (r !== null) patch.roleDeleteMax = Math.max(1, Math.min(20, r));
+      const [b, k] = f("bankick").split("/").map((x) => parseInt(x, 10));
+      if (Number.isFinite(b)) patch.banMax = Math.max(1, Math.min(30, b));
+      if (Number.isFinite(k)) patch.kickMax = Math.max(1, Math.min(30, k));
+      const w = int("window"); if (w !== null) patch.windowMs = Math.max(5, Math.min(120, w)) * 1000;
       const m = f("mode").toLowerCase(); if (["strip", "ban", "alert"].includes(m)) patch.punishment = m;
       await updateConfig(i.guildId, { antinuke: patch });
       return feedback(i, { ok: true, title: "Anti-nuke enregistré", text: "Les nouveaux seuils sont actifs." }, "protect");
     }
   }
 
+  /* -------------------------------- NIVEAUX ------------------------------ */
   if (section === "levels" && action === "reward") {
-    const lvl = parseInt(f("level"), 10);
-    if (!Number.isFinite(lvl) || lvl < 1) return feedback(i, { ok: false, title: "Niveau invalide", text: "Entre un nombre supérieur à 0.", color: COLORS.danger }, "levels");
+    const lvl = int("level");
+    if (lvl === null || lvl < 1) return feedback(i, { ok: false, title: "Niveau invalide", text: "Entre un nombre supérieur à 0.", color: COLORS.danger }, "levels");
     await updateConfig(i.guildId, { levelRewards: { ...config.levelRewards, [lvl]: arg } });
     return feedback(i, { ok: true, title: "Récompense enregistrée", text: `<@&${arg}> sera donné au niveau **${lvl}**.` }, "levels");
   }
 
+  /* -------------------------------- ÉCONOMIE ----------------------------- */
   if (section === "eco") {
     if (action === "montants") {
       const patch = {};
       const cur = f("currency"); if (cur) patch.currency = cur.slice(0, 8);
-      const d = parseInt(f("daily"), 10); if (Number.isFinite(d)) patch.dailyAmount = Math.max(0, d);
-      const [wmin, wmax] = f("work").split("-").map((x) => parseInt(x, 10));
+      const d = int("daily"); if (d !== null) patch.dailyAmount = Math.max(0, d);
+      const [wmin, wmax, wcd] = f("work").split("-").map((x) => parseInt(x, 10));
       if (Number.isFinite(wmin) && Number.isFinite(wmax) && wmin <= wmax) { patch.workMin = wmin; patch.workMax = wmax; }
+      if (Number.isFinite(wcd) && wcd >= 1) patch.workCooldownMs = Math.min(1440, wcd) * 60_000;
       const [dmin, dmax] = f("drop").split("-").map((x) => parseInt(x, 10));
       if (Number.isFinite(dmin) && Number.isFinite(dmax) && dmin <= dmax) { patch.dropMin = dmin; patch.dropMax = dmax; }
-      const ch = parseInt(f("chance"), 10); if (Number.isFinite(ch)) patch.dropChance = Math.max(0, Math.min(100, ch));
+      const ch = int("chance"); if (ch !== null) patch.dropChance = Math.max(0, Math.min(100, ch));
       await updateConfig(i.guildId, { economy: patch });
       return feedback(i, { ok: true, title: "Montants enregistrés", text: "L'économie utilise déjà les nouvelles valeurs.", color: COLORS.gold }, "eco");
     }
     if (action === "additem") {
-      const name = f("name");
-      const price = parseInt(f("price"), 10);
-      if (!name || !Number.isFinite(price) || price < 1) return feedback(i, { ok: false, title: "Article invalide", text: "Il faut un nom et un prix positif.", color: COLORS.danger }, "eco");
-      const role = i.guild.roles.cache.get(arg);
-      if (!role || role.position >= i.guild.members.me.roles.highest.position)
-        return feedback(i, { ok: false, title: "Rôle inutilisable", text: "Ce rôle est au-dessus du mien ou n'existe plus.", color: COLORS.danger }, "eco");
-      const stockRaw = parseInt(f("stock"), 10);
-      const item = { id: name.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40) || `a${Date.now()}`, name, price, roleId: arg, stock: Number.isFinite(stockRaw) ? stockRaw : null };
+      const [type, roleId] = arg.split("_");
+      const name = f("name"); const price = int("price");
+      if (!name || price === null || price < 1)
+        return feedback(i, { ok: false, title: "Article invalide", text: "Il faut un nom et un prix positif.", color: COLORS.danger }, "eco");
+
+      if (ITEM_TYPES[type]?.needsRole) {
+        const role = i.guild.roles.cache.get(roleId);
+        if (!role || role.position >= i.guild.members.me.roles.highest.position)
+          return feedback(i, { ok: false, title: "Rôle inutilisable", text: "Ce rôle est au-dessus du mien ou n'existe plus.", color: COLORS.danger }, "eco");
+      }
+
+      const item = {
+        id: `${type}-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 30)}` || `a${Date.now()}`,
+        type, name, price,
+        roleId: ITEM_TYPES[type]?.needsRole ? roleId : null,
+        amount: int("amount"), hours: int("hours"), stock: int("stock"),
+      };
       await updateConfig(i.guildId, { economy: { shop: [...config.economy.shop, item] } });
-      return feedback(i, { ok: true, title: "Article ajouté", text: `**${name}** — ${num(price)} coins → ${role}`, color: COLORS.gold }, "eco");
+      return feedback(i, { ok: true, title: "Article ajouté",
+        text: `${ITEM_TYPES[type]?.emoji ?? ""} **${name}** — ${num(price)} coins`, color: COLORS.gold }, "eco");
     }
   }
 
+  /* ------------------------------- GIVEAWAYS ----------------------------- */
   if (section === "gw" && action === "new") {
+    const [chId, roleId] = arg.split("_");
     const ms = parseDuration(f("duration"));
     if (!ms || ms < 60_000) return feedback(i, { ok: false, title: "Durée invalide", text: "Minimum 1 minute. Exemples : `30m`, `6h`, `2d`.", color: COLORS.danger }, "gw");
-    const winners = Math.max(1, Math.min(20, parseInt(f("winners"), 10) || 1));
-    const gid = await createGiveaway({ guildId: i.guildId, channelId: i.channelId, prize: f("prize"), winners,
-      hostId: i.user.id, requiredRole: null, endsAt: new Date(Date.now() + ms) });
-    await postGiveaway(i.client, gid, i.channel);
-    return feedback(i, { ok: true, title: "Giveaway lancé", text: `\`#${gid}\` **${f("prize")}** — ${winners} gagnant(s), fin dans ${formatDuration(ms)}.`, color: COLORS.gold }, "gw");
+    const ch = i.guild.channels.cache.get(chId) ?? i.channel;
+    const gid = await createGiveaway({ guildId: i.guildId, channelId: ch.id, prize: f("prize"),
+      winners: Math.max(1, Math.min(20, int("winners") ?? 1)), hostId: i.user.id,
+      requiredRole: roleId === "none" ? null : roleId, endsAt: new Date(Date.now() + ms) });
+    await postGiveaway(i.client, gid, ch);
+    return feedback(i, { ok: true, title: "Giveaway lancé",
+      text: `\`#${gid}\` **${f("prize")}** dans ${ch}, fin dans ${formatDuration(ms)}${roleId !== "none" ? ` · <@&${roleId}> requis` : ""}.`, color: COLORS.gold }, "gw");
   }
 
+  /* ------------------------------ PUBLICATIONS --------------------------- */
   if (section === "publish") {
+    const chans = String(arg ?? "").split("+").map((id) => i.guild.channels.cache.get(id)).filter((c) => c && canSend(c));
+    if (!chans.length) chans.push(i.channel);
+    const ch = chans[0];
+    const spread = (label) => ({ ok: true, title: `${label} dans ${chans.length} salon(s)`, text: chans.map((c) => `${c}`).join(" ") });
     if (action === "roles") {
       const ids = f("roles").match(/\d{15,25}/g) ?? [];
-      const roles = ids.map((id) => i.guild.roles.cache.get(id)).filter(Boolean).slice(0, 20);
-      if (!roles.length) return feedback(i, { ok: false, title: "Aucun rôle valide", text: "Mentionne les rôles ou colle leurs identifiants, séparés par des virgules.", color: COLORS.danger }, "publish");
+      const roles = ids.map((x) => i.guild.roles.cache.get(x)).filter(Boolean).slice(0, 20);
+      if (!roles.length) return feedback(i, { ok: false, title: "Aucun rôle valide", text: "Mentionne les rôles ou colle leurs identifiants.", color: COLORS.danger }, "publish");
       const top = i.guild.members.me.roles.highest.position;
       const bad = roles.filter((r) => r.position >= top || r.managed);
       if (bad.length) return feedback(i, { ok: false, title: "Rôles inutilisables", text: `Je ne peux pas gérer ${bad.join(", ")}.`, color: COLORS.danger }, "publish");
-      const menu = new StringSelectMenuBuilder().setCustomId("rolemenu").setPlaceholder("Choisis tes rôles")
-        .setMinValues(0).setMaxValues(roles.length)
-        .addOptions(roles.map((r) => ({ label: r.name.slice(0, 100), value: r.id })));
-      await i.channel.send({ embeds: [embed({ guild: i.guild, author: { name: `🎭  ${f("title")}` },
+      for (const c of chans) await c.send({ embeds: [embed({ guild: i.guild, author: { name: `🎭  ${f("title")}` },
         description: "Sélectionne les rôles que tu veux. Désélectionne pour les retirer." })],
-        components: [new ActionRowBuilder().addComponents(menu)] });
-      return feedback(i, { ok: true, title: "Menu publié", text: `${roles.length} rôle(s) proposés dans ${i.channel}.` }, "publish");
+        components: [row(new StringSelectMenuBuilder().setCustomId("rolemenu").setPlaceholder("Choisis tes rôles")
+          .setMinValues(0).setMaxValues(roles.length).addOptions(roles.map((r) => ({ label: r.name.slice(0, 100), value: r.id }))))] }).catch(() => null);
+      return feedback(i, spread(`Menu de ${roles.length} rôle(s) publié`), "publish");
     }
     if (action === "say") {
-      const title = f("title");
-      const text = f("text").replaceAll("\\n", "\n");
-      await i.channel.send(title
+      const title = f("title"); const text = f("text").replaceAll("\\n", "\n");
+      for (const c of chans) await c.send(title
         ? { embeds: [embed({ guild: i.guild, author: { name: `📣  ${title}` }, description: text })] }
-        : { content: text });
-      return feedback(i, { ok: true, title: "Annonce publiée", text: `Envoyée dans ${i.channel}.` }, "publish");
+        : { content: text }).catch(() => null);
+      return feedback(i, spread("Annonce publiée"), "publish");
     }
     if (action === "poll") {
       const POLL = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"];
       const opts = f("options").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 10);
-      if (opts.length < 2) return feedback(i, { ok: false, title: "Sondage invalide", text: "Il faut au moins 2 choix séparés par des virgules.", color: COLORS.danger }, "publish");
-      const msg = await i.channel.send({ embeds: [embed({ guild: i.guild, author: { name: `📊  ${f("question")}` },
-        description: opts.map((o, n) => `${POLL[n]} ${o}`).join("\n\n"), footer: `Lancé par ${i.user.tag}` })] });
-      for (let n = 0; n < opts.length; n++) await msg.react(POLL[n]).catch(() => null);
-      return feedback(i, { ok: true, title: "Sondage publié", text: `${opts.length} choix dans ${i.channel}.` }, "publish");
+      if (opts.length < 2) return feedback(i, { ok: false, title: "Sondage invalide", text: "Il faut au moins 2 choix.", color: COLORS.danger }, "publish");
+      for (const c of chans) {
+        const msg = await c.send({ embeds: [embed({ guild: i.guild, author: { name: `📊  ${f("question")}` },
+          description: opts.map((o, n) => `${POLL[n]} ${o}`).join("\n\n"), footer: `Lancé par ${i.user.tag}` })] }).catch(() => null);
+        if (msg) for (let n = 0; n < opts.length; n++) await msg.react(POLL[n]).catch(() => null);
+      }
+      return feedback(i, spread(`Sondage à ${opts.length} choix publié`), "publish");
     }
   }
 
+  if (section === "invites" && action === "delay") {
+    const m = int("minutes");
+    if (m === null || m < 0) return feedback(i, { ok: false, title: "Valeur invalide", text: "Entre un nombre de minutes.", color: COLORS.danger }, "invites");
+    await updateConfig(i.guildId, { invites: { deleteAfterMs: Math.min(1440, m) * 60_000 } });
+    return feedback(i, { ok: true, title: "Délai enregistré",
+      text: m === 0 ? "Les annonces ne seront plus supprimées." : `Suppression après ${m} minute(s).` }, "invites");
+  }
+
+  /* ---------------------------- PANNEAUX PUBLICS ------------------------- */
   if (section === "pub") {
+    if (action === "buyrole") {
+      const r = await actionBuy(i.guild, i.member, arg, { name: f("name"), color: f("color") });
+      return i.reply({ embeds: [embed({ guild: i.guild, color: r.color,
+        author: { name: `${r.ok ? ICONS.ok : ICONS.no}  ${r.title}` }, description: r.text })], ...EPH });
+    }
     if (action === "confess") return postConfession(i, f("text"));
     if (action === "pay") {
-      const uid = f("user").replace(/\D/g, "");
-      const amount = parseInt(f("amount"), 10);
-      const to = await i.client.users.fetch(uid).catch(() => null);
+      const to = await i.client.users.fetch(f("user").replace(/\D/g, "")).catch(() => null);
+      const amount = int("amount");
       if (!to) return i.reply({ content: "Membre introuvable. Colle son identifiant.", ...EPH });
-      if (!Number.isFinite(amount) || amount < 1) return i.reply({ content: "Montant invalide.", ...EPH });
+      if (amount === null || amount < 1) return i.reply({ content: "Montant invalide.", ...EPH });
       const r = await actionPay(i.guild, i.user, to, amount);
-      return i.reply({ embeds: [embed({ guild: i.guild, color: r.color, author: { name: `${r.ok ? ICONS.ok : ICONS.no}  ${r.title}` }, description: r.text })], ...EPH });
+      return i.reply({ embeds: [embed({ guild: i.guild, color: r.color,
+        author: { name: `${r.ok ? ICONS.ok : ICONS.no}  ${r.title}` }, description: r.text })], ...EPH });
     }
   }
 
   return respond(i, await buildSection("home", i, config));
+}
+
+/* ========================================================================== */
+/*                           MENUS CONTEXTUELS                                */
+/* ========================================================================== */
+
+async function handleContextMenu(i) {
+  const config = await getConfig(i.guildId);
+  const level = permLevel(i.member, config);
+  const deny = (need) => i.reply({ embeds: [embed({ guild: i.guild, color: COLORS.danger,
+    author: { name: `${ICONS.no}  Accès refusé` },
+    description: `Cette action demande **${PERM_LABELS[need]}**.\nTon niveau : **${PERM_LABELS[level]}**.` })], ...EPH });
+
+  if (i.commandName === "Fiche de modération") {
+    if (level < 1) return deny(1);
+    await i.deferReply(EPH);
+    i.replied = true;
+    return showMemberCard(i, i.targetId, config);
+  }
+
+  if (i.commandName === "Ses invitations") {
+    const raw = await inviterStats(i.guildId, i.targetId);
+    const s = { active: withBaseline(config, i.targetId, raw.active), total: withBaseline(config, i.targetId, raw.total) };
+    const parrain = await getInviter(i.guildId, i.targetId);
+    return i.reply({ embeds: [embed({ guild: i.guild, author: { name: "🔗  Invitations" },
+      description: `<@${i.targetId}>`,
+      fields: [
+        { name: "Invités actifs", value: `${s.active}`, inline: true },
+        { name: "Total", value: `${s.total}`, inline: true },
+        { name: "Invité(e) par", value: parrain?.inviter_id ? `<@${parrain.inviter_id}>` : "_inconnu_", inline: true },
+      ] })], ...EPH });
+  }
+
+  if (i.commandName === "Supprimer et avertir") {
+    if (level < 1) return deny(1);
+    const msg = i.targetMessage;
+    const author = msg.author;
+    if (author.bot) return i.reply({ content: "Ce message vient d'un bot.", ...EPH });
+    const target = await i.guild.members.fetch(author.id).catch(() => null);
+    if (!target) return i.reply({ content: "L'auteur a quitté le serveur.", ...EPH });
+    const problem = checkTarget(i.guild, i.member, target, config);
+    if (problem) return i.reply({ content: problem, ...EPH });
+    await msg.delete().catch(() => null);
+    return i.showModal(modal(`pm:mod:warn:${author.id}`, `Avertir ${author.username}`.slice(0, 45), [REASON]));
+  }
+
+  if (i.commandName === "Purger jusqu'ici") {
+    if (level < 1) return deny(1);
+    await i.deferReply(EPH);
+    const fetched = await i.channel.messages.fetch({ limit: 100 }).catch(() => null);
+    if (!fetched) return i.editReply("Lecture impossible dans ce salon.");
+    const cutoff = Date.now() - 13.5 * 864e5;
+    const slice = [...fetched.values()].filter((m) =>
+      m.createdTimestamp >= i.targetMessage.createdTimestamp && m.createdTimestamp > cutoff && !m.pinned);
+    if (!slice.length) return i.editReply("Rien à supprimer (messages trop anciens ou épinglés).");
+    const del = await i.channel.bulkDelete(slice, true).catch(() => null);
+    await log(i.guild, "messagePurge", embed({ guild: i.guild, color: COLORS.neutral, author: { name: "🧹  Purge jusqu'à un message" },
+      fields: [{ name: "Salon", value: `${i.channel}`, inline: true },
+        { name: "Messages", value: `${del?.size ?? 0}`, inline: true },
+        { name: "Par", value: i.user.tag, inline: true }] }));
+    return i.editReply(`${del?.size ?? 0} message(s) supprimé(s) à partir de celui-ci.`);
+  }
 }
 
 /* ========================================================================== */
@@ -3372,19 +4240,36 @@ async function handlePublic(i, parts, config) {
       fields: [{ name: "XP total", value: num(xp), inline: true }, { name: "Classement", value: rank ? `#${rank}` : "—", inline: true }] })
       .setThumbnail(i.user.displayAvatarURL({ size: 128 }))] });
   }
-
   if (action === "coins") {
     const w = await getWallet(i.guildId, i.user.id);
     return reply({ embeds: [embed({ guild: i.guild, color: COLORS.gold, author: { name: `${ICONS.coin}  Ton solde` },
-      description: `## ${config.economy.currency} ${num(w.coins)}`,
-      footer: w.streak ? `Série quotidienne : ${w.streak} jour(s)` : undefined })] });
+      description: `## ${config.economy.currency} ${num(w.coins)}`, footer: w.streak ? `Série quotidienne : ${w.streak} jour(s)` : undefined })] });
   }
-
   if (action === "daily") return card(await actionDaily(i.guild, i.user));
   if (action === "work") return card(await actionWork(i.guild, i.user));
+  if (action === "invites") {
+    const rawS = await inviterStats(i.guildId, i.user.id);
+    const s = { active: withBaseline(config, i.user.id, rawS.active), total: withBaseline(config, i.user.id, rawS.total) };
+    const parrain = await getInviter(i.guildId, i.user.id);
+    return reply({ embeds: [embed({ guild: i.guild, author: { name: `🔗  Tes invitations` }, color: COLORS.primary,
+      description: `## ${s.active} invité(s) actif(s)`,
+      fields: [
+        { name: "Total historique", value: `${s.total}`, inline: true },
+        { name: "Partis depuis", value: `${s.total - s.active}`, inline: true },
+        { name: "Invité(e) par", value: parrain?.inviter_id ? `<@${parrain.inviter_id}>` : "_inconnu_", inline: true },
+      ] })] });
+  }
 
   if (action === "top") {
     const medals = ["🥇", "🥈", "🥉"];
+    if (arg === "invites") {
+      const r = (await topInviters(i.guildId, 25))
+        .map((x) => ({ ...x, active: withBaseline(config, x.userId, x.active) }))
+        .sort((a, b) => b.active - a.active).slice(0, 10);
+      if (!r.length) return reply({ content: "Aucune invitation enregistrée pour l'instant." });
+      return reply({ embeds: [embed({ guild: i.guild, author: { name: "🔗  Top invitations" },
+        description: r.map((x, n) => `${medals[n] ?? `**${n + 1}.**`} <@${x.userId}> — **${x.active}** invité(s)`).join("\n") })] });
+    }
     if (arg === "coins") {
       const r = await topCoins(i.guildId, 10);
       if (!r.length) return reply({ content: "Personne n'a encore de coins." });
@@ -3396,25 +4281,36 @@ async function handlePublic(i, parts, config) {
     return reply({ embeds: [embed({ guild: i.guild, author: { name: "🏆  Top niveaux" },
       description: r.map((x, n) => `${medals[n] ?? `**${n + 1}.**`} <@${x.userId}> — niveau **${x.level}** · ${num(x.xp)} XP`).join("\n") })] });
   }
-
   if (action === "shop") {
     const shop = config.economy.shop;
     if (!shop.length) return reply({ content: "La boutique est vide pour le moment." });
     const w = await getWallet(i.guildId, i.user.id);
-    const menu = new StringSelectMenuBuilder().setCustomId("pub:buy").setPlaceholder("Acheter un article…")
-      .addOptions(shop.slice(0, 25).map((x) => ({ label: x.name.slice(0, 100), value: x.id,
-        description: `${num(x.price)} coins${x.stock != null ? ` · stock ${x.stock}` : ""}`.slice(0, 100) })));
     return reply({ embeds: [embed({ guild: i.guild, color: COLORS.gold, author: { name: "🛒  Boutique" },
-      description: shop.map((x) => `${w.coins >= x.price ? "🟢" : "🔴"} **${x.name}** — ${config.economy.currency} ${num(x.price)}\n<@&${x.roleId}>`).join("\n\n"),
-      footer: `Ton solde : ${num(w.coins)}` })], components: [new ActionRowBuilder().addComponents(menu)] });
+      description: shop.map((x) => {
+        const ty = ITEM_TYPES[x.type ?? "role"];
+        const what = (x.type ?? "role") === "role" ? `<@&${x.roleId}>`
+          : x.type === "xp" ? `${num(x.amount ?? 0)} XP immédiats`
+          : x.type === "multiplier" ? `XP ×${x.amount ?? 2} pendant ${x.hours ?? 24} h`
+          : x.type === "pardon" ? "Efface ton dernier avertissement"
+          : "Ton propre rôle, nom et couleur au choix";
+        return `${w.coins >= x.price ? "🟢" : "🔴"} ${ty?.emoji ?? ""} **${x.name}** — ${config.economy.currency} ${num(x.price)}\n${what}`;
+      }).join("\n\n"),
+      footer: `Ton solde : ${num(w.coins)}` })],
+      components: [row(new StringSelectMenuBuilder().setCustomId("pub:buy").setPlaceholder("Acheter un article…")
+        .addOptions(shop.slice(0, 25).map((x) => ({ label: x.name.slice(0, 100), value: x.id,
+          emoji: ITEM_TYPES[x.type ?? "role"]?.emoji,
+          description: `${num(x.price)} coins${x.stock != null ? ` · stock ${x.stock}` : ""}`.slice(0, 100) }))))] });
   }
-
-  if (action === "buy") return card(await actionBuy(i.guild, i.member, i.values[0]));
-
+  if (action === "buy") {
+    const item = config.economy.shop.find((x) => x.id === i.values[0]);
+    if (item?.type === "customrole") return i.showModal(modal(`pm:pub:buyrole:${item.id}`, "Ton rôle personnalisé",
+      [{ id: "name", label: "Nom du rôle", required: true, max: 60 },
+       { id: "color", label: "Couleur hexadécimale (ex. #ff5aa2)", max: 7 }]));
+    return card(await actionBuy(i.guild, i.member, i.values[0]));
+  }
   if (action === "pay") return i.showModal(modal("pm:pub:pay", "Envoyer des coins",
     [{ id: "user", label: "Identifiant du destinataire", required: true, max: 25 },
      { id: "amount", label: "Montant", required: true, max: 10 }]));
-
   if (action === "confess") return i.showModal(modal("pm:pub:confess", "Confession anonyme",
     [{ id: "text", label: "Ta confession", required: true, long: true, max: 1500 }]));
 
@@ -3422,7 +4318,7 @@ async function handlePublic(i, parts, config) {
 }
 
 /* ========================================================================== */
-/*                          9 - LES TROIS COMMANDES                           */
+/*                    10 - COMMANDES ET MENUS CONTEXTUELS                     */
 /* ========================================================================== */
 
 // commands.js — trois commandes seulement. Tout le reste passe par /panel.
@@ -3616,7 +4512,20 @@ async function handleAutocomplete(interaction) {
 }
 
 /* ========================================================================== */
-/*                     10 - CLIENT, EVENEMENTS, DEMARRAGE                     */
+/*                    MENUS CONTEXTUELS (appui long → Apps)                   */
+/* ========================================================================== */
+// Ils n'encombrent pas la liste des commandes : ils apparaissent en appuyant
+// longuement sur un membre ou sur un message.
+
+const contextMenus = [
+  new ContextMenuCommandBuilder().setName("Fiche de modération").setType(ApplicationCommandType.User).setDefaultMemberPermissions(null),
+  new ContextMenuCommandBuilder().setName("Ses invitations").setType(ApplicationCommandType.User).setDefaultMemberPermissions(null),
+  new ContextMenuCommandBuilder().setName("Supprimer et avertir").setType(ApplicationCommandType.Message).setDefaultMemberPermissions(null),
+  new ContextMenuCommandBuilder().setName("Purger jusqu'ici").setType(ApplicationCommandType.Message).setDefaultMemberPermissions(null),
+];
+
+/* ========================================================================== */
+/*                     11 - CLIENT, EVENEMENTS, DEMARRAGE                     */
 /* ========================================================================== */
 
 // index.js — client, événements, démarrage.
@@ -3653,14 +4562,14 @@ const client = new Client({
 
 async function deployCommands() {
   const rest = new REST({ version: "10" }).setToken(TOKEN);
-  const body = commands.map((c) => c.data.toJSON());
+  const body = [...commands.map((c) => c.data.toJSON()), ...contextMenus.map((c) => c.toJSON())];
   try {
     if (GUILD_ID) {
       await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body });
-      console.log(`[slash] ${body.length} commandes déployées sur ${GUILD_ID} (immédiat).`);
+      console.log(`[slash] ${commands.length} commandes + ${contextMenus.length} menus contextuels déployés sur ${GUILD_ID}.`);
     } else {
       await rest.put(Routes.applicationCommands(CLIENT_ID), { body });
-      console.log(`[slash] ${body.length} commandes déployées globalement (jusqu'à 1h de propagation).`);
+      console.log(`[slash] ${commands.length} commandes + ${contextMenus.length} menus contextuels déployés globalement.`);
     }
   } catch (e) {
     console.error("[slash] échec:", e.message);
@@ -3683,6 +4592,13 @@ client.once(Events.ClientReady, async (c) => {
     } catch (e) {
       console.warn("[cache] fetch des membres impossible :", e.message, "— active Server Members Intent");
     }
+    const n = await cacheInvites(guild);
+    console.log(`[invites] ${n} lien(x) mis en cache`);
+    const trusted = await syncTrustedRole(guild);
+    console.log(trusted.found
+      ? `[like] rôle de confiance : ${trusted.role.name} (niveau 5${trusted.manual ? ", choisi à la main" : ", détecté"}${trusted.changed ? ", appliqué" : ""})`
+      : "[like] aucun rôle « Like me » trouvé — désigne-le dans Configuration → Rôles clés");
+
     const counts = await computeCounts(guild);
     console.log(`[compteurs] humains ${num(counts.members)} · connectés ${counts.online ?? "n/d"} · vocal ${counts.voice} · états vocaux suivis ${guild.voiceStates.cache.size}`);
     if (counts.online === null) console.warn("[compteurs] Connectés indisponible → active Presence Intent dans le portail développeur");
@@ -3719,6 +4635,11 @@ client.once(Events.ClientReady, async (c) => {
 client.on(Events.InteractionCreate, async (i) => {
   try {
     if (i.isAutocomplete()) return handleAutocomplete(i);
+
+    if (i.isUserContextMenuCommand() || i.isMessageContextMenuCommand()) {
+      if (!i.inGuild()) return;
+      return handleContextMenu(i);
+    }
 
     if (i.isChatInputCommand()) {
       if (!i.inGuild()) return i.reply({ content: "Commande utilisable uniquement sur un serveur.", ...EPH });
@@ -3838,6 +4759,8 @@ client.on(Events.GuildMemberAdd, async (member) => {
     }
   }
 
+  await handleInviteJoin(member).catch((e) => console.error("[invites]", e.message));
+
   if (config.autoroleId) await member.roles.add(config.autoroleId, "Autorole").catch(() => null);
 
   if (config.welcomeChannelId) {
@@ -3860,6 +4783,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
 });
 
 client.on(Events.GuildMemberRemove, async (member) => {
+  await handleInviteLeave(member).catch(() => null);
   const kicker = await findExecutor(member.guild, "kick", member.id);
   if (kicker && !isWhitelisted(member.guild, kicker.id, await getConfig(member.guild.id))) {
     const config = await getConfig(member.guild.id);
@@ -3960,7 +4884,10 @@ client.on(Events.MessageCreate, async (message) => {
   if (now - (xpCooldown.get(key) ?? 0) < 60_000) return;
   xpCooldown.set(key, now);
 
-  const result = await addXp(message.guild.id, message.author.id, 15 + Math.floor(Math.random() * 11));
+  let gain = 15 + Math.floor(Math.random() * 11);
+  const boost = await getBoost(message.guild.id, message.author.id);
+  if (boost) gain = Math.round(gain * boost.multiplier);
+  const result = await addXp(message.guild.id, message.author.id, gain);
   if (!result?.leveledUp) return;
 
   const reward = config.levelRewards?.[String(result.level)];
@@ -4126,6 +5053,7 @@ client.on(Events.ChannelUpdate, async (before, after) => {
 });
 
 client.on(Events.GuildRoleCreate, async (role) => {
+  if (findLikeRole(role.guild)?.id === role.id) await syncTrustedRole(role.guild).catch(() => null);
   const r = await guardStructure(role.guild, "roleCreate", role.id, "créations de rôles");
   await log(role.guild, "roleCreate", embed({ title: "Rôle créé", color: COLORS.success, fields: [
     { name: "Rôle", value: `${role} (\`${role.name}\`)`, inline: true },
@@ -4133,6 +5061,8 @@ client.on(Events.GuildRoleCreate, async (role) => {
 });
 
 client.on(Events.GuildRoleDelete, async (role) => {
+  const cfgD = await getConfig(role.guild.id);
+  if (cfgD.trustedRoleId === role.id) await syncTrustedRole(role.guild).catch(() => null);
   const r = await guardStructure(role.guild, "roleDelete", role.id, "suppressions de rôles");
   await log(role.guild, "roleDelete", embed({ title: "Rôle supprimé", color: COLORS.danger, fields: [
     { name: "Rôle", value: `\`${role.name}\``, inline: true },
@@ -4140,6 +5070,7 @@ client.on(Events.GuildRoleDelete, async (role) => {
 });
 
 client.on(Events.GuildRoleUpdate, async (before, after) => {
+  if (before.name !== after.name) await syncTrustedRole(after.guild).catch(() => null);
   const changes = [];
   if (before.name !== after.name) changes.push({ name: "Nom", value: `${before.name} → ${after.name}` });
   if (before.color !== after.color) changes.push({ name: "Couleur", value: `${before.hexColor} → ${after.hexColor}` });
@@ -4196,6 +5127,7 @@ client.on(Events.ThreadDelete, async (thread) => {
 });
 
 client.on(Events.InviteCreate, async (invite) => {
+  noteInviteCreate(invite);
   await log(invite.guild, "invite", embed({ title: "Invitation créée", color: COLORS.primary, fields: [
     { name: "Code", value: `\`${invite.code}\``, inline: true },
     { name: "Par", value: invite.inviter?.tag ?? "Inconnu", inline: true },
@@ -4204,7 +5136,13 @@ client.on(Events.InviteCreate, async (invite) => {
     { name: "Utilisations max", value: invite.maxUses ? `${invite.maxUses}` : "Illimité", inline: true }] }));
 });
 
-client.on(Events.GuildCreate, (guild) => { buildIndex(guild); });
+client.on(Events.InviteDelete, (invite) => noteInviteDelete(invite));
+
+client.on(Events.GuildCreate, async (guild) => {
+  buildIndex(guild);
+  await cacheInvites(guild).catch(() => null);
+  await syncTrustedRole(guild).catch(() => null);
+});
 
 /* =============================== ROBUSTESSE =============================== */
 
