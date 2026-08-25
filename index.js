@@ -221,6 +221,11 @@ const FUNC_CHANNELS = {
   sondages: ["sondages"],
   staffChat: ["chat-staff", "chat-gestion", "chat-admin"],
   invites: ["invitations", "bienvenue", "welcome"],
+  memberPanel: ["commandes", "cmds-coins", "bot"],
+  recompense: ["recompense", "recompenses"],
+  coinsRules: ["reglement-coins", "regles-coins"],
+  coinsHowTo: ["comment-jouer"],
+  coinsAccess: ["acces-coins"],
 };
 
 /** Types de tickets → catégories existantes du serveur. */
@@ -268,6 +273,17 @@ function findChannel(guild, names) {
     if (ch) return ch;
   }
   return null;
+}
+
+/** Tous les salons dont le nom correspond — sert à détecter les ambiguïtés. */
+function findCandidates(guild, names) {
+  const wanted = new Set(names);
+  const out = [];
+  for (const ch of guild.channels.cache.values()) {
+    if (ch.type === ChannelType.GuildCategory) continue;
+    if (wanted.has(norm(ch.name))) out.push(ch);
+  }
+  return out;
 }
 
 function findCategory(guild, names) {
@@ -521,6 +537,7 @@ const DEFAULT_CONFIG = {
   logsEnabled: true,
   logOverrides: {},
   funcOverrides: {},
+  panelMessages: {},     // destId -> { channelId, messageId }
 
   // Salons compteurs forcés (sinon détection par motif "Nom :")
   counters: { members: null, online: null, voice: null },
@@ -540,6 +557,21 @@ const DEFAULT_CONFIG = {
 
   levelsEnabled: true,
   levelRewards: {},
+
+  // Escalade : le cumul d'avertissements déclenche une sanction automatique
+  escalation: {
+    enabled: true,
+    expireDays: 60,        // 0 = les avertissements ne périment jamais
+    rules: [
+      { warns: 3, action: "timeout", duration: "1h" },
+      { warns: 5, action: "timeout", duration: "1d" },
+      { warns: 7, action: "kick" },
+      { warns: 10, action: "ban" },
+    ],
+  },
+
+  // Rappel des tickets laissés sans réponse
+  ticketReminder: { enabled: true, hours: 6 },
 
   // Récompenses vocales : monter en niveau et gagner des coins en restant en vocal
   voice: {
@@ -621,6 +653,7 @@ const mem = {
   invites: new Map(),
   boosts: new Map(),
   voiceTime: new Map(),
+  backups: [],
 };
 let seq = 1;
 
@@ -662,6 +695,12 @@ async function initDatabase() {
     await q(`CREATE TABLE IF NOT EXISTS tickets (
       id SERIAL PRIMARY KEY, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, user_id TEXT NOT NULL,
       kind TEXT NOT NULL, opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), closed_at TIMESTAMPTZ, closed_by TEXT)`);
+    for (const col of ["last_activity TIMESTAMPTZ", "last_staff_at TIMESTAMPTZ", "reminded_at TIMESTAMPTZ"]) {
+      await q(`ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ${col}`);
+    }
+    await q(`CREATE TABLE IF NOT EXISTS backups (
+      id SERIAL PRIMARY KEY, guild_id TEXT NOT NULL, name TEXT NOT NULL,
+      data JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     await q(`CREATE TABLE IF NOT EXISTS jail (guild_id TEXT, user_id TEXT, roles JSONB NOT NULL DEFAULT '[]'::jsonb,
       until TIMESTAMPTZ, reason TEXT, PRIMARY KEY (guild_id, user_id))`);
     await q(`CREATE TABLE IF NOT EXISTS voice_time (
@@ -926,6 +965,99 @@ async function openTicketOf(guildId, userId, kind) {
   if (ready) return (await q("SELECT channel_id FROM tickets WHERE guild_id=$1 AND user_id=$2 AND kind=$3 AND closed_at IS NULL LIMIT 1",
     [guildId, userId, kind])).rows[0]?.channel_id ?? null;
   return mem.tickets.find((t) => t.guild_id === guildId && t.user_id === userId && t.kind === kind && !t.closed_at)?.channel_id ?? null;
+}
+
+/** Compte les sanctions d'un type sur une fenêtre glissante (0 = tout l'historique). */
+async function countRecentSanctions(guildId, userId, type, days = 0) {
+  if (!days) return countSanctions(guildId, userId, type);
+  if (ready) {
+    const r = await q(`SELECT COUNT(*)::int c FROM sanctions
+      WHERE guild_id=$1 AND user_id=$2 AND type=$3 AND created_at > NOW() - ($4 || ' days')::interval`,
+      [guildId, userId, type, String(days)]);
+    return r.rows[0]?.c ?? 0;
+  }
+  const cutoff = Date.now() - days * 864e5;
+  return mem.sanctions.filter((s) => s.guild_id === guildId && s.user_id === userId
+    && s.type === type && new Date(s.created_at).getTime() > cutoff).length;
+}
+
+/* ---------------------------- SUIVI DES TICKETS --------------------------- */
+
+/** Note une activité dans un ticket ; `isStaff` marque une réponse du staff. */
+async function touchTicket(channelId, isStaff) {
+  if (ready) {
+    await q(`UPDATE tickets SET last_activity=NOW()${isStaff ? ", last_staff_at=NOW(), reminded_at=NULL" : ""}
+      WHERE channel_id=$1 AND closed_at IS NULL`, [channelId]);
+    return;
+  }
+  const t = mem.tickets.find((x) => x.channel_id === channelId && !x.closed_at);
+  if (!t) return;
+  t.last_activity = new Date();
+  if (isStaff) { t.last_staff_at = new Date(); t.reminded_at = null; }
+}
+
+/** Tickets ouverts sans réponse du staff depuis N heures, jamais rappelés récemment. */
+async function staleTickets(guildId, hours) {
+  if (ready) {
+    const r = await q(`SELECT * FROM tickets WHERE guild_id=$1 AND closed_at IS NULL
+      AND COALESCE(last_staff_at, opened_at) < NOW() - ($2 || ' hours')::interval
+      AND (reminded_at IS NULL OR reminded_at < NOW() - ($2 || ' hours')::interval)`,
+      [guildId, String(hours)]);
+    return r.rows;
+  }
+  const cutoff = Date.now() - hours * 36e5;
+  return mem.tickets.filter((t) => t.guild_id === guildId && !t.closed_at
+    && new Date(t.last_staff_at ?? t.opened_at).getTime() < cutoff
+    && (!t.reminded_at || new Date(t.reminded_at).getTime() < cutoff));
+}
+
+async function markTicketReminded(channelId) {
+  if (ready) { await q("UPDATE tickets SET reminded_at=NOW() WHERE channel_id=$1", [channelId]); return; }
+  const t = mem.tickets.find((x) => x.channel_id === channelId);
+  if (t) t.reminded_at = new Date();
+}
+
+/* ------------------------------ SAUVEGARDES ------------------------------- */
+
+async function saveBackup(guildId, name, data) {
+  if (ready) {
+    const r = await q("INSERT INTO backups (guild_id,name,data) VALUES ($1,$2,$3::jsonb) RETURNING id",
+      [guildId, name, JSON.stringify(data)]);
+    await q(`DELETE FROM backups WHERE guild_id=$1 AND id NOT IN (
+      SELECT id FROM backups WHERE guild_id=$1 ORDER BY id DESC LIMIT 10)`, [guildId]);
+    return r.rows[0]?.id;
+  }
+  const id = seq++;
+  mem.backups.push({ id, guild_id: guildId, name, data, created_at: new Date() });
+  mem.backups = mem.backups.filter((x) => x.guild_id !== guildId)
+    .concat(mem.backups.filter((x) => x.guild_id === guildId).slice(-10));
+  return id;
+}
+
+async function listBackups(guildId) {
+  if (ready) return (await q("SELECT id,name,created_at FROM backups WHERE guild_id=$1 ORDER BY id DESC LIMIT 10", [guildId])).rows;
+  return mem.backups.filter((x) => x.guild_id === guildId).sort((a, b) => b.id - a.id).slice(0, 10);
+}
+
+async function getBackup(guildId, id) {
+  if (ready) return (await q("SELECT * FROM backups WHERE guild_id=$1 AND id=$2", [guildId, id])).rows[0] ?? null;
+  return mem.backups.find((x) => x.guild_id === guildId && x.id === Number(id)) ?? null;
+}
+
+async function deleteBackup(guildId, id) {
+  if (ready) return (await q("DELETE FROM backups WHERE guild_id=$1 AND id=$2", [guildId, id])).rowCount > 0;
+  const n = mem.backups.length;
+  mem.backups = mem.backups.filter((x) => !(x.guild_id === guildId && x.id === Number(id)));
+  return n !== mem.backups.length;
+}
+
+/** Écrase entièrement la configuration (utilisé par la restauration). */
+async function replaceConfig(guildId, data) {
+  cache.delete(guildId);
+  if (ready) await q(`INSERT INTO guild_config (guild_id,data) VALUES ($1,$2::jsonb)
+    ON CONFLICT (guild_id) DO UPDATE SET data=$2::jsonb`, [guildId, JSON.stringify(data)]);
+  else mem.config.set(guildId, data);
+  return getConfig(guildId);
 }
 
 /* --------------------------------- ALCATRAZ ------------------------------- */
@@ -1588,10 +1720,14 @@ async function updateCounters(guild, force = false) {
     const memoKey = `${guild.id}:${counter.key}`;
     if (!force && lastCounterValue.get(memoKey) === value) { report.push({ key: counter.key, value, status: "inchangé" }); continue; }
 
-    const ok = await channel.setName(next, "Compteur 0x").then(() => true).catch((e) => {
-      report.push({ key: counter.key, value, status: `échec : ${e.message.slice(0, 60)}` });
-      return false;
-    });
+    // setName peut lever de façon synchrone : le try/catch est indispensable
+    let ok = false;
+    try {
+      await channel.setName(next, "Compteur 0x");
+      ok = true;
+    } catch (e) {
+      report.push({ key: counter.key, value, status: `échec : ${String(e.message).slice(0, 60)}` });
+    }
     if (ok) { lastCounterValue.set(memoKey, value); report.push({ key: counter.key, value, status: "mis à jour" }); }
     await new Promise((r) => setTimeout(r, 2000));
   }
@@ -1778,9 +1914,13 @@ async function refreshTicketCounter(guild) {
       { name: "Total", value: `${s.total}`, inline: true },
     ],
   });
-  const recent = await channel.messages.fetch({ limit: 10 }).catch(() => null);
-  const mine = recent?.find((m) => m.author.id === guild.members.me.id && m.embeds[0]?.title === "Compteur de tickets");
-  if (mine) await mine.edit({ embeds: [body] }).catch(() => null);
+  let mine = null;
+  try {
+    const recent = await channel.messages.fetch({ limit: 10 });
+    const list = typeof recent?.find === "function" ? recent : [...(recent?.values?.() ?? [])];
+    mine = list.find((m) => m.author?.id === guild.members.me.id && m.embeds?.length);
+  } catch { mine = null; }
+  if (mine) await mine.edit({ embeds: [body] }).catch(() => channel.send({ embeds: [body] }).catch(() => null));
   else await channel.send({ embeds: [body] }).catch(() => null);
 }
 
@@ -1817,6 +1957,60 @@ async function closeTicket(interaction) {
 
   await refreshTicketCounter(interaction.guild);
   setTimeout(() => channel.delete("Ticket fermé").catch(() => null), 5000);
+}
+
+/**
+ * Relance les tickets laissés sans réponse du staff.
+ * @returns {Promise<{reminded:number, details:Array}>}
+ */
+async function checkStaleTickets(guild) {
+  const config = await getConfig(guild.id);
+  const conf = config.ticketReminder ?? {};
+  if (!conf.enabled) return { reminded: 0, details: [] };
+
+  const hours = Math.max(1, conf.hours ?? 6);
+  const stale = await staleTickets(guild.id, hours);
+  if (!stale.length) return { reminded: 0, details: [] };
+
+  const details = [];
+  for (const row of stale) {
+    const channel = guild.channels.cache.get(row.channel_id);
+    if (!channel) { await markTicketReminded(row.channel_id); continue; }
+    if (!canSend(channel)) continue;
+
+    const since = new Date(row.last_staff_at ?? row.opened_at);
+    const waited = Math.round((Date.now() - since.getTime()) / 36e5);
+
+    await channel.send({
+      content: config.staffRoleId ? `<@&${config.staffRoleId}>` : undefined,
+      embeds: [embed({
+        guild, color: COLORS.warning, author: { name: "⏰  Ticket sans réponse" },
+        description: `Ouvert par <@${row.user_id}> · aucune réponse du staff depuis **${waited} h**.`,
+        footer: "Ce rappel disparaît dès qu'un membre du staff écrit ici",
+      })],
+    }).catch(() => null);
+
+    await markTicketReminded(row.channel_id);
+    details.push({ channel, waited, userId: row.user_id, kind: row.kind });
+  }
+
+  // Récapitulatif pour l'équipe
+  if (details.length) {
+    const staff = resolveFuncChannel(guild, "staffChat", config);
+    if (staff && canSend(staff)) {
+      await staff.send({ embeds: [embed({
+        guild, color: COLORS.warning, author: { name: `⏰  ${details.length} ticket(s) en attente` },
+        description: details.slice(0, 15).map((d) => `${d.channel} — <@${d.userId}> · **${d.waited} h**`).join("\n"),
+        footer: `Seuil : ${hours} h sans réponse`,
+      })] }).catch(() => null);
+    }
+    await log(guild, "ticket", embed({
+      guild, color: COLORS.warning, author: { name: "⏰  Rappel de tickets" },
+      description: `${details.length} ticket(s) relancé(s) après ${hours} h sans réponse.`,
+    }));
+  }
+
+  return { reminded: details.length, details };
 }
 
 /* ========================================================================== */
@@ -2380,7 +2574,7 @@ function isTrusted(member, config) {
 }
 
 /* ========================================================================== */
-/*                      9 - ACTIONS ET TYPES D ARTICLES                       */
+/*                      9 - ACTIONS, ARTICLES, ESCALADE                       */
 /* ========================================================================== */
 
 // actions.js — la logique métier, appelable depuis n'importe quelle interface.
@@ -2412,6 +2606,7 @@ function checkTarget(guild, actor, target, config) {
 
 async function actionWarn(guild, target, moderator, reason) {
   const total = await addSanction(guild.id, target.id, moderator.id, "warn", reason);
+  const config = await getConfig(guild.id);
   await tryDm(target.user, guild.name, "Avertissement", reason);
   await log(guild, "warn", embed({
     guild, color: COLORS.warning, author: { name: `${ICONS.warn}  Avertissement` },
@@ -2422,7 +2617,10 @@ async function actionWarn(guild, target, moderator, reason) {
       { name: "Raison", value: reason },
     ],
   }));
-  return ok("Avertissement enregistré", `**${target.user.tag}** cumule **${total}** avertissement(s).`, COLORS.warning);
+  const esc = await applyEscalation(guild, target, config).catch(() => ({ applied: false }));
+  return ok("Avertissement enregistré",
+    `**${target.user.tag}** cumule **${total}** avertissement(s).${esc.applied ? `\n\n${esc.text}` : ""}`,
+    esc.applied ? COLORS.danger : COLORS.warning);
 }
 
 async function actionTimeout(guild, target, moderator, ms, reason) {
@@ -2522,6 +2720,59 @@ async function actionClearSanctions(guild, target) {
 async function actionDeleteSanction(guild, id) {
   const done = await deleteSanction(guild.id, id);
   return done ? ok("Sanction supprimée", `La sanction \`#${id}\` a été retirée du casier.`) : no(`Aucune sanction \`#${id}\`.`);
+}
+
+/* ================================ ESCALADE ================================ */
+
+const ESCALATION_ACTIONS = {
+  timeout:  { label: "Réduction au silence", emoji: "🔇", needsDuration: true },
+  kick:     { label: "Expulsion", emoji: "👢", needsDuration: false },
+  ban:      { label: "Bannissement", emoji: "⛔", needsDuration: false },
+  alcatraz: { label: "Alcatraz", emoji: "🤚", needsDuration: true },
+};
+
+/** Décrit une règle en une ligne lisible. */
+function describeRule(rule) {
+  const a = ESCALATION_ACTIONS[rule.action];
+  return `**${rule.warns}** avertissement(s) → ${a?.emoji ?? ""} ${a?.label ?? rule.action}`
+    + (rule.duration ? ` (${rule.duration})` : "");
+}
+
+/**
+ * Applique la règle d'escalade correspondant au nombre d'avertissements.
+ * Le bot agit en son nom propre : la sanction est incontestable.
+ * @returns {Promise<{applied:boolean, text?:string, rule?:object}>}
+ */
+async function applyEscalation(guild, target, config) {
+  const esc = config.escalation;
+  if (!esc?.enabled || !esc.rules?.length) return { applied: false };
+
+  const count = await countRecentSanctions(guild.id, target.id, "warn", esc.expireDays ?? 0);
+  const rule = esc.rules.find((r) => Number(r.warns) === count);
+  if (!rule) return { applied: false, count };
+
+  const me = { id: guild.members.me.id, tag: `${guild.client.user.username} (escalade)` };
+  const reason = `Escalade automatique : ${count} avertissement(s)`;
+  let result;
+
+  if (rule.action === "timeout") result = await actionTimeout(guild, target, me, parseDuration(rule.duration ?? "1h"), reason);
+  else if (rule.action === "kick") result = await actionKick(guild, target, me, reason);
+  else if (rule.action === "ban") result = await actionBan(guild, target, me, reason);
+  else if (rule.action === "alcatraz") result = await actionJail(guild, target, me, reason, parseDuration(rule.duration ?? ""));
+  else return { applied: false, count };
+
+  if (!result?.ok) return { applied: false, count, text: result?.text };
+
+  await log(guild, "sanction", embed({
+    guild, color: COLORS.danger, author: { name: "⚖️  Escalade automatique" },
+    description: `**${target.user.tag}** atteint **${count}** avertissement(s).`,
+    fields: [
+      { name: "Règle", value: describeRule(rule), inline: true },
+      { name: "Résultat", value: result.title, inline: true },
+    ],
+  }));
+
+  return { applied: true, count, rule, text: `⚖️ Seuil de **${count}** atteint → ${describeRule(rule)}` };
 }
 
 /* ================================= PURGE ================================== */
@@ -2899,11 +3150,11 @@ async function setupCoinsSpace(guild, memberPanelFactory) {
     return channel;
   };
 
-  await publish("rules", { embeds: [rulesEmbed(guild, config)] }, "Règlement");
-  await publish("howto", { embeds: [howToPlayEmbed(guild, config)] }, "Guide « comment jouer »");
-  await publish("shop", shopPanel(guild, config), "Panneau boutique");
-  await publish("rewards", rewardPanel(guild, config), "Panneau récompenses");
-  if (memberPanelFactory) await publish("commands", memberPanelFactory(guild), "Panneau membre complet");
+  // Les panneaux passent par la table d'affectation : emplacement mémorisé,
+  // message modifié plutôt que dupliqué, vérification possible ensuite.
+  const pub = await publishAllDestinations(guild);
+  for (const line of pub.done) report.push({ ok: true, label: "Panneau", detail: line });
+  for (const line of pub.failed) report.push({ ok: false, label: "Panneau", detail: line });
 
   const dropCh = findChannel(guild, TARGETS.drops);
   if (dropCh && canSend(dropCh)) {
@@ -2937,7 +3188,314 @@ async function setupCoinsSpace(guild, memberPanelFactory) {
 }
 
 /* ========================================================================== */
-/*                       11 - INSTALLATION AUTOMATIQUE                        */
+/*                11 - AFFECTATION ET VERIFICATION DES SALONS                 */
+/* ========================================================================== */
+
+// destinations.js — la table d'affectation : quel panneau, quelle fonction, quel salon.
+
+
+/* ========================================================================== */
+/*                          ACCÈS PAR CHEMIN POINTÉ                           */
+/* ========================================================================== */
+
+const getPath = (obj, path) => path.split(".").reduce((o, k) => o?.[k], obj);
+
+function patchPath(path, value) {
+  const parts = path.split(".");
+  const out = {};
+  let cur = out;
+  parts.forEach((k, idx) => {
+    if (idx === parts.length - 1) cur[k] = value;
+    else { cur[k] = {}; cur = cur[k]; }
+  });
+  return out;
+}
+
+/* ========================================================================== */
+/*                            TABLE D'AFFECTATION                             */
+/* ========================================================================== */
+
+/**
+ * kind : "panel"   → le bot y publie un message à boutons
+ *        "function"→ le bot y écrit quand un événement se produit
+ *        "counter" → salon vocal renommé automatiquement
+ * path  : où l'identifiant est rangé dans la configuration
+ * auto  : noms de salons cherchés si aucun salon n'est imposé
+ */
+const DESTINATIONS = [
+  // ---------------------------------- Panneaux ----------------------------
+  { id: "memberPanel", label: "Espace membre", emoji: "🧭", kind: "panel",
+    path: "funcOverrides.memberPanel", auto: ["commandes", "cmds-coins", "bot"],
+    signature: "🧭  Espace membre", build: (g) => memberPanel(g) },
+
+  { id: "ticketPanel", label: "Panneau de tickets", emoji: "🎫", kind: "panel",
+    path: "funcOverrides.ticketPanel", auto: ["tickets"],
+    build: (g) => ({ embeds: [embed({ guild: g, author: { name: `${ICONS.ticket}  Centre d'aide` }, color: COLORS.primary,
+      description: "Choisis le type de ticket dans le menu. Un salon privé sera créé avec le staff concerné.\n\nLes ouvertures abusives sont sanctionnées." })],
+      components: ticketPanelComponents() }), signature: `${ICONS.ticket}  Centre d'aide` },
+
+  { id: "confessionPost", label: "Panneau confessions", emoji: "🕵️", kind: "panel",
+    path: "funcOverrides.confessionPost", auto: ["se-confesser", "confession"],
+    signature: "🕵️  Confessions anonymes", build: (g) => confessionPanel(g) },
+
+  { id: "boutique", label: "Panneau boutique", emoji: "🛒", kind: "panel",
+    path: "funcOverrides.boutique", auto: ["boutique-coins", "boutique"],
+    signature: `${ICONS.coin}  Boutique`, build: (g, c) => shopPanel(g, c) },
+
+  { id: "recompense", label: "Panneau récompenses", emoji: "🎁", kind: "panel",
+    path: "funcOverrides.recompense", auto: ["recompense", "recompenses"],
+    signature: "🎁  Tes récompenses", build: (g, c) => rewardPanel(g, c) },
+
+  { id: "coinsRules", label: "Règlement des coins", emoji: "📜", kind: "panel",
+    path: "funcOverrides.coinsRules", auto: ["reglement-coins", "regles-coins"],
+    signature: "📜  Règlement de l'espace coins", build: (g, c) => ({ embeds: [rulesEmbed(g, c)] }) },
+
+  { id: "coinsHowTo", label: "Guide « comment jouer »", emoji: "💡", kind: "panel",
+    path: "funcOverrides.coinsHowTo", auto: ["comment-jouer"],
+    signature: "💡  Comment gagner des coins", build: (g, c) => ({ embeds: [howToPlayEmbed(g, c)] }) },
+
+  { id: "ticketCounter", label: "Compteur de tickets", emoji: "📨", kind: "panel",
+    path: "funcOverrides.ticketCounter", auto: ["compteur-tickets"],
+    signature: "Compteur de tickets", special: "ticketCounter" },
+
+  // ---------------------------------- Fonctions ---------------------------
+  { id: "welcome", label: "Messages de bienvenue", emoji: "👋", kind: "function",
+    path: "welcomeChannelId", auto: ["bienvenue", "welcome", "arrivees"] },
+
+  { id: "goodbye", label: "Messages de départ", emoji: "🚪", kind: "function",
+    path: "goodbyeChannelId", auto: ["departs", "logs-leave"] },
+
+  { id: "levelUp", label: "Annonces de niveau", emoji: "📈", kind: "function",
+    path: "funcOverrides.levelUp", auto: ["niveaux"] },
+
+  { id: "drops", label: "Colis de coins", emoji: "📦", kind: "function",
+    path: "economy.dropChannelId", auto: ["drop-colis"] },
+
+  { id: "invites", label: "Annonces d'invitation", emoji: "🔗", kind: "function",
+    path: "invites.channelId", auto: ["invitations"] },
+
+  { id: "absences", label: "Absences du staff", emoji: "🛌", kind: "function",
+    path: "funcOverrides.absences", auto: ["absences"] },
+
+  { id: "coinsAccess", label: "Accès à l'espace coins", emoji: "🎰", kind: "function",
+    path: "funcOverrides.coinsAccess", auto: ["acces-coins"] },
+
+  // ---------------------------------- Compteurs ---------------------------
+  { id: "counterMembers", label: "Compteur Membres", emoji: "💎", kind: "counter", voice: true,
+    path: "counters.members", auto: [] },
+  { id: "counterOnline", label: "Compteur Connectés", emoji: "🍋", kind: "counter", voice: true,
+    path: "counters.online", auto: [] },
+  { id: "counterVoice", label: "Compteur Vocal", emoji: "🎧", kind: "counter", voice: true,
+    path: "counters.voice", auto: [] },
+];
+
+const KIND_LABEL = { panel: "Panneaux publiés", function: "Salons où le bot écrit", counter: "Compteurs vocaux" };
+
+/* ========================================================================== */
+/*                              RÉSOLUTION                                    */
+/* ========================================================================== */
+
+/** @returns {{channel, forced:boolean}} */
+function resolveDestination(guild, config, dest) {
+  const forcedId = getPath(config, dest.path);
+  if (forcedId) {
+    const ch = guild.channels.cache.get(forcedId);
+    if (ch) return { channel: ch, forced: true };
+  }
+  if (dest.kind === "counter") {
+    const counter = COUNTERS.find((c) => dest.id.toLowerCase().endsWith(c.key));
+    const ch = counter && guild.channels.cache.find(
+      (x) => (x.type === ChannelType.GuildVoice || x.type === ChannelType.GuildStageVoice) && counter.test.test(x.name));
+    return { channel: ch ?? null, forced: false };
+  }
+  return { channel: dest.auto?.length ? findChannel(guild, dest.auto) : null, forced: false };
+}
+
+async function setDestination(guildId, dest, channelId) {
+  return updateConfig(guildId, patchPath(dest.path, channelId));
+}
+
+async function clearDestination(guildId, dest) {
+  return updateConfig(guildId, patchPath(dest.path, null));
+}
+
+/* ========================================================================== */
+/*                              PUBLICATION                                   */
+/* ========================================================================== */
+
+/** Modifie notre message existant plutôt que d'en empiler un nouveau. */
+async function publishOrEdit(channel, payload, signature = null) {
+  let mine = null;
+  try {
+    const recent = await channel.messages.fetch({ limit: 25 });
+    const list = typeof recent?.find === "function" ? recent : [...(recent?.values?.() ?? [])];
+    mine = list.find((m) => m.author?.id === channel.guild.members.me.id
+      && (signature ? matchesSignature(m, signature) : m.embeds?.length));
+  } catch { mine = null; }
+  if (mine) return mine.edit(payload).then(() => mine).catch(() => channel.send(payload).catch(() => null));
+  return channel.send(payload).catch(() => null);
+}
+
+/** Ce message est-il bien le panneau attendu ? */
+function matchesSignature(message, signature) {
+  const e = message?.embeds?.[0];
+  if (!e) return false;
+  const author = e.author?.name ?? e.data?.author?.name ?? "";
+  const title = e.title ?? e.data?.title ?? "";
+  return author === signature || title === signature;
+}
+
+/** Publie un panneau dans son salon affecté. */
+async function publishDestination(guild, config, dest) {
+  if (dest.kind !== "panel") return { ok: false, reason: "Ce n'est pas un panneau." };
+  const { channel } = resolveDestination(guild, config, dest);
+  if (!channel) return { ok: false, reason: "Aucun salon affecté." };
+  if (!canSend(channel)) return { ok: false, reason: `Je ne peux pas écrire dans ${channel}.` };
+
+  if (dest.special === "ticketCounter") {
+    await refreshTicketCounter(guild);
+    return { ok: true, channel };
+  }
+  const message = await publishOrEdit(channel, dest.build(guild, config), dest.signature);
+  if (message?.id) {
+    await updateConfig(guild.id, { panelMessages: { ...(config.panelMessages ?? {}),
+      [dest.id]: { channelId: channel.id, messageId: message.id } } });
+  }
+  return { ok: true, channel, message };
+}
+
+/** Publie tous les panneaux affectés d'un coup. */
+async function publishAllDestinations(guild) {
+  const config = await getConfig(guild.id);
+  const done = [];
+  const failed = [];
+  for (const dest of DESTINATIONS.filter((d) => d.kind === "panel")) {
+    try {
+      const r = await publishDestination(guild, config, dest);
+      if (r.ok) done.push(`${dest.emoji} ${dest.label} → ${r.channel}`);
+      else failed.push(`${dest.emoji} ${dest.label} — ${r.reason}`);
+    } catch (e) {
+      failed.push(`${dest.emoji} ${dest.label} — ${e.message.slice(0, 80)}`);
+    }
+  }
+  return { done, failed };
+}
+
+/* ========================================================================== */
+/*                                 RÉSUMÉ                                     */
+/* ========================================================================== */
+
+function destinationReport(guild, config) {
+  const groups = { panel: [], function: [], counter: [] };
+  for (const dest of DESTINATIONS) {
+    const { channel, forced } = resolveDestination(guild, config, dest);
+    groups[dest.kind].push({
+      dest, channel, forced,
+      line: `${channel ? "✅" : "🔴"} ${dest.emoji} **${dest.label}** → ${channel ? `${channel}` : "_non affecté_"}${forced ? " ⚙️" : ""}`,
+    });
+  }
+  return groups;
+}
+
+
+/* ========================================================================== */
+/*                   VÉRIFICATION : EST-CE AU BON ENDROIT ?                   */
+/* ========================================================================== */
+
+const ISSUE_LABEL = {
+  ok: "En place",
+  unassigned: "Aucun salon",
+  ambiguous: "Plusieurs salons possibles",
+  unpublished: "Salon défini, panneau absent",
+  misplaced: "Panneau publié ailleurs",
+  unreachable: "Salon inaccessible",
+};
+
+/**
+ * Contrôle chaque affectation : salon défini, non ambigu, panneau réellement présent.
+ * @returns {Promise<Array<{dest, status, channel, candidates, foundIn}>>}
+ */
+async function verifyDestinations(guild, config) {
+  const out = [];
+
+  for (const dest of DESTINATIONS) {
+    const forcedId = getPath(config, dest.path);
+    const candidates = dest.auto?.length ? findCandidates(guild, dest.auto) : [];
+    const { channel } = resolveDestination(guild, config, dest);
+
+    // 1. aucun salon du tout
+    if (!channel) { out.push({ dest, status: "unassigned", channel: null, candidates }); continue; }
+
+    // 2. plusieurs salons portent le même nom et rien n'a été imposé
+    if (!forcedId && candidates.length > 1) {
+      out.push({ dest, status: "ambiguous", channel, candidates });
+      continue;
+    }
+
+    // 3. le bot doit pouvoir y écrire
+    if (dest.kind !== "counter" && !canSend(channel)) {
+      out.push({ dest, status: "unreachable", channel, candidates });
+      continue;
+    }
+
+    // 4. pour un panneau : le message est-il vraiment là ?
+    if (dest.kind === "panel") {
+      const known = config.panelMessages?.[dest.id];
+      let found = null;
+
+      if (known?.messageId) {
+        const ch = guild.channels.cache.get(known.channelId);
+        if (ch) found = await ch.messages.fetch(known.messageId).catch(() => null);
+        if (found && known.channelId !== channel.id) {
+          out.push({ dest, status: "misplaced", channel, candidates, foundIn: ch });
+          continue;
+        }
+      }
+
+      if (!found && dest.signature) {
+        try {
+          const recent = await channel.messages.fetch({ limit: 25 });
+          const list = typeof recent?.find === "function" ? recent : [...(recent?.values?.() ?? [])];
+          found = list.find((m) => m.author?.id === guild.members.me.id && matchesSignature(m, dest.signature));
+        } catch { found = null; }
+      }
+
+      if (!found) { out.push({ dest, status: "unpublished", channel, candidates }); continue; }
+    }
+
+    out.push({ dest, status: "ok", channel, candidates });
+  }
+
+  return out;
+}
+
+/** Cherche des copies égarées de nos panneaux dans les salons candidats. */
+async function scanStrayPanels(guild, config) {
+  const strays = [];
+  for (const dest of DESTINATIONS.filter((d) => d.kind === "panel" && d.signature)) {
+    const { channel: assigned } = resolveDestination(guild, config, dest);
+    for (const ch of findCandidates(guild, dest.auto ?? [])) {
+      if (assigned && ch.id === assigned.id) continue;
+      if (!canSend(ch)) continue;
+      try {
+        const recent = await ch.messages.fetch({ limit: 25 });
+        const list = typeof recent?.find === "function" ? recent : [...(recent?.values?.() ?? [])];
+        const hit = list.find((m) => m.author?.id === guild.members.me.id && matchesSignature(m, dest.signature));
+        if (hit) strays.push({ dest, channel: ch, message: hit });
+      } catch { /* salon illisible */ }
+    }
+  }
+  return strays;
+}
+
+/** Résumé court pour l'accueil du panneau. */
+function summarizeIssues(results) {
+  const bad = results.filter((r) => r.status !== "ok");
+  return { total: results.length, ok: results.length - bad.length, bad };
+}
+
+/* ========================================================================== */
+/*                       12 - INSTALLATION AUTOMATIQUE                        */
 /* ========================================================================== */
 
 // setup.js — installation automatique. Un bouton, tout est branché.
@@ -3092,6 +3650,15 @@ async function autoSetup(guild, user) {
     steps.push(step(true, "Boutique", `${cfgNow.economy.shop.length} article(s) déjà en place, rien de touché`));
   }
 
+  /* 8c-bis — table d'affectation ------------------------------------------- */
+  {
+    const cfgD = await getConfig(guild.id);
+    const assigned = DESTINATIONS.filter((d) => resolveDestination(guild, cfgD, d).channel).length;
+    steps.push(step(assigned >= DESTINATIONS.length * 0.7, `Affectations (${assigned}/${DESTINATIONS.length})`,
+      assigned === DESTINATIONS.length ? "Chaque panneau et chaque fonction a son salon"
+        : "Ouvre 📍 Affectations pour placer ce qui manque"));
+  }
+
   /* 8d — espace coins ------------------------------------------------------- */
   await updateConfig(guild.id, patch);   // la boutique doit exister avant d'écrire les panneaux
   const space = await setupCoinsSpace(guild, memberPanel).catch(() => null);
@@ -3133,8 +3700,14 @@ async function autoSetup(guild, user) {
   };
 }
 
-/** Publie d'un coup tous les panneaux publics dans les salons détectés. */
+/** Publie tous les panneaux dans les salons de la table d'affectation. */
 async function publishAll(guild) {
+  const r = await publishAllDestinations(guild);
+  return r.done;
+}
+
+/** Ancienne version, conservée pour compatibilité. */
+async function publishAllLegacy(guild) {
   const config = await getConfig(guild.id);
   const done = [];
 
@@ -3181,7 +3754,7 @@ function setupReport(guild, result) {
 }
 
 /* ========================================================================== */
-/*             12 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
+/*             13 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
 /* ========================================================================== */
 
 // panel.js — l'interface complète. Tout réglage du bot est atteignable ici.
@@ -3197,6 +3770,7 @@ const SECTIONS = [
   { id: "mod", label: "Modération", emoji: "🛡️", level: 1, desc: "Sanctionner, purger, mode lent, casiers" },
   { id: "staff", label: "Équipe", emoji: "🗓️", level: 1, desc: "Absences, effectif, état du serveur" },
   { id: "invites", label: "Invitations", emoji: "🔗", level: 1, desc: "Classement, parrain d'un membre, réglages" },
+  { id: "dest", label: "Affectations", emoji: "📍", level: 4, desc: "Quel panneau va dans quel salon", trusted: true },
   { id: "publish", label: "Publications", emoji: "📢", level: 3, desc: "Panneaux, rôles, annonces, sondages" },
   { id: "tickets", label: "Tickets", emoji: "🎫", level: 4, desc: "Panneau, statistiques, compteur" },
   { id: "gw", label: "Giveaways", emoji: "🎁", level: 4, desc: "Lancer, terminer, retirer au sort" },
@@ -3205,6 +3779,7 @@ const SECTIONS = [
   { id: "levels", label: "Niveaux", emoji: "📈", level: 4, desc: "XP, récompenses, annonces", trusted: true },
   { id: "voice", label: "Vocal", emoji: "🔊", level: 4, desc: "XP et coins gagnés en vocal", trusted: true },
   { id: "channels", label: "Droits des salons", emoji: "🔐", level: 4, desc: "Qui peut voir, écrire et parler où", trusted: true },
+  { id: "escalation", label: "Escalade", emoji: "⚖️", level: 4, desc: "Sanction automatique au cumul d'avertissements", trusted: true },
   { id: "automod", label: "Automod", emoji: "🤖", level: 5, desc: "Filtres de messages", trusted: true },
   { id: "logs", label: "Journaux", emoji: "🗂️", level: 5, desc: "Routage de chaque type de log", ownerOnly: true },
   { id: "config", label: "Configuration", emoji: "⚙️", level: 5, desc: "Rôles, accueil, salons, piège vocal", ownerOnly: true },
@@ -3322,6 +3897,16 @@ async function diagnose(guild, config) {
   push(me.permissions.has(PermissionFlagsBits.ViewAuditLog), "Logs d'audit", "Nécessaires à l'anti-nuke");
   push(me.permissions.has(PermissionFlagsBits.Administrator), "Rôle de 0x tout en haut",
     "Paramètres du serveur → Rôles → remonte 0x");
+
+  try {
+    const results = await verifyDestinations(guild, config);
+    const { bad } = summarizeIssues(results);
+    push(bad.length === 0, `Panneaux au bon endroit (${results.length - bad.length}/${results.length})`,
+      bad.length === 1
+        ? `${bad[0].dest.label} : ${ISSUE_LABEL[bad[0].status].toLowerCase()} — Affectations → Vérifier`
+        : "Affectations → 🔎 Vérifier les emplacements");
+  } catch { /* la vérification ne doit jamais bloquer l'accueil */ }
+
   return items;
 }
 
@@ -3521,6 +4106,27 @@ async function buildSection(id, i, config, page = null) {
       ],
     };
 
+    if (page === "backup") {
+      const list = await listBackups(guild.id);
+      const comps = [row(
+        btn("p:config:bkcreate", "Créer une sauvegarde", ButtonStyle.Success, "💾"),
+        btn("p:config:bkexport", "Télécharger en JSON", ButtonStyle.Primary, "📥"),
+        btn("p:config:page:backup", "Actualiser", ButtonStyle.Secondary, "🔄"))];
+      if (list.length) comps.push(row(new StringSelectMenuBuilder().setCustomId("p:config:bkpick")
+        .setPlaceholder("Agir sur une sauvegarde…")
+        .addOptions(list.map((b) => ({ label: b.name.slice(0, 100), value: String(b.id),
+          description: new Date(b.created_at).toLocaleString("fr-FR").slice(0, 100) })))));
+      comps.push(backRow("p:config"));
+      return {
+        embeds: [embed({ guild, author: { name: "💾  Sauvegardes de la configuration" }, color: COLORS.primary,
+          description: list.length
+            ? list.map((b) => `\`#${b.id}\` **${b.name}** — ${ts(b.created_at)}`).join("\n")
+            : "_Aucune sauvegarde._ Crées-en une avant chaque grosse modification.",
+          footer: "10 sauvegardes conservées · seuls les réglages sont enregistrés, pas les données des membres" })],
+        components: comps,
+      };
+    }
+
     if (page === "danger") return {
       embeds: [embed({ guild, author: { name: "🔥  Zone rouge" }, color: COLORS.danger,
         description: "**Réinitialiser** efface tous les réglages de 0x sur ce serveur : rôles clés, perms, automod, protections, boutique, forçages de salons.\n\nLes données des membres (XP, coins, sanctions, tickets) ne sont pas touchées." })],
@@ -3538,6 +4144,7 @@ async function buildSection(id, i, config, page = null) {
             btn("p:config:page:welcome", "Arrivées / départs", ButtonStyle.Primary, "👋"),
             btn("p:config:page:chans", "Salons fonctionnels", ButtonStyle.Primary, "📂")),
         row(btn("p:config:page:trap", "Piège vocal", ButtonStyle.Secondary, "🪤"),
+            btn("p:config:page:backup", "Sauvegardes", ButtonStyle.Success, "💾"),
             btn("p:config:page:danger", "Zone rouge", ButtonStyle.Danger, "🔥")),
         backRow(),
       ],
@@ -3693,6 +4300,10 @@ async function buildSection(id, i, config, page = null) {
         row(new ChannelSelectMenuBuilder().setCustomId("p:tickets:publish").setChannelTypes(ChannelType.GuildText)
           .setPlaceholder("Publier le panneau de tickets dans…")),
         row(btn("p:tickets:refresh", "Actualiser le compteur", ButtonStyle.Primary, "🔄"),
+            btn("p:tickets:remind", config.ticketReminder?.enabled ? "Couper les rappels" : "Activer les rappels",
+              config.ticketReminder?.enabled ? ButtonStyle.Danger : ButtonStyle.Success, "⏰"),
+            btn("p:tickets:delay", "Délai", ButtonStyle.Primary, "⏱️"),
+            btn("p:tickets:check", "Vérifier maintenant", ButtonStyle.Secondary, "🔍"),
             btn("p:home", "Retour", ButtonStyle.Secondary, "◀️")),
       ],
     };
@@ -3740,6 +4351,38 @@ async function buildSection(id, i, config, page = null) {
         description: `Système d'XP : **${onOff(config.levelsEnabled)}**\nAnnonces : ${resolveFuncChannel(guild, "levelUp", config) ?? "_salon du message_"}`,
         fields: [{ name: "Récompenses", value: rewards.length ? rewards.map(([l, r]) => `Niveau **${l}** → <@&${r}>`).join("\n") : "_aucune_" }],
         footer: "15 à 25 XP par message, une fois par minute" })],
+      components: comps,
+    };
+  }
+
+  /* -------------------------------- ESCALADE ----------------------------- */
+  if (id === "escalation") {
+    const e = config.escalation ?? {};
+    const rules = [...(e.rules ?? [])].sort((a, b) => a.warns - b.warns);
+    const comps = [
+      row(btn("p:escalation:t", e.enabled ? "Couper l'escalade" : "Activer l'escalade",
+            e.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
+          btn("p:escalation:add", "Ajouter un palier", ButtonStyle.Primary, "➕"),
+          btn("p:escalation:expire", "Péremption", ButtonStyle.Secondary, "⏳"),
+          btn("p:escalation:default", "Paliers recommandés", ButtonStyle.Secondary, "🪄")),
+    ];
+    if (rules.length) comps.push(row(new StringSelectMenuBuilder().setCustomId("p:escalation:del")
+      .setPlaceholder("Retirer un palier…")
+      .addOptions(rules.slice(0, 25).map((r) => ({ label: `${r.warns} avertissement(s)`, value: String(r.warns),
+        emoji: ESCALATION_ACTIONS[r.action]?.emoji,
+        description: `${ESCALATION_ACTIONS[r.action]?.label ?? r.action}${r.duration ? ` · ${r.duration}` : ""}`.slice(0, 100) })))));
+    comps.push(backRow());
+
+    return {
+      embeds: [embed({ guild, author: { name: "⚖️  Escalade des sanctions" }, color: e.enabled ? COLORS.warning : COLORS.neutral,
+        description: [
+          `État : **${onOff(e.enabled)}**`,
+          e.expireDays ? `Les avertissements ne comptent plus après **${e.expireDays} jours**.` : "Les avertissements **ne périment jamais**.",
+          "",
+          rules.length ? rules.map((r) => `\`${String(r.warns).padStart(2)}\` ${describeRule(r).replace(/^\*\*\d+\*\* avertissement\(s\) → /, "")}`).join("\n")
+            : "_Aucun palier : rien ne se déclenche automatiquement._",
+        ].join("\n"),
+        footer: "Le bot agit en son nom propre — la sanction est la même pour tous" })],
       components: comps,
     };
   }
@@ -3814,7 +4457,8 @@ async function buildSection(id, i, config, page = null) {
   if (id === "voice") {
     const v = config.voice ?? {};
     const top = await topVoice(guild.id, 8);
-    const live = guild.voiceStates.cache.filter((x) => x.channelId).size;
+    let live = 0;
+    for (const vs of guild.voiceStates.cache.values()) if (vs.channelId) live++;
     const fmt = (m) => (m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`);
     const medals = ["🥇", "🥈", "🥉"];
     return {
@@ -3936,6 +4580,145 @@ async function buildSection(id, i, config, page = null) {
     };
   }
 
+  /* ------------------------------ AFFECTATIONS --------------------------- */
+  if (id === "dest") {
+    // Rapport de vérification : p:dest:page:__check
+    if (page === "__check") {
+      const results = await verifyDestinations(guild, config);
+      const { ok, bad } = summarizeIssues(results);
+      const icon = { unassigned: "🔴", ambiguous: "❓", unpublished: "📭", misplaced: "📍", unreachable: "🚫" };
+      const comps = [];
+
+      if (bad.length) {
+        comps.push(row(new StringSelectMenuBuilder().setCustomId("p:dest:fix")
+          .setPlaceholder("Régler un problème…")
+          .addOptions(bad.slice(0, 25).map((r) => ({ label: r.dest.label.slice(0, 100), value: r.dest.id,
+            emoji: r.dest.emoji, description: ISSUE_LABEL[r.status].slice(0, 100) })))));
+      }
+      comps.push(row(
+        btn("p:dest:page:__check", "Revérifier", ButtonStyle.Primary, "🔄"),
+        btn("p:dest:stray", "Chercher des copies égarées", ButtonStyle.Secondary, "🧹"),
+        btn("p:dest", "Retour", ButtonStyle.Secondary, "◀️")));
+
+      return {
+        embeds: [embed({ guild, author: { name: "🔎  Vérification des emplacements" },
+          color: bad.length ? COLORS.warning : COLORS.success,
+          description: bad.length
+            ? `**${ok}/${results.length}** en place. ${bad.length} à régler :`
+            : `### ${ICONS.ok} Les ${results.length} éléments sont au bon endroit.`,
+          fields: bad.length ? [{ name: "\u200b", value: bad.slice(0, 12).map((r) =>
+            `${icon[r.status] ?? "⚠️"} ${r.dest.emoji} **${r.dest.label}** — ${ISSUE_LABEL[r.status]}`
+            + (r.status === "ambiguous" ? `\n └ ${r.candidates.map((c) => `${c}`).join(" ")}` : "")
+            + (r.status === "misplaced" ? `\n └ trouvé dans ${r.foundIn} au lieu de ${r.channel}` : "")
+            + (r.status === "unpublished" ? `\n └ ${r.channel} attend son panneau` : "")
+            + (r.status === "unreachable" ? `\n └ je ne peux pas écrire dans ${r.channel}` : "")
+          ).join("\n").slice(0, 1000) }] : [],
+          footer: bad.length ? "Choisis un problème dans le menu pour le régler" : undefined })],
+        components: comps,
+      };
+    }
+
+    // Fiche de correction d'un problème : p:dest:page:fix_<destId>
+    if (page?.startsWith("fix_")) {
+      const dest = DESTINATIONS.find((d) => d.id === page.slice(4));
+      if (dest) {
+        const results = await verifyDestinations(guild, config);
+        const r = results.find((x) => x.dest.id === dest.id) ?? { status: "ok", candidates: [] };
+        const comps = [];
+
+        if (r.candidates?.length > 1) {
+          comps.push(row(new StringSelectMenuBuilder().setCustomId(`p:dest:choose:${dest.id}`)
+            .setPlaceholder("Lequel est le bon ?")
+            .addOptions(r.candidates.slice(0, 25).map((c) => ({ label: `#${c.name}`.slice(0, 100), value: c.id,
+              description: (c.parent?.name ? `dans ${c.parent.name}` : "sans catégorie").slice(0, 100) })))));
+        }
+        comps.push(row(new ChannelSelectMenuBuilder().setCustomId(`p:dest:set:${dest.id}`)
+          .setChannelTypes(...(dest.voice ? [ChannelType.GuildVoice, ChannelType.GuildStageVoice]
+            : [ChannelType.GuildText, ChannelType.GuildAnnouncement]))
+          .setPlaceholder("…ou choisis n'importe quel autre salon")));
+        const acts = [];
+        if (dest.kind === "panel" && r.channel) acts.push(btn(`p:dest:pub:${dest.id}`, "Publier ici", ButtonStyle.Success, "📤"));
+        if (r.status === "misplaced") acts.push(btn(`p:dest:movehere:${dest.id}`, "Garder là où il est", ButtonStyle.Secondary, "📍"));
+        acts.push(btn("p:dest:page:__check", "Retour", ButtonStyle.Secondary, "◀️"));
+        comps.push(row(...acts));
+
+        const explain = {
+          unassigned: "Aucun salon n'est associé. Choisis-en un ci-dessous.",
+          ambiguous: `**${r.candidates.length} salons** portent ce nom sur ton serveur. Je ne peux pas deviner lequel tu veux — dis-le moi.`,
+          unpublished: `Le salon est bien ${r.channel}, mais le panneau n'y est pas. Publie-le.`,
+          misplaced: `Le panneau se trouve dans ${r.foundIn}, alors que l'affectation dit ${r.channel}.`,
+          unreachable: `Je n'ai pas le droit d'écrire dans ${r.channel}. Donne-moi l'accès ou change de salon.`,
+          ok: "Tout est en ordre pour cet élément.",
+        };
+
+        return {
+          embeds: [embed({ guild, author: { name: `${dest.emoji}  ${dest.label}` },
+            color: r.status === "ok" ? COLORS.success : COLORS.warning,
+            description: `**${ISSUE_LABEL[r.status]}**\n\n${explain[r.status]}`,
+            fields: r.candidates?.length ? [{ name: "Salons portant ce nom",
+              value: r.candidates.map((c) => `${c}${c.parent ? ` — _${c.parent.name}_` : ""}`).join("\n").slice(0, 1000) }] : [] })],
+          components: comps,
+        };
+      }
+    }
+
+    // Fiche d'une affectation : p:dest:page:<destId>
+    const one = page ? DESTINATIONS.find((d) => d.id === page) : null;
+    if (one) {
+      const { channel, forced } = resolveDestination(guild, config, one);
+      const comps = [
+        row(new ChannelSelectMenuBuilder().setCustomId(`p:dest:set:${one.id}`)
+          .setChannelTypes(...(one.voice ? [ChannelType.GuildVoice, ChannelType.GuildStageVoice]
+            : [ChannelType.GuildText, ChannelType.GuildAnnouncement]))
+          .setPlaceholder("Choisis le salon…")),
+      ];
+      const actions = [];
+      if (one.kind === "panel" && channel) actions.push(btn(`p:dest:pub:${one.id}`, "Publier maintenant", ButtonStyle.Success, "📤"));
+      if (forced) actions.push(btn(`p:dest:auto:${one.id}`, "Revenir en automatique", ButtonStyle.Secondary, "🪄"));
+      actions.push(btn("p:dest", "Retour", ButtonStyle.Secondary, "◀️"));
+      comps.push(row(...actions));
+
+      return {
+        embeds: [embed({ guild, author: { name: `${one.emoji}  ${one.label}` }, color: channel ? COLORS.success : COLORS.warning,
+          description: [
+            `**Type :** ${KIND_LABEL[one.kind]}`,
+            `**Salon actuel :** ${channel ? `${channel}` : "_aucun_"}`,
+            `**Origine :** ${forced ? "⚙️ imposé par toi" : one.auto?.length ? `🪄 détecté par le nom (${one.auto.join(", ")})` : "🪄 détection automatique"}`,
+            "",
+            one.kind === "panel" ? "Le message est **modifié** s'il existe déjà : aucune relance ne crée de doublon."
+              : one.kind === "counter" ? "Ce salon vocal sera renommé automatiquement toutes les 10 minutes."
+              : "Le bot écrira ici quand l'événement se produira.",
+          ].join("\n") })],
+        components: comps,
+      };
+    }
+
+    const groups = destinationReport(guild, config);
+    const missing = Object.values(groups).flat().filter((x) => !x.channel).length;
+    return {
+      embeds: [embed({ guild, author: { name: "📍  Affectations" }, color: missing ? COLORS.warning : COLORS.success,
+        description: missing ? `**${missing}** élément(s) sans salon.` : "Tout est affecté.",
+        fields: Object.entries(groups).map(([kind, items]) => ({
+          name: `${KIND_LABEL[kind]} (${items.filter((x) => x.channel).length}/${items.length})`,
+          value: items.map((x) => x.line).join("\n").slice(0, 1000),
+        })),
+        footer: "⚙️ = salon imposé · sinon détecté par le nom" })],
+      components: [
+        row(new StringSelectMenuBuilder().setCustomId("p:dest:pick").setPlaceholder("Changer une affectation…")
+          .addOptions(DESTINATIONS.slice(0, 25).map((d) => {
+            const { channel } = resolveDestination(guild, config, d);
+            return { label: d.label.slice(0, 100), value: d.id, emoji: d.emoji,
+              description: (channel ? `→ ${channel.name}` : "aucun salon").slice(0, 100) };
+          }))),
+        row(btn("p:dest:page:__check", "Vérifier les emplacements", ButtonStyle.Primary, "🔎"),
+            btn("p:dest:puball", "Publier tous les panneaux", ButtonStyle.Success, "📤"),
+            btn("p:dest:autoall", "Tout remettre en automatique", ButtonStyle.Secondary, "🪄"),
+            btn("p:dest", "Actualiser", ButtonStyle.Secondary, "🔄")),
+        backRow(),
+      ],
+    };
+  }
+
   /* ------------------------------ PUBLICATIONS --------------------------- */
   if (id === "publish") {
     return {
@@ -3944,7 +4727,8 @@ async function buildSection(id, i, config, page = null) {
           "**Tickets** — menu des 6 catégories", "**Confessions** — bouton anonyme",
           "**Menu de rôles** — rôles à cocher", "", "Chaque publication demande ensuite le salon cible."].join("\n") })],
       components: [
-        row(btn("p:setup:publish", "Tout publier automatiquement", ButtonStyle.Success, "⚡")),
+        row(btn("p:setup:publish", "Tout publier automatiquement", ButtonStyle.Success, "⚡"),
+            btn("p:dest", "Choisir où va chaque panneau", ButtonStyle.Primary, "📍")),
         row(btn("p:publish:pick:member", "Espace membre", ButtonStyle.Primary, "🧭"),
             btn("p:publish:pick:ticket", "Tickets", ButtonStyle.Primary, "🎫"),
             btn("p:publish:pick:confess", "Confessions", ButtonStyle.Primary, "🕵️")),
@@ -4071,9 +4855,12 @@ async function handlePanel(i) {
     }
     if (parts[2] === "publish") {
       await i.deferUpdate();
-      const done = await publishAll(i.guild);
-      return feedback(i, done.length ? { ok: true, title: `${done.length} panneau(x) publié(s)`, text: done.join("\n") }
-        : { ok: false, title: "Rien publié", text: "Aucun salon cible trouvé. Passe par Publications.", color: COLORS.warning });
+      const r = await publishAllDestinations(i.guild);
+      return feedback(i, r.done.length
+        ? { ok: true, title: `${r.done.length} panneau(x) publié(s)`,
+            text: [...r.done.map((x) => `✅ ${x}`), ...r.failed.map((x) => `⚠️ ${x}`)].join("\n").slice(0, 3000) }
+        : { ok: false, title: "Rien publié",
+            text: "Aucun salon affecté. Ouvre **📍 Affectations** pour dire où va chaque panneau.", color: COLORS.warning });
     }
     if (parts[2] === "defaults") {
       await updateConfig(i.guildId, structuredClone(RECOMMENDED));
@@ -4245,7 +5032,47 @@ async function handlePanel(i) {
         text: a === "off" ? "Le salon n'est plus piégé." : `Toute personne entrant sera **${a === "ban" ? "bannie" : "expulsée"}**.`,
         color: a === "off" ? COLORS.success : COLORS.danger }, "config", "trap"); }
 
-    if (action === "reset") { await updateConfig(i.guildId, structuredClone(DEFAULT_CONFIG)); return feedback(i, { ok: true, title: "Configuration réinitialisée", text: "Tous les réglages sont revenus à leur valeur d'origine." }, "config"); }
+    if (action === "bkcreate") return i.showModal(modal("pm:config:bkcreate", "Nouvelle sauvegarde",
+      [{ id: "name", label: "Nom de la sauvegarde", required: true, value: `Avant modification ${new Date().toLocaleDateString("fr-FR")}`, max: 60 }]));
+
+    if (action === "bkexport") {
+      await i.deferReply(EPH);
+      const json = JSON.stringify(config, null, 2);
+      return i.editReply({ content: "Voici toute ta configuration. Garde ce fichier hors de Discord.",
+        files: [{ attachment: Buffer.from(json, "utf8"), name: `0x-config-${i.guild.name.replace(/[^a-z0-9]/gi, "-")}.json` }] });
+    }
+
+    if (action === "bkpick") {
+      const bk = await getBackup(i.guildId, i.values[0]);
+      if (!bk) return feedback(i, { ok: false, title: "Introuvable", text: "Cette sauvegarde n'existe plus.", color: COLORS.danger }, "config", "backup");
+      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: `💾  ${bk.name}` }, color: COLORS.primary,
+        description: `Créée ${ts(bk.created_at)}.\n\n**Restaurer** écrase intégralement la configuration actuelle.` })],
+        components: [row(
+          btn(`p:config:bkrestore:${bk.id}`, "Restaurer", ButtonStyle.Danger, "♻️"),
+          btn(`p:config:bkdelete:${bk.id}`, "Supprimer", ButtonStyle.Secondary, "🗑️"),
+          btn("p:config:page:backup", "Annuler", ButtonStyle.Secondary, "◀️"))] });
+    }
+
+    if (action === "bkrestore") {
+      const bk = await getBackup(i.guildId, arg);
+      if (!bk) return feedback(i, { ok: false, title: "Introuvable", text: "Cette sauvegarde n'existe plus.", color: COLORS.danger }, "config", "backup");
+      await saveBackup(i.guildId, `Avant restauration de « ${bk.name} »`, config);
+      await replaceConfig(i.guildId, bk.data);
+      return feedback(i, { ok: true, title: "Configuration restaurée",
+        text: `Les réglages de **${bk.name}** sont de nouveau actifs.\nL'état précédent a été sauvegardé au cas où.` }, "config", "backup");
+    }
+
+    if (action === "bkdelete") {
+      await deleteBackup(i.guildId, arg);
+      return feedback(i, { ok: true, title: "Sauvegarde supprimée", text: "Elle a été retirée de la liste." }, "config", "backup");
+    }
+
+    if (action === "reset") {
+      await saveBackup(i.guildId, "Avant réinitialisation", config);
+      await updateConfig(i.guildId, structuredClone(DEFAULT_CONFIG));
+      return feedback(i, { ok: true, title: "Configuration réinitialisée",
+        text: "Tous les réglages sont revenus à leur valeur d'origine.\nUne sauvegarde a été créée automatiquement avant l'effacement." }, "config");
+    }
   }
 
   /* ------------------------------- JOURNAUX ------------------------------ */
@@ -4450,6 +5277,17 @@ async function handlePanel(i) {
       return feedback(i, { ok: true, title: "Panneau publié", text: `Le menu est en ligne dans ${ch}.` }, "tickets");
     }
     if (action === "refresh") { await refreshTicketCounter(i.guild); return feedback(i, { ok: true, title: "Compteur actualisé", text: "Le salon compteur-tickets est à jour." }, "tickets"); }
+    if (action === "remind") { await updateConfig(i.guildId, { ticketReminder: { enabled: !config.ticketReminder?.enabled } });
+      return respond(i, await buildSection("tickets", i, await getConfig(i.guildId))); }
+    if (action === "delay") return i.showModal(modal("pm:tickets:delay", "Délai avant rappel",
+      [{ id: "hours", label: "Heures sans réponse du staff", required: true, value: `${config.ticketReminder?.hours ?? 6}`, max: 3 }]));
+    if (action === "check") {
+      await i.deferUpdate();
+      const r = await checkStaleTickets(i.guild);
+      return feedback(i, { ok: true, title: r.reminded ? `${r.reminded} ticket(s) relancé(s)` : "Aucun ticket en retard",
+        text: r.reminded ? r.details.map((d) => `${d.channel} — ${d.waited} h d'attente`).join("\n") : "Le staff suit le rythme.",
+        color: r.reminded ? COLORS.warning : COLORS.success }, "tickets");
+    }
   }
 
   /* ------------------------------- COMPTEURS ----------------------------- */
@@ -4471,6 +5309,34 @@ async function handlePanel(i) {
     if (action === "delreward") { const r = { ...config.levelRewards }; delete r[i.values[0]];
       await updateConfig(i.guildId, { levelRewards: r });
       return feedback(i, { ok: true, title: "Récompense retirée", text: `Plus rien n'est donné au niveau ${i.values[0]}.` }, "levels"); }
+  }
+
+  /* -------------------------------- ESCALADE ----------------------------- */
+  if (section === "escalation") {
+    const rules = [...(config.escalation?.rules ?? [])];
+    if (action === "t") { await updateConfig(i.guildId, { escalation: { enabled: !config.escalation.enabled } });
+      return respond(i, await buildSection("escalation", i, await getConfig(i.guildId))); }
+    if (action === "add") return i.showModal(modal("pm:escalation:add", "Nouveau palier", [
+      { id: "warns", label: "À combien d'avertissements ?", required: true, placeholder: "3", max: 3 },
+      { id: "act", label: "timeout / kick / ban / alcatraz", required: true, placeholder: "timeout", max: 10 },
+      { id: "duration", label: "Durée (10m, 1h, 7d) — timeout et alcatraz", placeholder: "1h", max: 10 },
+    ]));
+    if (action === "expire") return i.showModal(modal("pm:escalation:expire", "Péremption des avertissements",
+      [{ id: "days", label: "Jours avant oubli (0 = jamais)", required: true, value: `${config.escalation.expireDays ?? 0}`, max: 4 }]));
+    if (action === "default") {
+      await updateConfig(i.guildId, { escalation: { enabled: true, expireDays: 60, rules: [
+        { warns: 3, action: "timeout", duration: "1h" },
+        { warns: 5, action: "timeout", duration: "1d" },
+        { warns: 7, action: "kick" },
+        { warns: 10, action: "ban" }] } });
+      return feedback(i, { ok: true, title: "Paliers recommandés posés",
+        text: "3 → 1 h de silence · 5 → 1 jour · 7 → expulsion · 10 → bannissement. Oubli après 60 jours." }, "escalation");
+    }
+    if (action === "del") {
+      const kept = rules.filter((r) => String(r.warns) !== i.values[0]);
+      await updateConfig(i.guildId, { escalation: { rules: kept } });
+      return feedback(i, { ok: true, title: "Palier retiré", text: `Plus rien ne se déclenche à ${i.values[0]} avertissement(s).` }, "escalation");
+    }
   }
 
   /* ---------------------------- DROITS DES SALONS ------------------------ */
@@ -4676,6 +5542,102 @@ async function handlePanel(i) {
     }
   }
 
+  /* ------------------------------ AFFECTATIONS --------------------------- */
+  if (section === "dest") {
+    if (action === "pick") return respond(i, await buildSection("dest", i, config, i.values[0]));
+    if (action === "fix") return respond(i, await buildSection("dest", i, config, `fix_${i.values[0]}`));
+
+    if (action === "choose") {
+      const d = DESTINATIONS.find((x) => x.id === arg);
+      const ch = i.guild.channels.cache.get(i.values[0]);
+      await setDestination(i.guildId, d, ch.id);
+      const cfg2 = await getConfig(i.guildId);
+      if (d.kind === "panel") await publishDestination(i.guild, cfg2, d).catch(() => null);
+      return feedback(i, { ok: true, title: "Ambiguïté levée",
+        text: `${d.emoji} **${d.label}** est désormais fixé sur ${ch}${d.kind === "panel" ? " et le panneau vient d'y être publié." : "."}` },
+        "dest", "__check");
+    }
+
+    if (action === "movehere") {
+      const d = DESTINATIONS.find((x) => x.id === arg);
+      const known = config.panelMessages?.[d.id];
+      const ch = known?.channelId ? i.guild.channels.cache.get(known.channelId) : null;
+      if (!ch) return feedback(i, { ok: false, title: "Introuvable", text: "Je ne retrouve plus ce panneau.", color: COLORS.danger }, "dest", "__check");
+      await setDestination(i.guildId, d, ch.id);
+      return feedback(i, { ok: true, title: "Affectation corrigée",
+        text: `${d.emoji} **${d.label}** est officiellement dans ${ch}.` }, "dest", "__check");
+    }
+
+    if (action === "stray") {
+      await i.deferUpdate();
+      const strays = await scanStrayPanels(i.guild, config);
+      if (!strays.length) return feedback(i, { ok: true, title: "Aucune copie égarée",
+        text: "Chaque panneau n'existe qu'à un seul endroit." }, "dest", "__check");
+      return respond(i, { embeds: [embed({ guild: i.guild, color: COLORS.warning,
+        author: { name: `🧹  ${strays.length} copie(s) égarée(s)` },
+        description: strays.map((s2) => `${s2.dest.emoji} **${s2.dest.label}** traîne dans ${s2.channel}`).join("\n").slice(0, 3000),
+        footer: "Supprimer efface uniquement ces messages en double" })],
+        components: [row(
+          btn("p:dest:straydel", "Supprimer les doublons", ButtonStyle.Danger, "🗑️"),
+          btn("p:dest:page:__check", "Laisser en place", ButtonStyle.Secondary, "◀️"))] });
+    }
+
+    if (action === "straydel") {
+      await i.deferUpdate();
+      const strays = await scanStrayPanels(i.guild, config);
+      let n = 0;
+      for (const s2 of strays) { if (await s2.message.delete().then(() => true).catch(() => false)) n++; }
+      return feedback(i, { ok: true, title: `${n} doublon(s) supprimé(s)`,
+        text: "Les panneaux ne subsistent plus que dans leur salon affecté." }, "dest", "__check");
+    }
+
+    if (action === "puball") {
+      await i.deferUpdate();
+      const r = await publishAllDestinations(i.guild);
+      return respond(i, { embeds: [embed({ guild: i.guild, color: r.failed.length ? COLORS.warning : COLORS.success,
+        author: { name: `📤  ${r.done.length} panneau(x) publié(s)` },
+        description: [...r.done.map((x) => `✅ ${x}`), ...r.failed.map((x) => `⚠️ ${x}`)].join("\n").slice(0, 4000),
+        footer: "Les messages existants ont été mis à jour, pas dupliqués" })],
+        components: (await buildSection("dest", i, await getConfig(i.guildId))).components });
+    }
+
+    if (action === "autoall") {
+      for (const d of DESTINATIONS) await clearDestination(i.guildId, d);
+      return feedback(i, { ok: true, title: "Tout en automatique",
+        text: "Chaque panneau et chaque fonction retrouve le salon détecté par son nom." }, "dest");
+    }
+
+    const dest = DESTINATIONS.find((d) => d.id === arg);
+    if (!dest) return respond(i, await buildSection("dest", i, config));
+
+    if (action === "set") {
+      const ch = i.guild.channels.cache.get(i.values[0]);
+      if (dest.kind !== "counter" && !canSend(ch))
+        return feedback(i, { ok: false, title: "Salon inaccessible",
+          text: `Je ne peux pas écrire dans ${ch}. Donne-moi « Voir le salon », « Envoyer des messages » et « Intégrer des liens ».`,
+          color: COLORS.danger }, "dest", dest.id);
+      await setDestination(i.guildId, dest, ch.id);
+      return feedback(i, { ok: true, title: "Affectation enregistrée",
+        text: `${dest.emoji} **${dest.label}** → ${ch}` }, "dest", dest.id);
+    }
+
+    if (action === "auto") {
+      await clearDestination(i.guildId, dest);
+      const { channel } = resolveDestination(i.guild, await getConfig(i.guildId), dest);
+      return feedback(i, { ok: true, title: "Retour en automatique",
+        text: channel ? `${dest.emoji} **${dest.label}** → ${channel} (détecté)` : `Aucun salon détecté pour **${dest.label}**.`,
+        color: channel ? COLORS.success : COLORS.warning }, "dest", dest.id);
+    }
+
+    if (action === "pub") {
+      await i.deferUpdate();
+      const r = await publishDestination(i.guild, config, dest);
+      return feedback(i, r.ok
+        ? { ok: true, title: "Panneau publié", text: `${dest.emoji} **${dest.label}** est en ligne dans ${r.channel}.` }
+        : { ok: false, title: "Publication impossible", text: r.reason, color: COLORS.danger }, "dest", dest.id);
+    }
+  }
+
   /* ------------------------------ PUBLICATIONS --------------------------- */
   if (section === "publish") {
     if (action === "pick") {
@@ -4776,6 +5738,10 @@ async function handleModal(i, parts, config, level) {
 
   /* -------------------------------- CONFIG ------------------------------- */
   if (section === "config") {
+    if (action === "bkcreate") {
+      const id = await saveBackup(i.guildId, f("name"), config);
+      return feedback(i, { ok: true, title: "Sauvegarde créée", text: `\`#${id}\` **${f("name")}** — restaurable à tout moment.` }, "config", "backup");
+    }
     if (action === "msgw") { await updateConfig(i.guildId, { welcomeMessage: f("text") }); return feedback(i, { ok: true, title: "Message d'accueil enregistré", text: f("text") }, "config", "welcome"); }
     if (action === "msgg") { await updateConfig(i.guildId, { goodbyeMessage: f("text") }); return feedback(i, { ok: true, title: "Message de départ enregistré", text: f("text") }, "config", "welcome"); }
   }
@@ -4833,6 +5799,34 @@ async function handleModal(i, parts, config, level) {
     if (lvl === null || lvl < 1) return feedback(i, { ok: false, title: "Niveau invalide", text: "Entre un nombre supérieur à 0.", color: COLORS.danger }, "levels");
     await updateConfig(i.guildId, { levelRewards: { ...config.levelRewards, [lvl]: arg } });
     return feedback(i, { ok: true, title: "Récompense enregistrée", text: `<@&${arg}> sera donné au niveau **${lvl}**.` }, "levels");
+  }
+
+  /* -------------------------------- ESCALADE ----------------------------- */
+  if (section === "escalation") {
+    const rules = [...(config.escalation?.rules ?? [])];
+    if (action === "t") { await updateConfig(i.guildId, { escalation: { enabled: !config.escalation.enabled } });
+      return respond(i, await buildSection("escalation", i, await getConfig(i.guildId))); }
+    if (action === "add") return i.showModal(modal("pm:escalation:add", "Nouveau palier", [
+      { id: "warns", label: "À combien d'avertissements ?", required: true, placeholder: "3", max: 3 },
+      { id: "act", label: "timeout / kick / ban / alcatraz", required: true, placeholder: "timeout", max: 10 },
+      { id: "duration", label: "Durée (10m, 1h, 7d) — timeout et alcatraz", placeholder: "1h", max: 10 },
+    ]));
+    if (action === "expire") return i.showModal(modal("pm:escalation:expire", "Péremption des avertissements",
+      [{ id: "days", label: "Jours avant oubli (0 = jamais)", required: true, value: `${config.escalation.expireDays ?? 0}`, max: 4 }]));
+    if (action === "default") {
+      await updateConfig(i.guildId, { escalation: { enabled: true, expireDays: 60, rules: [
+        { warns: 3, action: "timeout", duration: "1h" },
+        { warns: 5, action: "timeout", duration: "1d" },
+        { warns: 7, action: "kick" },
+        { warns: 10, action: "ban" }] } });
+      return feedback(i, { ok: true, title: "Paliers recommandés posés",
+        text: "3 → 1 h de silence · 5 → 1 jour · 7 → expulsion · 10 → bannissement. Oubli après 60 jours." }, "escalation");
+    }
+    if (action === "del") {
+      const kept = rules.filter((r) => String(r.warns) !== i.values[0]);
+      await updateConfig(i.guildId, { escalation: { rules: kept } });
+      return feedback(i, { ok: true, title: "Palier retiré", text: `Plus rien ne se déclenche à ${i.values[0]} avertissement(s).` }, "escalation");
+    }
   }
 
   /* ---------------------------- DROITS DES SALONS ------------------------ */
@@ -4965,6 +5959,37 @@ async function handleModal(i, parts, config, level) {
   }
 
   /* -------------------------------- ÉCONOMIE ----------------------------- */
+  if (section === "tickets" && action === "delay") {
+    const h = int("hours");
+    if (h === null || h < 1) return feedback(i, { ok: false, title: "Valeur invalide", text: "Entre un nombre d'heures supérieur à 0.", color: COLORS.danger }, "tickets");
+    await updateConfig(i.guildId, { ticketReminder: { hours: Math.min(168, h) } });
+    return feedback(i, { ok: true, title: "Délai enregistré", text: `Le staff sera relancé après **${Math.min(168, h)} h** sans réponse.` }, "tickets");
+  }
+
+  if (section === "escalation") {
+    if (action === "add") {
+      const warns = int("warns");
+      const act = f("act").toLowerCase();
+      const duration = f("duration");
+      if (warns === null || warns < 1) return feedback(i, { ok: false, title: "Seuil invalide", text: "Entre un nombre d'avertissements supérieur à 0.", color: COLORS.danger }, "escalation");
+      if (!ESCALATION_ACTIONS[act]) return feedback(i, { ok: false, title: "Action inconnue",
+        text: "Choisis parmi : `timeout`, `kick`, `ban`, `alcatraz`.", color: COLORS.danger }, "escalation");
+      if (ESCALATION_ACTIONS[act].needsDuration && act === "timeout" && !parseDuration(duration))
+        return feedback(i, { ok: false, title: "Durée invalide", text: "Un timeout demande une durée : `10m`, `1h`, `7d` (max 28j).", color: COLORS.danger }, "escalation");
+      const rules = [...(config.escalation?.rules ?? [])].filter((r) => Number(r.warns) !== warns);
+      rules.push({ warns, action: act, duration: duration || null });
+      await updateConfig(i.guildId, { escalation: { rules } });
+      return feedback(i, { ok: true, title: "Palier enregistré", text: describeRule({ warns, action: act, duration }) }, "escalation");
+    }
+    if (action === "expire") {
+      const days = int("days");
+      if (days === null || days < 0) return feedback(i, { ok: false, title: "Valeur invalide", text: "Entre un nombre de jours.", color: COLORS.danger }, "escalation");
+      await updateConfig(i.guildId, { escalation: { expireDays: Math.min(3650, days) } });
+      return feedback(i, { ok: true, title: "Péremption enregistrée",
+        text: days ? `Un avertissement cesse de compter après **${days} jours**.` : "Les avertissements comptent **à vie**." }, "escalation");
+    }
+  }
+
   if (section === "voice" && action === "cfg") {
     const patch = {};
     const xp = int("xp"); if (xp !== null) patch.xpPerMinute = Math.max(0, Math.min(500, xp));
@@ -5028,6 +6053,102 @@ async function handleModal(i, parts, config, level) {
     await postGiveaway(i.client, gid, ch);
     return feedback(i, { ok: true, title: "Giveaway lancé",
       text: `\`#${gid}\` **${f("prize")}** dans ${ch}, fin dans ${formatDuration(ms)}${roleId !== "none" ? ` · <@&${roleId}> requis` : ""}.`, color: COLORS.gold }, "gw");
+  }
+
+  /* ------------------------------ AFFECTATIONS --------------------------- */
+  if (section === "dest") {
+    if (action === "pick") return respond(i, await buildSection("dest", i, config, i.values[0]));
+    if (action === "fix") return respond(i, await buildSection("dest", i, config, `fix_${i.values[0]}`));
+
+    if (action === "choose") {
+      const d = DESTINATIONS.find((x) => x.id === arg);
+      const ch = i.guild.channels.cache.get(i.values[0]);
+      await setDestination(i.guildId, d, ch.id);
+      const cfg2 = await getConfig(i.guildId);
+      if (d.kind === "panel") await publishDestination(i.guild, cfg2, d).catch(() => null);
+      return feedback(i, { ok: true, title: "Ambiguïté levée",
+        text: `${d.emoji} **${d.label}** est désormais fixé sur ${ch}${d.kind === "panel" ? " et le panneau vient d'y être publié." : "."}` },
+        "dest", "__check");
+    }
+
+    if (action === "movehere") {
+      const d = DESTINATIONS.find((x) => x.id === arg);
+      const known = config.panelMessages?.[d.id];
+      const ch = known?.channelId ? i.guild.channels.cache.get(known.channelId) : null;
+      if (!ch) return feedback(i, { ok: false, title: "Introuvable", text: "Je ne retrouve plus ce panneau.", color: COLORS.danger }, "dest", "__check");
+      await setDestination(i.guildId, d, ch.id);
+      return feedback(i, { ok: true, title: "Affectation corrigée",
+        text: `${d.emoji} **${d.label}** est officiellement dans ${ch}.` }, "dest", "__check");
+    }
+
+    if (action === "stray") {
+      await i.deferUpdate();
+      const strays = await scanStrayPanels(i.guild, config);
+      if (!strays.length) return feedback(i, { ok: true, title: "Aucune copie égarée",
+        text: "Chaque panneau n'existe qu'à un seul endroit." }, "dest", "__check");
+      return respond(i, { embeds: [embed({ guild: i.guild, color: COLORS.warning,
+        author: { name: `🧹  ${strays.length} copie(s) égarée(s)` },
+        description: strays.map((s2) => `${s2.dest.emoji} **${s2.dest.label}** traîne dans ${s2.channel}`).join("\n").slice(0, 3000),
+        footer: "Supprimer efface uniquement ces messages en double" })],
+        components: [row(
+          btn("p:dest:straydel", "Supprimer les doublons", ButtonStyle.Danger, "🗑️"),
+          btn("p:dest:page:__check", "Laisser en place", ButtonStyle.Secondary, "◀️"))] });
+    }
+
+    if (action === "straydel") {
+      await i.deferUpdate();
+      const strays = await scanStrayPanels(i.guild, config);
+      let n = 0;
+      for (const s2 of strays) { if (await s2.message.delete().then(() => true).catch(() => false)) n++; }
+      return feedback(i, { ok: true, title: `${n} doublon(s) supprimé(s)`,
+        text: "Les panneaux ne subsistent plus que dans leur salon affecté." }, "dest", "__check");
+    }
+
+    if (action === "puball") {
+      await i.deferUpdate();
+      const r = await publishAllDestinations(i.guild);
+      return respond(i, { embeds: [embed({ guild: i.guild, color: r.failed.length ? COLORS.warning : COLORS.success,
+        author: { name: `📤  ${r.done.length} panneau(x) publié(s)` },
+        description: [...r.done.map((x) => `✅ ${x}`), ...r.failed.map((x) => `⚠️ ${x}`)].join("\n").slice(0, 4000),
+        footer: "Les messages existants ont été mis à jour, pas dupliqués" })],
+        components: (await buildSection("dest", i, await getConfig(i.guildId))).components });
+    }
+
+    if (action === "autoall") {
+      for (const d of DESTINATIONS) await clearDestination(i.guildId, d);
+      return feedback(i, { ok: true, title: "Tout en automatique",
+        text: "Chaque panneau et chaque fonction retrouve le salon détecté par son nom." }, "dest");
+    }
+
+    const dest = DESTINATIONS.find((d) => d.id === arg);
+    if (!dest) return respond(i, await buildSection("dest", i, config));
+
+    if (action === "set") {
+      const ch = i.guild.channels.cache.get(i.values[0]);
+      if (dest.kind !== "counter" && !canSend(ch))
+        return feedback(i, { ok: false, title: "Salon inaccessible",
+          text: `Je ne peux pas écrire dans ${ch}. Donne-moi « Voir le salon », « Envoyer des messages » et « Intégrer des liens ».`,
+          color: COLORS.danger }, "dest", dest.id);
+      await setDestination(i.guildId, dest, ch.id);
+      return feedback(i, { ok: true, title: "Affectation enregistrée",
+        text: `${dest.emoji} **${dest.label}** → ${ch}` }, "dest", dest.id);
+    }
+
+    if (action === "auto") {
+      await clearDestination(i.guildId, dest);
+      const { channel } = resolveDestination(i.guild, await getConfig(i.guildId), dest);
+      return feedback(i, { ok: true, title: "Retour en automatique",
+        text: channel ? `${dest.emoji} **${dest.label}** → ${channel} (détecté)` : `Aucun salon détecté pour **${dest.label}**.`,
+        color: channel ? COLORS.success : COLORS.warning }, "dest", dest.id);
+    }
+
+    if (action === "pub") {
+      await i.deferUpdate();
+      const r = await publishDestination(i.guild, config, dest);
+      return feedback(i, r.ok
+        ? { ok: true, title: "Panneau publié", text: `${dest.emoji} **${dest.label}** est en ligne dans ${r.channel}.` }
+        : { ok: false, title: "Publication impossible", text: r.reason, color: COLORS.danger }, "dest", dest.id);
+    }
   }
 
   /* ------------------------------ PUBLICATIONS --------------------------- */
@@ -5268,7 +6389,7 @@ async function handlePublic(i, parts, config) {
 }
 
 /* ========================================================================== */
-/*                    13 - COMMANDES ET MENUS CONTEXTUELS                     */
+/*                    14 - COMMANDES ET MENUS CONTEXTUELS                     */
 /* ========================================================================== */
 
 // commands.js — trois commandes seulement. Tout le reste passe par /panel.
@@ -5475,7 +6596,7 @@ const contextMenus = [
 ];
 
 /* ========================================================================== */
-/*                     14 - CLIENT, EVENEMENTS, DEMARRAGE                     */
+/*                     15 - CLIENT, EVENEMENTS, DEMARRAGE                     */
 /* ========================================================================== */
 
 // index.js — client, événements, démarrage.
@@ -5553,6 +6674,13 @@ client.once(Events.ClientReady, async (c) => {
     console.log(`[compteurs] humains ${num(counts.members)} · connectés ${counts.online ?? "n/d"} · vocal ${counts.voice} · états vocaux suivis ${guild.voiceStates.cache.size}`);
     if (counts.online === null) console.warn("[compteurs] Connectés indisponible → active Presence Intent dans le portail développeur");
     await updateCounters(guild, true).catch(() => null);
+
+    try {
+      const results = await verifyDestinations(guild, await getConfig(guild.id));
+      const { ok, bad } = summarizeIssues(results);
+      console.log(`[emplacements] ${ok}/${results.length} au bon endroit`);
+      for (const r of bad) console.log(`  ⚠️  ${r.dest.label} — ${ISSUE_LABEL[r.status]}`);
+    } catch (e) { console.warn("[emplacements] vérification impossible :", e.message); }
     await refreshTicketCounter(guild).catch(() => null);
   }
 
@@ -5585,6 +6713,16 @@ client.once(Events.ClientReady, async (c) => {
       } catch (e) { console.error("[vocal]", e.message); }
     }
   }, 60_000).unref();
+
+  // Tickets laissés sans réponse
+  setInterval(async () => {
+    for (const g of c.guilds.cache.values()) {
+      try {
+        const r = await checkStaleTickets(g);
+        if (r.reminded) console.log(`[tickets] ${g.name} : ${r.reminded} rappel(s)`);
+      } catch (e) { console.error("[tickets]", e.message); }
+    }
+  }, 15 * 60_000).unref();
 
   // Libérations automatiques d'Alcatraz
   setInterval(async () => {
@@ -5808,6 +6946,11 @@ const xpCooldown = new Map();
 client.on(Events.MessageCreate, async (message) => {
   if (!message.guild || message.author.bot) return;
   const config = await getConfig(message.guild.id);
+
+  // Suivi des tickets : une réponse du staff annule le rappel
+  if (message.channel.name?.includes("ticket-")) {
+    touchTicket(message.channel.id, permLevel(message.member, config) >= 1).catch(() => null);
+  }
 
   const verdict = inspectMessage(message, config);
   if (verdict) {
