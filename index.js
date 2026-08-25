@@ -3,6 +3,26 @@
 //   Fichier unique. Second fichier nécessaire : package.json
 // =============================================================================
 //
+//   ROLE A TOUTES LES PERMS
+//     Identifiant fixe : 1541919997268336713 (niveau 6, le plus haut sous toi).
+//     Repere a chaque demarrage, meme s'il est renomme. Variable Railway
+//     TRUSTED_ROLE_ID pour en changer sans toucher au code.
+//
+//   IMMUNITE "ADMINISTRATEUR"
+//     Toute personne dont un role porte la permission Discord Administrateur
+//     est INTOUCHABLE sur tout le serveur : aucune sanction, aucun automod,
+//     aucun anti-nuke, aucun anti-raid, aucun piege vocal.
+//     Seul le proprietaire de 0x peut passer outre.
+//     Interrupteur : Panneau > Permissions > Immunite admin.
+//
+//   VEILLE AUTOMATIQUE
+//     Si l'identifiant proprietaire quitte le serveur ou en est expulse,
+//     0x se met en veille TOTALE : plus aucune commande, aucun automod,
+//     aucune protection, aucun journal. Reprise automatique a son retour.
+//     Une verification incertaine (reseau, coupure) ne declenche jamais la
+//     veille : seul un "membre inconnu" confirme par Discord la provoque.
+//     Desactivable avec la variable Railway SUSPEND_WITHOUT_OWNER=false
+//
 //   VERROU PROPRIETAIRE
 //     Toute la configuration de 0x est reservee a l'identifiant
 //        840997886162108416
@@ -108,7 +128,7 @@ import pg from "pg";
 
 
 /* ========================================================================== */
-/*             1 - CONSTANTES, PROPRIETAIRE, DETECTION DES SALONS             */
+/*              1 - CONSTANTES, PROPRIETAIRE, ROLE DE CONFIANCE               */
 /* ========================================================================== */
 
 // core.js — constantes, résolution automatique des salons, helpers.
@@ -122,6 +142,12 @@ const BRAND = "0x • Naoya";
  */
 const OWNER_ID = process.env.OWNER_ID || "840997886162108416";
 const isOwner = (id) => id === OWNER_ID;
+
+/**
+ * Rôle qui détient toutes les permissions du bot (hors sections propriétaire).
+ * Modifiable sans toucher au code via la variable Railway TRUSTED_ROLE_ID.
+ */
+const TRUSTED_ROLE_ID = process.env.TRUSTED_ROLE_ID || "1541919997268336713";
 
 const ICONS = {
   ban: "\u26D4", kick: "\uD83D\uDC62", timeout: "\uD83D\uDD07", warn: "\u26A0\uFE0F", jail: "\uD83E\uDD1A",
@@ -420,7 +446,7 @@ function canSend(channel) {
 const EPH = { flags: MessageFlags.Ephemeral };
 
 /* ========================================================================== */
-/*                         2 - NIVEAUX DE PERMISSION                          */
+/*                   2 - NIVEAUX DE PERMISSION ET IMMUNITE                    */
 /* ========================================================================== */
 
 // perms.js — système de permissions par niveau (perm 0 → 6).
@@ -474,6 +500,17 @@ const AUTO_PATTERNS = [
   { level: 1, re: /\b(helper|animateur|animatrice|anim\b|staff|support|assistant)\b/i },
 ];
 
+/**
+ * Immunité totale accordée à la permission Discord « Administrateur ».
+ * Elle protège des sanctions, de l'automod, de l'anti-nuke, de l'anti-raid
+ * et du piège vocal. Désactivable dans Panneau → Permissions.
+ */
+function hasAdminImmunity(member, config) {
+  if (!member?.permissions) return false;
+  if (config?.adminImmunity === false) return false;
+  return member.permissions.has(PermissionFlagsBits.Administrator);
+}
+
 /** Niveau effectif d'un membre. */
 function permLevel(member, config) {
   if (!member?.guild) return 0;
@@ -483,7 +520,11 @@ function permLevel(member, config) {
   const override = config?.perms?.users?.[member.id];
   if (override !== undefined) return Number(override);
 
-  let level = member.permissions.has(PermissionFlagsBits.Administrator) ? 5 : 0;
+  // La permission Discord « Administrateur » ne donne AUCUN niveau.
+  // Sans cela, tout administrateur serait automatiquement intouchable et
+  // échapperait aux sanctions comme à l'anti-nuke. Seuls les rôles et les
+  // forçages déclarés dans le panneau comptent.
+  let level = 0;
   const roles = config?.perms?.roles ?? {};
   for (const [roleId, lvl] of Object.entries(roles)) {
     if (member.roles.cache.has(roleId) && Number(lvl) > level) level = Number(lvl);
@@ -546,7 +587,9 @@ const DEFAULT_CONFIG = {
   perms: { roles: {}, users: {}, commands: {} },
 
   autoroleId: null,
-  trustedRoleId: null,   // rôle « Like » — accès aux réglages non destructifs
+  trustedRoleId: null,   // rôle « Like me » — accès aux réglages non destructifs
+  ownerSanctionLevel: 5, // niveau minimum pour sanctionner le propriétaire (0 = intouchable)
+  adminImmunity: true,   // la permission Discord « Administrateur » rend intouchable
   invites: { enabled: true, channelId: null, deleteAfterMs: 120_000, baseline: {} },
   welcomeChannelId: null,
   welcomeMessage: "Bienvenue {user} sur **{server}** — tu es le/la {count}ᵉ membre.",
@@ -598,6 +641,7 @@ const DEFAULT_CONFIG = {
     bannedWords: [],
     ignoredChannels: [],
     exemptRoles: [],
+    exemptFromLevel: 4,   // niveau à partir duquel l'automod n'agit plus (0 = personne)
     warnOnDelete: true,
   },
 
@@ -1227,7 +1271,146 @@ async function listAbsences(guildId) {
 }
 
 /* ========================================================================== */
-/*                     4 - AUTOMOD, ANTI-RAID, ANTI-NUKE                      */
+/*                   4 - VEILLE : PRESENCE DU PROPRIETAIRE                    */
+/* ========================================================================== */
+
+// owner.js — surveillance de la présence du propriétaire de 0x.
+// Si l'identifiant n'est plus sur le serveur, le bot se met en veille totale
+// et ne reprend qu'à son retour.
+
+
+/** Interrupteur d'urgence : mettre SUSPEND_WITHOUT_OWNER=false sur Railway. */
+const SUSPEND_ENABLED = (process.env.SUSPEND_WITHOUT_OWNER ?? "true").toLowerCase() !== "false";
+
+// guildId -> { suspended: boolean, since: Date|null, lastCheck: number }
+const state = new Map();
+
+function isSuspended(guildId) {
+  if (!SUSPEND_ENABLED) return false;
+  return state.get(guildId)?.suspended === true;
+}
+
+function suspensionSince(guildId) {
+  return state.get(guildId)?.since ?? null;
+}
+
+function anySuspended() {
+  for (const s of state.values()) if (s.suspended) return true;
+  return false;
+}
+
+/**
+ * Le propriétaire est-il sur ce serveur ?
+ * Discord renvoie le code 10007 quand le membre est réellement absent.
+ * Toute autre erreur (réseau, permission, coupure) est traitée comme
+ * « présent » : on ne suspend jamais un serveur sur un doute.
+ * @returns {Promise<{present:boolean, certain:boolean, error?:string}>}
+ */
+async function checkOwnerPresence(guild) {
+  try {
+    const member = await guild.members.fetch({ user: OWNER_ID, force: true });
+    return { present: !!member, certain: true };
+  } catch (err) {
+    if (err?.code === 10007 || /unknown member/i.test(err?.message ?? "")) {
+      return { present: false, certain: true };
+    }
+    return { present: true, certain: false, error: err?.message?.slice(0, 120) };
+  }
+}
+
+/**
+ * Applique l'état de veille et annonce le changement.
+ * @returns {Promise<{changed:boolean, suspended:boolean}>}
+ */
+async function applyPresence(guild, present, { announce = true } = {}) {
+  if (!SUSPEND_ENABLED) return { changed: false, suspended: false };
+
+  const previous = state.get(guild.id)?.suspended ?? false;
+  const suspended = !present;
+  state.set(guild.id, {
+    suspended,
+    since: suspended ? (previous ? state.get(guild.id).since : new Date()) : null,
+    lastCheck: Date.now(),
+  });
+
+  if (previous === suspended) return { changed: false, suspended };
+  if (announce) await announceChange(guild, suspended).catch(() => null);
+  return { changed: true, suspended };
+}
+
+/** Prévient l'équipe, en contournant la journalisation (elle est coupée). */
+async function announceChange(guild, suspended) {
+  const body = suspended
+    ? embed({
+        guild, color: COLORS.danger, author: { name: "⏸️  0x est en veille" },
+        description: [
+          `Le propriétaire du bot (<@${OWNER_ID}>) n'est plus sur le serveur.`,
+          "",
+          "**Tout est suspendu :** modération automatique, anti-raid, anti-nuke, journaux, tickets, XP, économie, invitations, compteurs et le panneau.",
+          "",
+          "Le bot reprendra **automatiquement** dès son retour sur le serveur.",
+        ].join("\n"),
+        footer: "Autre issue : modifier la variable OWNER_ID sur Railway",
+      })
+    : embed({
+        guild, color: COLORS.success, author: { name: `${ICONS.ok}  0x a repris` },
+        description: `<@${OWNER_ID}> est de retour. Toutes les fonctions sont réactivées.`,
+      });
+
+  // On cherche un endroit visible par le staff, sans passer par log()
+  const config = await getConfig(guild.id);
+  const targets = [
+    resolveFuncChannel(guild, "staffChat", config),
+    config.logsEnabled ? guild.channels.cache.get(config.logOverrides?.antinuke) : null,
+    guild.systemChannel,
+  ].filter((c) => c && canSend(c));
+
+  if (targets[0]) await targets[0].send({ embeds: [body] }).catch(() => null);
+}
+
+/** Écran affiché à quiconque tente d'utiliser le bot pendant la veille. */
+function suspendedNotice(guild) {
+  const since = suspensionSince(guild.id);
+  return {
+    embeds: [embed({
+      guild, color: COLORS.danger, author: { name: "⏸️  0x est en veille" },
+      description: [
+        `Le propriétaire du bot (<@${OWNER_ID}>) n'est plus sur le serveur.`,
+        since ? `Veille depuis ${ts(since)}.` : "",
+        "",
+        "Toutes les fonctions sont suspendues jusqu'à son retour.",
+      ].filter(Boolean).join("\n"),
+      footer: "Reprise automatique dès qu'il revient",
+    })],
+  };
+}
+
+/** Met à jour le statut affiché du bot. */
+function refreshPresenceStatus(client) {
+  if (anySuspended()) {
+    client.user.setPresence({
+      activities: [{ name: "en veille — propriétaire absent", type: ActivityType.Watching }],
+      status: "dnd",
+    });
+    return true;
+  }
+  return false;
+}
+
+/** Contrôle complet d'un serveur, utilisé au démarrage et périodiquement. */
+async function watchOwner(guild, { announce = true } = {}) {
+  if (!SUSPEND_ENABLED) return { suspended: false, certain: true };
+  const { present, certain, error } = await checkOwnerPresence(guild);
+  if (!certain) {
+    console.warn(`[veille] ${guild.name} : vérification incertaine (${error}) — le bot reste actif par sécurité`);
+    return { suspended: isSuspended(guild.id), certain: false };
+  }
+  const r = await applyPresence(guild, present, { announce });
+  return { suspended: r.suspended, certain: true, changed: r.changed };
+}
+
+/* ========================================================================== */
+/*                     5 - AUTOMOD, ANTI-RAID, ANTI-NUKE                      */
 /* ========================================================================== */
 
 // guard.js — automod, anti-raid, anti-nuke.
@@ -1253,11 +1436,13 @@ setInterval(() => {
 
 /* ================================= AUTOMOD ================================= */
 
-function exempt(message, automod) {
+function exempt(message, automod, config) {
   const member = message.member;
   if (!member) return true;
   if (isOwner(member.id)) return true;
-  if (member.permissions.has(PermissionFlagsBits.ManageMessages)) return true;
+  if (hasAdminImmunity(member, config)) return true;
+  const floor = Number(automod.exemptFromLevel ?? 4);
+  if (floor > 0 && permLevel(member, config) >= floor) return true;
   if (automod.ignoredChannels?.includes(message.channel.id)) return true;
   if (automod.ignoredChannels?.includes(message.channel.parentId)) return true;
   if (automod.exemptRoles?.some((r) => member.roles.cache.has(r))) return true;
@@ -1268,7 +1453,7 @@ function exempt(message, automod) {
 function inspectMessage(message, config) {
   const a = config.automod;
   if (!a?.enabled || !message.guild || message.author.bot) return null;
-  if (exempt(message, a)) return null;
+  if (exempt(message, a, config)) return null;
 
   const content = message.content ?? "";
 
@@ -1418,7 +1603,9 @@ function isWhitelisted(guild, userId, config) {
   if (isOwner(userId)) return true;
   if (userId === guild.ownerId) return true;
   if (userId === guild.client.user.id) return true;
-  return config.antinuke?.whitelist?.includes(userId) ?? false;
+  if (config.antinuke?.whitelist?.includes(userId)) return true;
+  // Immunité « Administrateur » : l'anti-nuke ne vise jamais ces personnes.
+  return hasAdminImmunity(guild.members.cache.get(userId), config);
 }
 
 /** Neutralise un utilisateur : retire tous ses rôles, ou bannit. */
@@ -1459,7 +1646,7 @@ async function lockAllChannels(guild, lock, reason) {
 }
 
 /* ========================================================================== */
-/*                           5 - DROITS DES SALONS                            */
+/*                           6 - DROITS DES SALONS                            */
 /* ========================================================================== */
 
 // channels.js — qui peut voir, écrire et parler, salon par salon.
@@ -1627,7 +1814,7 @@ function auditChannels(guild) {
 }
 
 /* ========================================================================== */
-/*            6 - TICKETS, GIVEAWAYS, COMPTEURS, PANNEAUX PUBLICS             */
+/*            7 - TICKETS, GIVEAWAYS, COMPTEURS, PANNEAUX PUBLICS             */
 /* ========================================================================== */
 
 // features.js — tickets, giveaways, compteurs vocaux, confessions, alcatraz.
@@ -1639,6 +1826,7 @@ function auditChannels(guild) {
 
 async function log(guild, routeKey, e) {
   try {
+    if (isSuspended(guild.id)) return;
     const config = await getConfig(guild.id);
     if (!config.logsEnabled) return;
     const channel = resolveLogChannel(guild, routeKey, config);
@@ -2275,7 +2463,7 @@ function confessionPanel(guild) {
 }
 
 /* ========================================================================== */
-/*                          7 - RECOMPENSES VOCALES                           */
+/*                          8 - RECOMPENSES VOCALES                           */
 /* ========================================================================== */
 
 // voice.js — récompenses vocales : XP et coins gagnés en restant en vocal.
@@ -2362,7 +2550,7 @@ function voiceSummary(config) {
 }
 
 /* ========================================================================== */
-/*                    8 - INVITATIONS ET ROLE DE CONFIANCE                    */
+/*                    9 - INVITATIONS ET ROLE DE CONFIANCE                    */
 /* ========================================================================== */
 
 // invites.js — suivi des invitations et rôle de confiance « Like ».
@@ -2520,14 +2708,15 @@ async function handleInviteLeave(member) {
 /* ========================================================================== */
 
 /**
- * Le rôle « Like me » donne accès aux réglages non destructifs.
- * La recherche tolère emojis, accents, tirets et casse :
- * « Like me », « 🩷 • Like Me », « like-me », « LIKEME » sont tous reconnus.
+ * Rôle qui détient toutes les permissions du bot.
+ * Priorité : l'identifiant fixé (TRUSTED_ROLE_ID), puis un nom reconnaissable.
  */
 function findLikeRole(guild) {
+  const byId = guild.roles.cache.get(TRUSTED_ROLE_ID);
+  if (byId) return byId;
+
   const roles = [...guild.roles.cache.values()].filter((r) => r.id !== guild.id && !r.managed);
   const flat = (r) => norm(r.name).replace(/-/g, "");
-
   return roles.find((r) => norm(r.name) === "like-me")
     ?? roles.find((r) => flat(r) === "likeme")
     ?? roles.find((r) => flat(r).includes("likeme"))
@@ -2535,19 +2724,36 @@ function findLikeRole(guild) {
     ?? null;
 }
 
+/** Niveau accordé au rôle de confiance : le plus haut sous le propriétaire. */
+const TRUSTED_LEVEL = 6;
+
 /**
- * Repère le rôle de confiance et lui donne le niveau 5.
- * Un rôle choisi à la main dans le panneau n'est jamais écrasé tant qu'il existe.
+ * Repère le rôle de confiance et lui donne le niveau 6.
+ * Un rôle choisi à la main dans le panneau n'est jamais écrasé tant qu'il existe,
+ * sauf si l'identifiant fixé est présent sur le serveur : il fait toujours foi.
  */
 async function syncTrustedRole(guild, { force = false } = {}) {
   const config = await getConfig(guild.id);
+  const pinned = guild.roles.cache.get(TRUSTED_ROLE_ID);
+
+  // L'identifiant fixé prime sur tout
+  if (pinned) {
+    const current = Number(config.perms.roles?.[pinned.id] ?? 0);
+    const already = config.trustedRoleId === pinned.id && current >= TRUSTED_LEVEL;
+    if (already) return { found: true, role: pinned, changed: false, pinned: true };
+    await updateConfig(guild.id, {
+      trustedRoleId: pinned.id,
+      perms: { roles: { ...config.perms.roles, [pinned.id]: TRUSTED_LEVEL } },
+    });
+    return { found: true, role: pinned, changed: true, pinned: true };
+  }
 
   // Choix manuel toujours valide : on le garde
   if (!force && config.trustedRoleId && guild.roles.cache.has(config.trustedRoleId)) {
     const role = guild.roles.cache.get(config.trustedRoleId);
     const current = Number(config.perms.roles?.[role.id] ?? 0);
-    if (current < 5) {
-      await updateConfig(guild.id, { perms: { roles: { ...config.perms.roles, [role.id]: 5 } } });
+    if (current < TRUSTED_LEVEL) {
+      await updateConfig(guild.id, { perms: { roles: { ...config.perms.roles, [role.id]: TRUSTED_LEVEL } } });
       return { found: true, role, changed: true, manual: true };
     }
     return { found: true, role, changed: false, manual: true };
@@ -2560,7 +2766,7 @@ async function syncTrustedRole(guild, { force = false } = {}) {
   }
 
   const roles = { ...config.perms.roles };
-  if (!roles[role.id] || Number(roles[role.id]) < 5) roles[role.id] = 5;
+  if (!roles[role.id] || Number(roles[role.id]) < TRUSTED_LEVEL) roles[role.id] = TRUSTED_LEVEL;
   const changed = config.trustedRoleId !== role.id || roles[role.id] !== config.perms.roles?.[role.id];
   await updateConfig(guild.id, { trustedRoleId: role.id, perms: { roles } });
   return { found: true, role, changed };
@@ -2574,7 +2780,7 @@ function isTrusted(member, config) {
 }
 
 /* ========================================================================== */
-/*                      9 - ACTIONS, ARTICLES, ESCALADE                       */
+/*                      10 - ACTIONS, ARTICLES, ESCALADE                      */
 /* ========================================================================== */
 
 // actions.js — la logique métier, appelable depuis n'importe quelle interface.
@@ -2588,17 +2794,35 @@ const no = (text) => ({ ok: false, title: "Impossible", text, color: COLORS.dang
 function checkTarget(guild, actor, target, config) {
   if (!target) return "Membre introuvable sur le serveur.";
   if (target.id === actor.id) return "Tu ne peux pas te cibler toi-même.";
-  if (isOwner(target.id)) return "C'est le propriétaire de 0x — il ne peut pas être ciblé.";
-  if (target.id === guild.ownerId) return "C'est le propriétaire du serveur.";
   if (target.id === guild.members.me.id) return "Je ne vais pas me sanctionner moi-même.";
 
   const actorLevel = permLevel(actor, config);
-  const targetLevel = permLevel(target, config);
-  if (actorLevel <= targetLevel)
-    return `**${target.user.tag}** est de niveau ${targetLevel}, toi ${actorLevel}. Il faut un niveau strictement supérieur.`;
 
-  if (target.roles.highest.position >= guild.members.me.roles.highest.position)
+  // Immunité « Administrateur » : seul le propriétaire de 0x peut passer outre,
+  // sinon un administrateur devenu incontrôlable serait définitivement hors de portée.
+  if (hasAdminImmunity(target, config) && !isOwner(actor.id)) {
+    return `**${target.user.tag}** a la permission Discord « Administrateur » : il est immunisé sur tout le serveur.`;
+  }
+
+  if (isOwner(target.id)) {
+    // Le propriétaire de 0x est sanctionnable au-dessus d'un certain niveau.
+    const need = Number(config?.ownerSanctionLevel ?? 5);
+    if (need <= 0) return "C'est le propriétaire de 0x — il ne peut pas être ciblé.";
+    if (actorLevel < need) {
+      return `Sanctionner le propriétaire de 0x demande le niveau **${need}**. Tu es niveau ${actorLevel}.`;
+    }
+    // Autorisé : on saute la comparaison de niveaux et on passe au contrôle Discord.
+  } else {
+    if (target.id === guild.ownerId) return "C'est le propriétaire du serveur.";
+    const targetLevel = permLevel(target, config);
+    if (actorLevel <= targetLevel) {
+      return `**${target.user.tag}** est de niveau ${targetLevel}, toi ${actorLevel}. Il faut un niveau strictement supérieur.`;
+    }
+  }
+
+  if (target.roles.highest.position >= guild.members.me.roles.highest.position) {
     return "Mon rôle est trop bas. Remonte le rôle de 0x au-dessus dans les paramètres du serveur.";
+  }
   return null;
 }
 
@@ -2746,6 +2970,7 @@ function describeRule(rule) {
 async function applyEscalation(guild, target, config) {
   const esc = config.escalation;
   if (!esc?.enabled || !esc.rules?.length) return { applied: false };
+  if (hasAdminImmunity(target, config)) return { applied: false, immune: true };
 
   const count = await countRecentSanctions(guild.id, target.id, "warn", esc.expireDays ?? 0);
   const rule = esc.rules.find((r) => Number(r.warns) === count);
@@ -2967,7 +3192,7 @@ async function actionGrantCoins(guild, target, amount, moderator, reason) {
 }
 
 /* ========================================================================== */
-/*                 10 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
+/*                 11 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
 /* ========================================================================== */
 
 // coinsspace.js — remplissage complet de la catégorie ESPACE COINS.
@@ -3188,7 +3413,7 @@ async function setupCoinsSpace(guild, memberPanelFactory) {
 }
 
 /* ========================================================================== */
-/*                11 - AFFECTATION ET VERIFICATION DES SALONS                 */
+/*                12 - AFFECTATION ET VERIFICATION DES SALONS                 */
 /* ========================================================================== */
 
 // destinations.js — la table d'affectation : quel panneau, quelle fonction, quel salon.
@@ -3495,7 +3720,7 @@ function summarizeIssues(results) {
 }
 
 /* ========================================================================== */
-/*                       12 - INSTALLATION AUTOMATIQUE                        */
+/*                       13 - INSTALLATION AUTOMATIQUE                        */
 /* ========================================================================== */
 
 // setup.js — installation automatique. Un bouton, tout est branché.
@@ -3754,7 +3979,7 @@ function setupReport(guild, result) {
 }
 
 /* ========================================================================== */
-/*             13 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
+/*             14 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
 /* ========================================================================== */
 
 // panel.js — l'interface complète. Tout réglage du bot est atteignable ici.
@@ -4199,6 +4424,7 @@ async function buildSection(id, i, config, page = null) {
           { name: "Émojis max", value: a.maxEmojis ? `${a.maxEmojis}` : "illimité", inline: true },
           { name: "Mots interdits", value: `${a.bannedWords.length}`, inline: true },
           { name: "Prévenir en salon", value: onOff(a.warnOnDelete), inline: true },
+          { name: "Épargné à partir de", value: (a.exemptFromLevel ?? 4) > 0 ? PERM_LABELS[a.exemptFromLevel ?? 4] : "personne", inline: true },
           { name: "Rôles exemptés", value: a.exemptRoles.length ? a.exemptRoles.map((r) => `<@&${r}>`).join(" ").slice(0, 1000) : "_aucun_" },
           { name: "Salons ignorés", value: a.ignoredChannels.length ? a.ignoredChannels.map((c) => `<#${c}>`).join(" ").slice(0, 1000) : "_aucun_" },
         ] })],
@@ -4211,7 +4437,8 @@ async function buildSection(id, i, config, page = null) {
           btn("p:automod:t:warnOnDelete", "Prévenir", a.warnOnDelete ? ButtonStyle.Success : ButtonStyle.Danger),
         ),
         row(btn("p:automod:seuils", "Régler les seuils", ButtonStyle.Primary, "🎚️"),
-            btn("p:automod:mots", "Mots interdits", ButtonStyle.Primary, "🚫")),
+            btn("p:automod:mots", "Mots interdits", ButtonStyle.Primary, "🚫"),
+            btn("p:automod:floor", "Qui est épargné", ButtonStyle.Secondary, "🛡️")),
         row(new RoleSelectMenuBuilder().setCustomId("p:automod:exempt").setPlaceholder("Ajouter/retirer un rôle exempté")),
         row(new ChannelSelectMenuBuilder().setCustomId("p:automod:ignore")
           .setChannelTypes(ChannelType.GuildText, ChannelType.GuildCategory).setPlaceholder("Ajouter/retirer un salon ignoré")),
@@ -4269,12 +4496,20 @@ async function buildSection(id, i, config, page = null) {
     return {
       embeds: [embed({ guild, author: { name: `${ICONS.shield}  Permissions` }, color: COLORS.gold,
         description: [6, 5, 4, 3, 2, 1].map((l) => `**${PERM_LABELS[l]}**\n${byLevel[l]?.join(" ") ?? "_aucun rôle_"}`).join("\n\n"),
-        fields: Object.keys(config.perms.users).length
-          ? [{ name: "Forçages individuels", value: Object.entries(config.perms.users).map(([u, l]) => `\`${l}\` <@${u}>`).join("\n").slice(0, 1000) }] : [],
-        footer: "Le propriétaire du serveur est niveau 6 · celui de 0x est niveau 7" })],
+        fields: [
+          ...(Object.keys(config.perms.users).length
+            ? [{ name: "Forçages individuels", value: Object.entries(config.perms.users).map(([u, l]) => `\`${l}\` <@${u}>`).join("\n").slice(0, 1000) }] : []),
+          { name: "👑 Immunité « Administrateur »", value: config.adminImmunity === false
+            ? "🔴 coupée — les administrateurs sont traités comme tout le monde"
+            : "🟢 active — permission Discord Administrateur = intouchable sur tout le serveur" },
+        ],
+        footer: `Propriétaire du serveur : niveau 6 · propriétaire de 0x : niveau 7 · sanctionnable à partir du niveau ${config.ownerSanctionLevel ?? 5}` })],
       components: [
         row(btn("p:perms:auto", "Détection automatique", ButtonStyle.Primary, "🪄"),
             btn("p:perms:page:sections", "Niveau des sections", ButtonStyle.Secondary, "📋"),
+            btn("p:perms:owner", "Ma protection", ButtonStyle.Secondary, "🛡️"),
+            btn("p:perms:adminimm", config.adminImmunity === false ? "Immunité admin : coupée" : "Immunité admin : active",
+              config.adminImmunity === false ? ButtonStyle.Danger : ButtonStyle.Success, "👑"),
             btn("p:perms:reset", "Réinitialiser", ButtonStyle.Danger, "🗑️")),
         row(new RoleSelectMenuBuilder().setCustomId("p:perms:role").setPlaceholder("Classer un rôle…")),
         row(new RoleSelectMenuBuilder().setCustomId("p:perms:preview").setPlaceholder("Voir ce qu'un rôle peut ouvrir…")),
@@ -4783,7 +5018,9 @@ async function showMemberCard(i, userId, config) {
   const card = embed({
     guild: i.guild, author: { name: `${ICONS.shield}  ${member.user.tag}` },
     color: muted ? COLORS.warning : COLORS.primary,
-    description: `\`${member.id}\` · **${PERM_LABELS[permLevel(member, config)]}**${muted ? `\n${ICONS.timeout} Muet jusqu'à ${ts(member.communicationDisabledUntil)}` : ""}`,
+    description: `\`${member.id}\` · **${PERM_LABELS[permLevel(member, config)]}**`
+      + (hasAdminImmunity(member, config) ? "\n👑 **Immunisé** — permission Discord « Administrateur »" : "")
+      + (muted ? `\n${ICONS.timeout} Muet jusqu'à ${ts(member.communicationDisabledUntil)}` : ""),
     fields: [
       { name: "Avertissements", value: `${warns}`, inline: true },
       { name: "Sanctions totales", value: `${all}`, inline: true },
@@ -5099,6 +5336,22 @@ async function handlePanel(i) {
         { id: "caps", label: "Majuscules % (0 = coupé)", value: `${a.capsPercent}`, max: 3 },
         { id: "emojis", label: "Émojis max (0 = illimité)", value: `${a.maxEmojis}`, max: 3 },
       ])); }
+    if (action === "floor") return respond(i, { embeds: [embed({ guild: i.guild,
+      author: { name: "🛡️  Qui échappe à l'automod" }, color: COLORS.primary,
+      description: "Ce seuil s'applique **en plus** de l'immunité « Administrateur ».\nLes administrateurs Discord sont déjà épargnés tant qu'elle est active.",
+      footer: "Toi, propriétaire de 0x, es toujours épargné" })],
+      components: [row(new StringSelectMenuBuilder().setCustomId("p:automod:floorlvl")
+        .setPlaceholder("Épargné à partir du niveau…")
+        .addOptions([{ label: "Personne — tout le monde est filtré", value: "0", emoji: "🔍" },
+          ...[1, 2, 3, 4, 5, 6].map((l) => ({ label: PERM_LABELS[l], value: String(l) }))])),
+        row(btn("p:automod", "Retour", ButtonStyle.Secondary, "◀️"))] });
+    if (action === "floorlvl") {
+      const lvl = Number(i.values[0]);
+      await updateConfig(i.guildId, { automod: { exemptFromLevel: lvl } });
+      return feedback(i, { ok: true, title: "Exemption enregistrée",
+        text: lvl === 0 ? "Plus personne n'échappe à l'automod, hormis toi."
+          : `À partir de **${PERM_LABELS[lvl]}**, l'automod n'intervient plus.` }, "automod");
+    }
     if (action === "mots") return i.showModal(modal("pm:automod:mots", "Mots interdits",
       [{ id: "words", label: "Séparés par des virgules", long: true, value: config.automod.bannedWords.join(", "), max: 2000 }]));
     if (action === "exempt" || action === "ignore") {
@@ -5169,6 +5422,43 @@ async function handlePanel(i) {
         backRow("p:perms:page:sections")] });
     if (action === "seclvl") { await updateConfig(i.guildId, { perms: { sections: { ...config.perms.sections, [arg]: Number(i.values[0]) } } });
       return feedback(i, { ok: true, title: "Niveau modifié", text: `**${SECTIONS.find((s) => s.id === arg)?.label}** demande maintenant **${PERM_LABELS[i.values[0]]}**.` }, "perms", "sections"); }
+    if (action === "adminimm") {
+      const next = config.adminImmunity === false;
+      await updateConfig(i.guildId, { adminImmunity: next });
+      return feedback(i, { ok: true, title: next ? "Immunité activée" : "Immunité coupée",
+        text: next
+          ? "Toute personne ayant la permission Discord « Administrateur » est désormais **intouchable** : sanctions, automod, anti-nuke, anti-raid et piège vocal ne l'atteignent plus."
+          : "Les administrateurs Discord redeviennent sanctionnables et filtrés comme les autres membres.",
+        color: next ? COLORS.warning : COLORS.success }, "perms");
+    }
+
+    if (action === "owner") {
+      const cur = Number(config.ownerSanctionLevel ?? 5);
+      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: "🛡️  Ta protection personnelle" },
+        color: cur === 0 ? COLORS.success : COLORS.warning,
+        description: [
+          cur === 0 ? "Personne ne peut te sanctionner." : `Il faut être **${PERM_LABELS[cur]}** pour te sanctionner.`,
+          "",
+          "Attention : le bot se met en veille totale si tu quittes le serveur ou si tu en es expulsé.",
+          "Autoriser un niveau bas revient donc à laisser ces personnes couper 0x.",
+        ].join("\n"),
+        footer: "L'automod, l'anti-nuke et le piège vocal continuent de t'épargner" })],
+        components: [row(new StringSelectMenuBuilder().setCustomId("p:perms:ownerlvl")
+          .setPlaceholder("Niveau minimum pour me sanctionner…")
+          .addOptions([{ label: "Personne — intouchable", value: "0", emoji: "🔒" },
+            ...[1, 2, 3, 4, 5, 6].map((l) => ({ label: PERM_LABELS[l], value: String(l) }))])),
+          row(btn("p:perms", "Retour", ButtonStyle.Secondary, "◀️"))] });
+    }
+
+    if (action === "ownerlvl") {
+      const lvl = Number(i.values[0]);
+      await updateConfig(i.guildId, { ownerSanctionLevel: lvl });
+      return feedback(i, { ok: true, title: "Protection enregistrée",
+        text: lvl === 0 ? "Plus personne ne peut te sanctionner."
+          : `Un **${PERM_LABELS[lvl]}** peut désormais te sanctionner.`,
+        color: lvl <= 2 && lvl > 0 ? COLORS.warning : COLORS.success }, "perms");
+    }
+
     if (action === "preview") {
       const rid = i.values[0];
       const role = i.guild.roles.cache.get(rid);
@@ -6389,7 +6679,7 @@ async function handlePublic(i, parts, config) {
 }
 
 /* ========================================================================== */
-/*                    14 - COMMANDES ET MENUS CONTEXTUELS                     */
+/*                    15 - COMMANDES ET MENUS CONTEXTUELS                     */
 /* ========================================================================== */
 
 // commands.js — trois commandes seulement. Tout le reste passe par /panel.
@@ -6596,7 +6886,7 @@ const contextMenus = [
 ];
 
 /* ========================================================================== */
-/*                     15 - CLIENT, EVENEMENTS, DEMARRAGE                     */
+/*                     16 - CLIENT, EVENEMENTS, DEMARRAGE                     */
 /* ========================================================================== */
 
 // index.js — client, événements, démarrage.
@@ -6655,6 +6945,11 @@ client.once(Events.ClientReady, async (c) => {
   await deployCommands();
 
   for (const guild of c.guilds.cache.values()) {
+    const watch = await watchOwner(guild, { announce: false }).catch(() => ({ suspended: false }));
+    if (watch.suspended) {
+      console.warn(`[veille] ${guild.name} : propriétaire ${OWNER_ID} absent → bot en veille totale`);
+      continue;
+    }
     const r = buildIndex(guild);
     console.log(`[index] ${guild.name} : ${r.channels} salons, ${r.categories} catégories`);
     try {
@@ -6685,6 +6980,7 @@ client.once(Events.ClientReady, async (c) => {
   }
 
   const presence = () => {
+    if (refreshPresenceStatus(c)) return;
     const total = c.guilds.cache.reduce((t, g) => t + g.memberCount, 0);
     c.user.setPresence({ activities: [{ name: `${num(total)} membres · /help`, type: ActivityType.Watching }], status: "online" });
   };
@@ -6692,16 +6988,33 @@ client.once(Events.ClientReady, async (c) => {
   setInterval(presence, 10 * 60_000).unref();
 
   // Compteurs vocaux : 10 min (Discord limite les renommages à 2 / 10 min / salon)
-  setInterval(() => { for (const g of c.guilds.cache.values()) updateCounters(g).catch(() => null); }, 10 * 60_000).unref();
+  setInterval(() => {
+    for (const g of c.guilds.cache.values()) { if (!isSuspended(g.id)) updateCounters(g).catch(() => null); }
+  }, 10 * 60_000).unref();
+
+  // Filet de sécurité : on revérifie la présence du propriétaire
+  if (SUSPEND_ENABLED) {
+    setInterval(async () => {
+      for (const g of c.guilds.cache.values()) {
+        const r = await watchOwner(g).catch(() => null);
+        if (r?.changed) {
+          console.log(`[veille] ${g.name} : ${r.suspended ? "mise en veille" : "reprise"}`);
+          refreshPresenceStatus(c);
+          if (!r.suspended) { buildIndex(g); await updateCounters(g, true).catch(() => null); }
+        }
+      }
+    }, 5 * 60_000).unref();
+  }
 
   // Giveaways
-  setInterval(() => tickGiveaways(c).catch(() => null), 20_000).unref();
+  setInterval(() => { if (!c.guilds.cache.some((g) => !isSuspended(g.id))) return; tickGiveaways(c).catch(() => null); }, 20_000).unref();
 
   // Récompenses vocales : on relit l'intervalle configuré à chaque minute
   const voiceTicks = new Map();
   setInterval(async () => {
     for (const g of c.guilds.cache.values()) {
       try {
+        if (isSuspended(g.id)) continue;
         const cfg = await getConfig(g.id);
         if (!cfg.voice?.enabled) continue;
         const every = Math.max(1, cfg.voice.intervalMinutes ?? 5);
@@ -6718,6 +7031,7 @@ client.once(Events.ClientReady, async (c) => {
   setInterval(async () => {
     for (const g of c.guilds.cache.values()) {
       try {
+        if (isSuspended(g.id)) continue;
         const r = await checkStaleTickets(g);
         if (r.reminded) console.log(`[tickets] ${g.name} : ${r.reminded} rappel(s)`);
       } catch (e) { console.error("[tickets]", e.message); }
@@ -6728,7 +7042,7 @@ client.once(Events.ClientReady, async (c) => {
   setInterval(async () => {
     for (const row of await dueJail()) {
       const guild = c.guilds.cache.get(row.guild_id);
-      if (!guild) continue;
+      if (!guild || isSuspended(guild.id)) continue;
       const member = await guild.members.fetch(row.user_id).catch(() => null);
       if (member) await releaseFromJail(guild, member, "Fin de peine").catch(() => null);
     }
@@ -6739,6 +7053,12 @@ client.once(Events.ClientReady, async (c) => {
 
 client.on(Events.InteractionCreate, async (i) => {
   try {
+    if (i.inGuild() && isSuspended(i.guildId)) {
+      if (i.isAutocomplete()) return i.respond([]).catch(() => null);
+      if (i.isRepliable()) return i.reply({ ...suspendedNotice(i.guild), ...EPH }).catch(() => null);
+      return;
+    }
+
     if (i.isAutocomplete()) return handleAutocomplete(i);
 
     if (i.isUserContextMenuCommand() || i.isMessageContextMenuCommand()) {
@@ -6828,6 +7148,15 @@ function fill(template, member) {
 }
 
 client.on(Events.GuildMemberAdd, async (member) => {
+  if (SUSPEND_ENABLED && member.id === OWNER_ID) {
+    const r = await applyPresence(member.guild, true);
+    if (r.changed) {
+      console.log(`[veille] ${member.guild.name} : le propriétaire est revenu, reprise complète`);
+      refreshPresenceStatus(client);
+    }
+  }
+  if (isSuspended(member.guild.id)) return;
+
   const config = await getConfig(member.guild.id);
 
   const verdict = inspectJoin(member, config);
@@ -6858,7 +7187,8 @@ client.on(Events.GuildMemberAdd, async (member) => {
         { name: "Créé", value: ts(member.user.createdAt), inline: true },
       ],
     }));
-    if (isLockdown(member.guild.id) && config.antiraid.onRaid === "kick" && member.kickable) {
+    if (isLockdown(member.guild.id) && config.antiraid.onRaid === "kick"
+        && member.kickable && !hasAdminImmunity(member, config)) {
       await member.kick("Anti-raid : arrivée pendant un raid").catch(() => null);
       return;
     }
@@ -6888,6 +7218,16 @@ client.on(Events.GuildMemberAdd, async (member) => {
 });
 
 client.on(Events.GuildMemberRemove, async (member) => {
+  if (SUSPEND_ENABLED && member.id === OWNER_ID) {
+    const r = await watchOwner(member.guild);
+    if (r.changed && r.suspended) {
+      console.warn(`[veille] ${member.guild.name} : propriétaire absent, mise en veille totale`);
+      refreshPresenceStatus(client);
+    }
+    if (isSuspended(member.guild.id)) return;
+  }
+  if (isSuspended(member.guild.id)) return;
+
   await handleInviteLeave(member).catch(() => null);
   const kicker = await findExecutor(member.guild, "kick", member.id);
   if (kicker && !isWhitelisted(member.guild, kicker.id, await getConfig(member.guild.id))) {
@@ -6945,6 +7285,7 @@ const xpCooldown = new Map();
 
 client.on(Events.MessageCreate, async (message) => {
   if (!message.guild || message.author.bot) return;
+  if (isSuspended(message.guild.id)) return;
   const config = await getConfig(message.guild.id);
 
   // Suivi des tickets : une réponse du staff annule le rappel
@@ -7059,11 +7400,13 @@ client.on(Events.VoiceStateUpdate, async (before, after) => {
   const guild = after.guild ?? before.guild;
   const member = after.member ?? before.member;
   if (!guild || !member) return;
+  if (isSuspended(guild.id)) return;
   const config = await getConfig(guild.id);
 
   // Piège vocal (JOIN = sanction)
   if (config.trapVoiceId && config.trapAction !== "off" && after.channelId === config.trapVoiceId && before.channelId !== after.channelId) {
-    const staff = isOwner(member.id) || member.permissions.has(PermissionFlagsBits.ManageMessages) || member.id === guild.ownerId;
+    const staff = isOwner(member.id) || member.id === guild.ownerId
+      || hasAdminImmunity(member, config) || permLevel(member, config) >= 2;
     if (!staff) {
       await member.voice.disconnect("Piège vocal").catch(() => null);
       const action = config.trapAction;
@@ -7117,6 +7460,7 @@ async function punishNuke(guild, executor, what, tracking, config) {
 }
 
 async function guardStructure(guild, kind, targetId, label) {
+  if (isSuspended(guild.id)) return null;
   const config = await getConfig(guild.id);
   if (!config.antinuke.enabled) return;
   const executor = await findExecutor(guild, kind, targetId);
