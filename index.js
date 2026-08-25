@@ -2013,9 +2013,9 @@ def(new SlashCommandBuilder().setName("panel").setDescription("Publie un panneau
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles.toString())
   .addSubcommand((s) => {
     s.setName("roles").setDescription("Menu de rôles à cocher")
-      .addStringOption((o) => o.setName("titre").setDescription("Titre du menu").setRequired(true))
-      .addChannelOption((o) => o.setName("salon").setDescription("Salon cible").addChannelTypes(ChannelType.GuildText));
+      .addStringOption((o) => o.setName("titre").setDescription("Titre du menu").setRequired(true));
     for (let n = 1; n <= 8; n++) s.addRoleOption((o) => o.setName(`role${n}`).setDescription(`Rôle ${n}`).setRequired(n === 1));
+    s.addChannelOption((o) => o.setName("salon").setDescription("Salon cible").addChannelTypes(ChannelType.GuildText));
     return s;
   }),
   async (i) => {
