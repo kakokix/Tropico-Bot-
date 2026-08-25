@@ -539,7 +539,18 @@ const DEFAULT_CONFIG = {
   trapAction: "off", // off | kick | ban
 
   levelsEnabled: true,
-  levelRewards: {}, // { "10": "roleId" }
+  levelRewards: {},
+
+  // Récompenses vocales : monter en niveau et gagner des coins en restant en vocal
+  voice: {
+    enabled: true,
+    xpPerMinute: 15,
+    coinsPerMinute: 3,
+    intervalMinutes: 5,
+    minMembers: 2,        // seul dans un salon = aucun gain
+    requireUnmuted: true, // casque coupé = considéré absent
+    ignoredChannels: [],
+  }, // { "10": "roleId" }
 
   automod: {
     enabled: true,
@@ -609,6 +620,7 @@ const mem = {
   absences: [],
   invites: new Map(),
   boosts: new Map(),
+  voiceTime: new Map(),
 };
 let seq = 1;
 
@@ -652,6 +664,9 @@ async function initDatabase() {
       kind TEXT NOT NULL, opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), closed_at TIMESTAMPTZ, closed_by TEXT)`);
     await q(`CREATE TABLE IF NOT EXISTS jail (guild_id TEXT, user_id TEXT, roles JSONB NOT NULL DEFAULT '[]'::jsonb,
       until TIMESTAMPTZ, reason TEXT, PRIMARY KEY (guild_id, user_id))`);
+    await q(`CREATE TABLE IF NOT EXISTS voice_time (
+      guild_id TEXT NOT NULL, user_id TEXT NOT NULL, minutes INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (guild_id, user_id))`);
     await q(`CREATE TABLE IF NOT EXISTS boosts (
       guild_id TEXT NOT NULL, user_id TEXT NOT NULL, multiplier REAL NOT NULL DEFAULT 1,
       until TIMESTAMPTZ NOT NULL, PRIMARY KEY (guild_id, user_id))`);
@@ -934,6 +949,30 @@ async function dueJail() {
   if (ready) return (await q("SELECT * FROM jail WHERE until IS NOT NULL AND until<=NOW()")).rows;
   return [...mem.jail.entries()].filter(([, v]) => v.until && new Date(v.until) <= new Date())
     .map(([k, v]) => ({ guild_id: k.split(":")[0], user_id: k.split(":")[1], ...v }));
+}
+
+/* ------------------------------- TEMPS VOCAL ------------------------------ */
+
+async function addVoiceMinutes(guildId, userId, minutes) {
+  if (ready) {
+    await q(`INSERT INTO voice_time (guild_id,user_id,minutes) VALUES ($1,$2,$3)
+      ON CONFLICT (guild_id,user_id) DO UPDATE SET minutes = voice_time.minutes + $3`, [guildId, userId, minutes]);
+    return;
+  }
+  const k = `${guildId}:${userId}`;
+  mem.voiceTime.set(k, (mem.voiceTime.get(k) ?? 0) + minutes);
+}
+
+async function getVoiceMinutes(guildId, userId) {
+  if (ready) return (await q("SELECT minutes FROM voice_time WHERE guild_id=$1 AND user_id=$2", [guildId, userId])).rows[0]?.minutes ?? 0;
+  return mem.voiceTime.get(`${guildId}:${userId}`) ?? 0;
+}
+
+async function topVoice(guildId, limit = 10) {
+  if (ready) return (await q("SELECT user_id, minutes FROM voice_time WHERE guild_id=$1 ORDER BY minutes DESC LIMIT $2", [guildId, limit]))
+    .rows.map((r) => ({ userId: r.user_id, minutes: r.minutes }));
+  return [...mem.voiceTime.entries()].filter(([k]) => k.startsWith(`${guildId}:`))
+    .sort((a, b) => b[1] - a[1]).slice(0, limit).map(([k, minutes]) => ({ userId: k.split(":")[1], minutes }));
 }
 
 /* --------------------------- MULTIPLICATEURS D'XP -------------------------- */
@@ -1841,6 +1880,7 @@ function memberPanel(guild) {
         { name: "🏆 Classement", value: "Top XP et coins", inline: true },
         { name: "🛒 Boutique", value: "Rôles à acheter", inline: true },
         { name: "🔗 Invitations", value: "Tes filleuls", inline: true },
+        { name: "🔊 Vocal", value: "XP et coins en parlant", inline: true },
       ] })],
     components: [
       new ActionRowBuilder().addComponents(
@@ -1858,6 +1898,7 @@ function memberPanel(guild) {
       new ActionRowBuilder().addComponents(
         pbtn("pub:invites", "Mes invitations", ButtonStyle.Primary, "🔗"),
         pbtn("pub:top:invites", "Top invitations", ButtonStyle.Secondary, "🏅"),
+        pbtn("pub:top:voice", "Top vocal", ButtonStyle.Secondary, "🔊"),
       ),
     ],
   };
@@ -1872,7 +1913,94 @@ function confessionPanel(guild) {
 }
 
 /* ========================================================================== */
-/*                    6 - INVITATIONS ET ROLE DE CONFIANCE                    */
+/*                          6 - RECOMPENSES VOCALES                           */
+/* ========================================================================== */
+
+// voice.js — récompenses vocales : XP et coins gagnés en restant en vocal.
+
+
+/** Un membre est-il éligible aux gains vocaux ? */
+function isEligible(voiceState, member, guild, v) {
+  if (!voiceState.channelId) return false;
+  if (member?.user?.bot) return false;
+  if (guild.afkChannelId && voiceState.channelId === guild.afkChannelId) return false;
+  if (v.ignoredChannels?.includes(voiceState.channelId)) return false;
+  if (v.requireUnmuted && (voiceState.selfDeaf || voiceState.deaf)) return false;
+  if (v.requireUnmuted && voiceState.selfMute && voiceState.selfDeaf) return false;
+  return true;
+}
+
+/**
+ * Distribue les gains à tout le monde en vocal.
+ * Appelé toutes les `intervalMinutes` minutes.
+ * @returns {Promise<{rewarded:number, levelUps:Array}>}
+ */
+async function tickVoiceRewards(guild) {
+  const config = await getConfig(guild.id);
+  const v = config.voice;
+  if (!v?.enabled) return { rewarded: 0, levelUps: [] };
+
+  // Regroupement par salon : on exige un minimum de participants
+  const byChannel = new Map();
+  for (const vs of guild.voiceStates.cache.values()) {
+    const member = guild.members.cache.get(vs.id);
+    if (!isEligible(vs, member, guild, v)) continue;
+    if (!byChannel.has(vs.channelId)) byChannel.set(vs.channelId, []);
+    byChannel.get(vs.channelId).push({ vs, member });
+  }
+
+  const minutes = Math.max(1, v.intervalMinutes ?? 5);
+  const baseXp = Math.round((v.xpPerMinute ?? 15) * minutes);
+  const baseCoins = Math.round((v.coinsPerMinute ?? 3) * minutes);
+  const levelUps = [];
+  let rewarded = 0;
+
+  for (const group of byChannel.values()) {
+    if (group.length < (v.minMembers ?? 2)) continue;
+
+    for (const { member } of group) {
+      if (!member) continue;
+      let xp = baseXp;
+      const boost = await getBoost(guild.id, member.id);
+      if (boost) xp = Math.round(xp * boost.multiplier);
+
+      const result = await addXp(guild.id, member.id, xp);
+      if (baseCoins > 0 && config.economy?.enabled) await addCoins(guild.id, member.id, baseCoins);
+      await addVoiceMinutes(guild.id, member.id, minutes);
+      rewarded++;
+
+      if (result?.leveledUp) levelUps.push({ member, level: result.level });
+    }
+  }
+
+  // Annonces de montée de niveau
+  if (levelUps.length) {
+    const target = resolveFuncChannel(guild, "levelUp", config);
+    if (target && canSend(target)) {
+      for (const up of levelUps.slice(0, 10)) {
+        const reward = config.levelRewards?.[String(up.level)];
+        if (reward) await up.member.roles.add(reward, `Niveau ${up.level} (vocal)`).catch(() => null);
+        await target.send(`🔊 ${up.member} passe **niveau ${up.level}** en vocal${reward ? ` et débloque <@&${reward}>` : ""} !`).catch(() => null);
+      }
+    }
+  }
+
+  return { rewarded, levelUps };
+}
+
+/** Résumé lisible des réglages vocaux. */
+function voiceSummary(config) {
+  const v = config.voice ?? {};
+  if (!v.enabled) return "🔴 coupé";
+  const perTick = Math.round((v.xpPerMinute ?? 15) * (v.intervalMinutes ?? 5));
+  const coinsTick = Math.round((v.coinsPerMinute ?? 3) * (v.intervalMinutes ?? 5));
+  return `🟢 **${perTick} XP** et **${coinsTick} coins** toutes les ${v.intervalMinutes ?? 5} min\n`
+    + `Minimum ${v.minMembers ?? 2} personne(s) dans le salon`
+    + (v.requireUnmuted ? " · casque coupé = pas de gain" : "");
+}
+
+/* ========================================================================== */
+/*                    7 - INVITATIONS ET ROLE DE CONFIANCE                    */
 /* ========================================================================== */
 
 // invites.js — suivi des invitations et rôle de confiance « Like ».
@@ -2084,7 +2212,7 @@ function isTrusted(member, config) {
 }
 
 /* ========================================================================== */
-/*                      7 - ACTIONS ET TYPES D ARTICLES                       */
+/*                      8 - ACTIONS ET TYPES D ARTICLES                       */
 /* ========================================================================== */
 
 // actions.js — la logique métier, appelable depuis n'importe quelle interface.
@@ -2420,7 +2548,228 @@ async function actionGrantCoins(guild, target, amount, moderator, reason) {
 }
 
 /* ========================================================================== */
-/*                        8 - INSTALLATION AUTOMATIQUE                        */
+/*                  9 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
+/* ========================================================================== */
+
+// coinsspace.js — remplissage complet de la catégorie ESPACE COINS.
+
+
+const b = (id, label, style = ButtonStyle.Secondary, emoji) => {
+  const x = new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style);
+  if (emoji) x.setEmoji(emoji);
+  return x;
+};
+
+/* ========================================================================== */
+/*                          PANNEAUX DE L'ESPACE COINS                        */
+/* ========================================================================== */
+
+function shopPanel(guild, config) {
+  return {
+    embeds: [embed({
+      guild, color: COLORS.gold, author: { name: `${ICONS.coin}  Boutique` },
+      description: [
+        `Dépense tes ${config.economy.currency} contre du concret.`,
+        "",
+        "**🕊️ Pardon** — efface ton dernier avertissement",
+        "**📈 XP** — crédité immédiatement sur ton niveau",
+        "**🚀 Boost** — multiplie l'XP gagné pendant plusieurs heures",
+        "**✨ Rôle personnalisé** — ton nom, ta couleur, à toi seul",
+        "**🎭 Rôles du serveur** — les rôles mis en vente par le staff",
+      ].join("\n"),
+      footer: "Le stock et les prix évoluent — reviens régulièrement",
+    })],
+    components: [new ActionRowBuilder().addComponents(
+      b("pub:shop", "Ouvrir la boutique", ButtonStyle.Success, "🛒"),
+      b("pub:coins", "Mon solde", ButtonStyle.Primary, "🪙"),
+    )],
+  };
+}
+
+function rewardPanel(guild, config) {
+  const e = config.economy;
+  return {
+    embeds: [embed({
+      guild, color: COLORS.success, author: { name: "🎁  Tes récompenses" },
+      description: "Récupère ce que tu as gagné. Tout est gratuit, il suffit de revenir.",
+      fields: [
+        { name: "🎁 Quotidien", value: `${e.currency} ${num(e.dailyAmount)} par jour\n+25 par jour de série, jusqu'à +250`, inline: true },
+        { name: "💼 Travail", value: `${e.currency} ${num(e.workMin)}–${num(e.workMax)}\ntoutes les ${Math.round(e.workCooldownMs / 60000)} min`, inline: true },
+        { name: "📦 Colis", value: "Tombent au hasard\nPremier arrivé, premier servi", inline: true },
+      ],
+      footer: "Oublier un jour casse ta série : reviens toutes les 24 h",
+    })],
+    components: [new ActionRowBuilder().addComponents(
+      b("pub:daily", "Quotidien", ButtonStyle.Success, "🎁"),
+      b("pub:work", "Travailler", ButtonStyle.Success, "💼"),
+      b("pub:coins", "Mon solde", ButtonStyle.Primary, "🪙"),
+      b("pub:top:coins", "Classement", ButtonStyle.Secondary, "🏆"),
+    )],
+  };
+}
+
+function rulesEmbed(guild, config) {
+  const c = config.economy.currency;
+  return embed({
+    guild, color: COLORS.gold, author: { name: "📜  Règlement de l'espace coins" },
+    description: [
+      `Les ${c} coins sont la monnaie du serveur. Ils s'obtiennent en participant, et se dépensent en boutique.`,
+      "Participer ici vaut acceptation de ces règles.",
+    ].join("\n"),
+    fields: [
+      {
+        name: "1 · Un compte par personne",
+        value: "Les comptes multiples, alternatifs ou partagés sont interdits. Tout gain obtenu ainsi est retiré et le compte principal est sanctionné.",
+      },
+      {
+        name: "2 · Pas de triche au gain",
+        value: "Flood pour l'XP, macros, bots d'auto-clic, salons vocaux tenus micro coupé pour farmer : solde remis à zéro et exclusion de l'espace coins.",
+      },
+      {
+        name: "3 · Les échanges sont à vos risques",
+        value: `Les transferts entre membres sont autorisés et définitifs. Le staff ne rembourse **aucun** ${c} envoyé par erreur, ni aucune arnaque entre membres.`,
+      },
+      {
+        name: "4 · Aucune valeur réelle",
+        value: "Les coins ne s'achètent ni ne se revendent contre de l'argent, du Nitro, des Robux ou quoi que ce soit d'extérieur au serveur. Toute proposition de ce type est signalée.",
+      },
+      {
+        name: "5 · Les achats sont fermes",
+        value: "Un article acheté n'est ni remboursé ni échangé. Vérifiez avant de valider. Un rôle personnalisé retiré pour non-respect du règlement n'est pas remboursé.",
+      },
+      {
+        name: "6 · Rôles personnalisés",
+        value: "Nom et couleur doivent respecter le règlement du serveur : pas d'insulte, pas d'usurpation d'un membre du staff, pas de contenu choquant. Le staff peut renommer ou supprimer sans préavis.",
+      },
+      {
+        name: "7 · Le staff a le dernier mot",
+        value: "Les prix, gains et stocks peuvent changer à tout moment. En cas d'abus, le staff peut ajuster ou remettre à zéro un solde. Les décisions se contestent en ticket, jamais en salon public.",
+      },
+    ],
+    footer: "Un doute ? Ouvre un ticket dans le centre d'aide",
+  });
+}
+
+function howToPlayEmbed(guild, config) {
+  const c = config.economy.currency;
+  const e = config.economy;
+  return embed({
+    guild, color: COLORS.primary, author: { name: "💡  Comment gagner des coins" },
+    description: `Cinq façons de remplir ta bourse. Aucune ne demande de payer quoi que ce soit.`,
+    fields: [
+      {
+        name: "💬 Parler dans le chat",
+        value: "15 à 25 XP par message, une fois par minute maximum. L'XP fait monter ton niveau, et les niveaux débloquent des rôles.",
+      },
+      {
+        name: "🔊 Rester en vocal",
+        value: voiceSummary(config) + "\nLe plus rentable du serveur : tu gagnes sans rien faire, tant que tu es accompagné.",
+      },
+      {
+        name: "🎁 La récompense quotidienne",
+        value: `${c} ${num(e.dailyAmount)} par jour, plus un bonus de série qui grimpe jusqu'à +250. Reviens tous les jours sans en sauter un.`,
+      },
+      {
+        name: "💼 Le travail",
+        value: `${c} ${num(e.workMin)} à ${num(e.workMax)}, toutes les ${Math.round(e.workCooldownMs / 60000)} minutes. Le geste le plus rentable si tu es actif.`,
+      },
+      {
+        name: "📦 Les colis",
+        value: "Des colis tombent au hasard dans le salon dédié. Le premier à appuyer sur le bouton rafle tout.",
+      },
+      {
+        name: "🛒 Et après ?",
+        value: "Direction la boutique : pardon d'avertissement, XP, multiplicateurs, rôle personnalisé à ton nom.",
+      },
+    ],
+    footer: "Ton solde et ton niveau te suivent partout sur le serveur",
+  });
+}
+
+/* ========================================================================== */
+/*                              INSTALLATION                                  */
+/* ========================================================================== */
+
+const TARGETS = {
+  rules: ["reglement-coins", "regles-coins"],
+  howto: ["comment-jouer"],
+  shop: ["boutique-coins"],
+  rewards: ["recompense", "recompenses"],
+  drops: ["drop-colis"],
+  commands: ["cmds-coins", "commandes-coins"],
+  access: ["acces-coins"],
+};
+
+/**
+ * Remplit toute la catégorie ESPACE COINS et branche les réglages.
+ * Remplace ses propres messages s'ils existent déjà (pas de doublon).
+ */
+async function setupCoinsSpace(guild, memberPanelFactory) {
+  const config = await getConfig(guild.id);
+  const report = [];
+  const patch = { economy: {} };
+
+  /** Modifie notre message existant, sinon en poste un nouveau. */
+  const publishOrEdit = async (channel, payload) => {
+    let mine = null;
+    try {
+      const recent = await channel.messages.fetch({ limit: 20 });
+      const list = typeof recent?.find === "function" ? recent : [...(recent?.values?.() ?? [])];
+      mine = list.find((m) => m.author?.id === guild.members.me.id && m.embeds?.length);
+    } catch { mine = null; }
+    if (mine) return mine.edit(payload).catch(() => channel.send(payload).catch(() => null));
+    return channel.send(payload).catch(() => null);
+  };
+
+  const publish = async (key, payload, label) => {
+    const channel = findChannel(guild, TARGETS[key]);
+    if (!channel) { report.push({ ok: false, label, detail: `Salon introuvable (${TARGETS[key][0]})` }); return null; }
+    if (!canSend(channel)) { report.push({ ok: false, label, detail: `Je ne peux pas écrire dans ${channel}` }); return null; }
+
+    await publishOrEdit(channel, payload);
+    report.push({ ok: true, label, detail: `${channel}` });
+    return channel;
+  };
+
+  await publish("rules", { embeds: [rulesEmbed(guild, config)] }, "Règlement");
+  await publish("howto", { embeds: [howToPlayEmbed(guild, config)] }, "Guide « comment jouer »");
+  await publish("shop", shopPanel(guild, config), "Panneau boutique");
+  await publish("rewards", rewardPanel(guild, config), "Panneau récompenses");
+  if (memberPanelFactory) await publish("commands", memberPanelFactory(guild), "Panneau membre complet");
+
+  const dropCh = findChannel(guild, TARGETS.drops);
+  if (dropCh && canSend(dropCh)) {
+    patch.economy.dropChannelId = dropCh.id;
+    if (!config.economy.dropChance) patch.economy.dropChance = 4;
+    report.push({ ok: true, label: "Colis automatiques", detail: `${dropCh} · 4 % de chance par message` });
+  } else {
+    report.push({ ok: false, label: "Colis automatiques", detail: "Salon drop-colis introuvable" });
+  }
+
+  const accessCh = findChannel(guild, TARGETS.access);
+  const coinRole = guild.roles.cache.find((r) => /coins?/i.test(r.name) && !r.managed && r.id !== guild.id);
+  if (accessCh && canSend(accessCh) && coinRole) {
+    await publishOrEdit(accessCh, {
+      embeds: [embed({ guild, color: COLORS.gold, author: { name: "🎰  Rejoindre l'espace coins" },
+        description: `Choisis ${coinRole} dans le menu pour accéder à tous les salons de l'espace coins. Reviens ici pour le retirer.` })],
+      components: [new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder().setCustomId("rolemenu")
+          .setPlaceholder("Rejoindre / quitter l'espace coins").setMinValues(0).setMaxValues(1)
+          .addOptions([{ label: coinRole.name.slice(0, 100), value: coinRole.id }]))],
+    });
+    report.push({ ok: true, label: "Accès à l'espace", detail: `${accessCh} → ${coinRole}` });
+  } else {
+    report.push({ ok: false, label: "Accès à l'espace",
+      detail: coinRole ? "Salon accès-coins introuvable" : "Aucun rôle contenant « coins » — crée-le puis relance" });
+  }
+
+  if (Object.keys(patch.economy).length) await updateConfig(guild.id, patch);
+
+  return { report, ok: report.filter((r) => r.ok).length, ko: report.filter((r) => !r.ok).length };
+}
+
+/* ========================================================================== */
+/*                       10 - INSTALLATION AUTOMATIQUE                        */
 /* ========================================================================== */
 
 // setup.js — installation automatique. Un bouton, tout est branché.
@@ -2575,6 +2924,14 @@ async function autoSetup(guild, user) {
     steps.push(step(true, "Boutique", `${cfgNow.economy.shop.length} article(s) déjà en place, rien de touché`));
   }
 
+  /* 8d — espace coins ------------------------------------------------------- */
+  await updateConfig(guild.id, patch);   // la boutique doit exister avant d'écrire les panneaux
+  const space = await setupCoinsSpace(guild, memberPanel).catch(() => null);
+  if (space) {
+    steps.push(step(space.ko === 0, `Espace coins (${space.ok}/${space.ok + space.ko})`,
+      space.report.filter((r) => r.ok).map((r) => r.label).join(", ") || "aucun salon rempli"));
+  }
+
   /* 9 — catégories de tickets ---------------------------------------------- */
   const cats = TICKET_TYPES.filter((t) => findCategory(guild, t.categories));
   steps.push(step(cats.length === TICKET_TYPES.length, `Catégories de tickets (${cats.length}/${TICKET_TYPES.length})`,
@@ -2656,7 +3013,7 @@ function setupReport(guild, result) {
 }
 
 /* ========================================================================== */
-/*              9 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
+/*             11 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
 /* ========================================================================== */
 
 // panel.js — l'interface complète. Tout réglage du bot est atteignable ici.
@@ -2678,6 +3035,7 @@ const SECTIONS = [
   { id: "counters", label: "Compteurs", emoji: "📊", level: 4, desc: "Membres, connectés, vocal", trusted: true },
   { id: "eco", label: "Économie", emoji: "🪙", level: 4, desc: "Coins, boutique, colis", trusted: true },
   { id: "levels", label: "Niveaux", emoji: "📈", level: 4, desc: "XP, récompenses, annonces", trusted: true },
+  { id: "voice", label: "Vocal", emoji: "🔊", level: 4, desc: "XP et coins gagnés en vocal", trusted: true },
   { id: "automod", label: "Automod", emoji: "🤖", level: 5, desc: "Filtres de messages", trusted: true },
   { id: "logs", label: "Journaux", emoji: "🗂️", level: 5, desc: "Routage de chaque type de log", ownerOnly: true },
   { id: "config", label: "Configuration", emoji: "⚙️", level: 5, desc: "Rôles, accueil, salons, piège vocal", ownerOnly: true },
@@ -3217,13 +3575,44 @@ async function buildSection(id, i, config, page = null) {
     };
   }
 
+  /* --------------------------------- VOCAL ------------------------------- */
+  if (id === "voice") {
+    const v = config.voice ?? {};
+    const top = await topVoice(guild.id, 8);
+    const live = guild.voiceStates.cache.filter((x) => x.channelId).size;
+    const fmt = (m) => (m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`);
+    const medals = ["🥇", "🥈", "🥉"];
+    return {
+      embeds: [embed({ guild, author: { name: "🔊  Récompenses vocales" }, color: v.enabled ? COLORS.success : COLORS.neutral,
+        description: voiceSummary(config),
+        fields: [
+          { name: "En vocal maintenant", value: `${live}`, inline: true },
+          { name: "Salons ignorés", value: v.ignoredChannels?.length ? v.ignoredChannels.map((c) => `<#${c}>`).join(" ").slice(0, 900) : "_aucun_", inline: true },
+          { name: "Salon AFK", value: guild.afkChannelId ? `<#${guild.afkChannelId}> — jamais récompensé` : "_non défini_", inline: true },
+          { name: "Top temps vocal", value: top.length
+            ? top.map((x, n) => `${medals[n] ?? `**${n + 1}.**`} <@${x.userId}> — ${fmt(x.minutes)}`).join("\n") : "_personne pour l'instant_" },
+        ],
+        footer: "Seul dans un salon : aucun gain. Casque coupé : aucun gain." })],
+      components: [
+        row(btn("p:voice:t", v.enabled ? "Couper les gains vocaux" : "Activer les gains vocaux",
+              v.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
+            btn("p:voice:cfg", "Régler les gains", ButtonStyle.Primary, "🎚️"),
+            btn("p:voice:tick", "Distribuer maintenant", ButtonStyle.Secondary, "⚡")),
+        row(new ChannelSelectMenuBuilder().setCustomId("p:voice:ignore")
+          .setChannelTypes(ChannelType.GuildVoice).setPlaceholder("Ajouter/retirer un salon ignoré")),
+        backRow(),
+      ],
+    };
+  }
+
   /* -------------------------------- ÉCONOMIE ----------------------------- */
   if (id === "eco") {
     const e = config.economy;
     const comps = [
       row(btn("p:eco:t", e.enabled ? "Couper l'économie" : "Activer l'économie", e.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
         btn("p:eco:montants", "Montants", ButtonStyle.Primary, "🎚️"),
-        btn("p:eco:drop", "Lâcher un colis", ButtonStyle.Primary, "📦")),
+        btn("p:eco:drop", "Lâcher un colis", ButtonStyle.Primary, "📦"),
+        btn("p:eco:space", "Remplir l'espace coins", ButtonStyle.Success, "🏛️")),
       row(new StringSelectMenuBuilder().setCustomId("p:eco:addtype").setPlaceholder("Ajouter un article : quel type ?")
         .addOptions(Object.entries(ITEM_TYPES).map(([k, v]) => ({ label: v.label, value: k, emoji: v.emoji, description: v.desc.slice(0, 100) })))),
       row(new ChannelSelectMenuBuilder().setCustomId("p:eco:dropch").setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon des colis automatiques")),
@@ -3813,6 +4202,33 @@ async function handlePanel(i) {
       return feedback(i, { ok: true, title: "Récompense retirée", text: `Plus rien n'est donné au niveau ${i.values[0]}.` }, "levels"); }
   }
 
+  /* --------------------------------- VOCAL ------------------------------- */
+  if (section === "voice") {
+    if (action === "t") { await updateConfig(i.guildId, { voice: { enabled: !config.voice.enabled } });
+      return respond(i, await buildSection("voice", i, await getConfig(i.guildId))); }
+    if (action === "cfg") { const v = config.voice;
+      return i.showModal(modal("pm:voice:cfg", "Gains vocaux", [
+        { id: "xp", label: "XP par minute", required: true, value: `${v.xpPerMinute}`, max: 5 },
+        { id: "coins", label: "Coins par minute", required: true, value: `${v.coinsPerMinute}`, max: 5 },
+        { id: "interval", label: "Distribution toutes les N minutes", required: true, value: `${v.intervalMinutes}`, max: 3 },
+        { id: "minmembers", label: "Minimum de personnes dans le salon", required: true, value: `${v.minMembers}`, max: 2 },
+        { id: "unmuted", label: "Casque coupé = pas de gain (oui/non)", value: v.requireUnmuted ? "oui" : "non", max: 3 },
+      ])); }
+    if (action === "ignore") {
+      const list = [...(config.voice.ignoredChannels ?? [])]; const val = i.values[0];
+      const idx = list.indexOf(val); idx === -1 ? list.push(val) : list.splice(idx, 1);
+      await updateConfig(i.guildId, { voice: { ignoredChannels: list } });
+      return respond(i, await buildSection("voice", i, await getConfig(i.guildId)));
+    }
+    if (action === "tick") {
+      await i.deferUpdate();
+      const r = await tickVoiceRewards(i.guild);
+      return feedback(i, { ok: true, title: "Distribution effectuée",
+        text: r.rewarded ? `${r.rewarded} personne(s) récompensée(s)${r.levelUps.length ? ` · ${r.levelUps.length} montée(s) de niveau` : ""}.`
+          : "Personne d'éligible : salons vides, membres seuls ou casque coupé." }, "voice");
+    }
+  }
+
   /* -------------------------------- ÉCONOMIE ----------------------------- */
   if (section === "eco") {
     if (action === "t") { await updateConfig(i.guildId, { economy: { enabled: !config.economy.enabled } }); return respond(i, await buildSection("eco", i, await getConfig(i.guildId))); }
@@ -3834,6 +4250,15 @@ async function handlePanel(i) {
     if (action === "additem") return i.showModal(itemModal(arg, i.values[0]));
     if (action === "del") { await updateConfig(i.guildId, { economy: { shop: config.economy.shop.filter((x) => x.id !== i.values[0]) } });
       return feedback(i, { ok: true, title: "Article retiré", text: "La boutique est à jour." }, "eco"); }
+    if (action === "space") {
+      await i.deferUpdate();
+      const r = await setupCoinsSpace(i.guild, memberPanel);
+      return respond(i, { embeds: [embed({ guild: i.guild, color: r.ko === 0 ? COLORS.success : COLORS.warning,
+        author: { name: "🏛️  Espace coins configuré" },
+        description: r.report.map((x) => `${x.ok ? "✅" : "⚠️"} **${x.label}**\n └ ${x.detail}`).join("\n"),
+        footer: `${r.ok} réussite(s) · ${r.ko} à corriger — relançable sans créer de doublon` })],
+        components: (await buildSection("eco", i, await getConfig(i.guildId))).components });
+    }
     if (action === "dropch") { await updateConfig(i.guildId, { economy: { dropChannelId: i.values[0] } });
       return feedback(i, { ok: true, title: "Salon des colis", text: `Les colis tomberont dans <#${i.values[0]}>.` }, "eco"); }
     if (action === "drop") {
@@ -4037,7 +4462,47 @@ async function handleModal(i, parts, config, level) {
     return feedback(i, { ok: true, title: "Récompense enregistrée", text: `<@&${arg}> sera donné au niveau **${lvl}**.` }, "levels");
   }
 
+  /* --------------------------------- VOCAL ------------------------------- */
+  if (section === "voice") {
+    if (action === "t") { await updateConfig(i.guildId, { voice: { enabled: !config.voice.enabled } });
+      return respond(i, await buildSection("voice", i, await getConfig(i.guildId))); }
+    if (action === "cfg") { const v = config.voice;
+      return i.showModal(modal("pm:voice:cfg", "Gains vocaux", [
+        { id: "xp", label: "XP par minute", required: true, value: `${v.xpPerMinute}`, max: 5 },
+        { id: "coins", label: "Coins par minute", required: true, value: `${v.coinsPerMinute}`, max: 5 },
+        { id: "interval", label: "Distribution toutes les N minutes", required: true, value: `${v.intervalMinutes}`, max: 3 },
+        { id: "minmembers", label: "Minimum de personnes dans le salon", required: true, value: `${v.minMembers}`, max: 2 },
+        { id: "unmuted", label: "Casque coupé = pas de gain (oui/non)", value: v.requireUnmuted ? "oui" : "non", max: 3 },
+      ])); }
+    if (action === "ignore") {
+      const list = [...(config.voice.ignoredChannels ?? [])]; const val = i.values[0];
+      const idx = list.indexOf(val); idx === -1 ? list.push(val) : list.splice(idx, 1);
+      await updateConfig(i.guildId, { voice: { ignoredChannels: list } });
+      return respond(i, await buildSection("voice", i, await getConfig(i.guildId)));
+    }
+    if (action === "tick") {
+      await i.deferUpdate();
+      const r = await tickVoiceRewards(i.guild);
+      return feedback(i, { ok: true, title: "Distribution effectuée",
+        text: r.rewarded ? `${r.rewarded} personne(s) récompensée(s)${r.levelUps.length ? ` · ${r.levelUps.length} montée(s) de niveau` : ""}.`
+          : "Personne d'éligible : salons vides, membres seuls ou casque coupé." }, "voice");
+    }
+  }
+
   /* -------------------------------- ÉCONOMIE ----------------------------- */
+  if (section === "voice" && action === "cfg") {
+    const patch = {};
+    const xp = int("xp"); if (xp !== null) patch.xpPerMinute = Math.max(0, Math.min(500, xp));
+    const co = int("coins"); if (co !== null) patch.coinsPerMinute = Math.max(0, Math.min(500, co));
+    const iv = int("interval"); if (iv !== null) patch.intervalMinutes = Math.max(1, Math.min(60, iv));
+    const mm = int("minmembers"); if (mm !== null) patch.minMembers = Math.max(1, Math.min(20, mm));
+    const um = f("unmuted").toLowerCase();
+    if (um) patch.requireUnmuted = ["oui", "o", "yes", "true", "1"].includes(um);
+    await updateConfig(i.guildId, { voice: patch });
+    return feedback(i, { ok: true, title: "Gains vocaux enregistrés",
+      text: voiceSummary(await getConfig(i.guildId)) }, "voice");
+  }
+
   if (section === "eco") {
     if (action === "montants") {
       const patch = {};
@@ -4232,12 +4697,15 @@ async function handlePublic(i, parts, config) {
     author: { name: `${r.ok === false ? ICONS.no : ICONS.ok}  ${r.title}` }, description: r.text })] });
 
   if (action === "rank") {
+    const vmin = await getVoiceMinutes(i.guildId, i.user.id);
     const { xp, level, rank } = await getUserLevel(i.guildId, i.user.id);
     if (!xp) return reply({ content: "Tu n'as pas encore d'XP. Participe au chat." });
     const cur = xpForLevel(level), next = xpForLevel(level + 1);
     return reply({ embeds: [embed({ guild: i.guild, author: { name: `${ICONS.level}  Niveau de ${i.user.username}` },
       description: `## Niveau ${level}\n${bar(xp - cur, next - cur)}\n**${num(xp - cur)} / ${num(next - cur)}** XP vers le niveau ${level + 1}`,
-      fields: [{ name: "XP total", value: num(xp), inline: true }, { name: "Classement", value: rank ? `#${rank}` : "—", inline: true }] })
+      fields: [{ name: "XP total", value: num(xp), inline: true },
+        { name: "Classement", value: rank ? `#${rank}` : "—", inline: true },
+        { name: "Temps vocal", value: vmin >= 60 ? `${Math.floor(vmin / 60)} h ${vmin % 60} min` : `${vmin} min`, inline: true }] })
       .setThumbnail(i.user.displayAvatarURL({ size: 128 }))] });
   }
   if (action === "coins") {
@@ -4262,6 +4730,13 @@ async function handlePublic(i, parts, config) {
 
   if (action === "top") {
     const medals = ["🥇", "🥈", "🥉"];
+    if (arg === "voice") {
+      const r = await topVoice(i.guildId, 10);
+      if (!r.length) return reply({ content: "Aucun temps vocal enregistré pour l'instant." });
+      const fmt = (m) => (m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`);
+      return reply({ embeds: [embed({ guild: i.guild, author: { name: "🔊  Top temps vocal" },
+        description: r.map((x, n) => `${medals[n] ?? `**${n + 1}.**`} <@${x.userId}> — ${fmt(x.minutes)}`).join("\n") })] });
+    }
     if (arg === "invites") {
       const r = (await topInviters(i.guildId, 25))
         .map((x) => ({ ...x, active: withBaseline(config, x.userId, x.active) }))
@@ -4318,7 +4793,7 @@ async function handlePublic(i, parts, config) {
 }
 
 /* ========================================================================== */
-/*                    10 - COMMANDES ET MENUS CONTEXTUELS                     */
+/*                    12 - COMMANDES ET MENUS CONTEXTUELS                     */
 /* ========================================================================== */
 
 // commands.js — trois commandes seulement. Tout le reste passe par /panel.
@@ -4525,7 +5000,7 @@ const contextMenus = [
 ];
 
 /* ========================================================================== */
-/*                     11 - CLIENT, EVENEMENTS, DEMARRAGE                     */
+/*                     13 - CLIENT, EVENEMENTS, DEMARRAGE                     */
 /* ========================================================================== */
 
 // index.js — client, événements, démarrage.
@@ -4618,6 +5093,23 @@ client.once(Events.ClientReady, async (c) => {
 
   // Giveaways
   setInterval(() => tickGiveaways(c).catch(() => null), 20_000).unref();
+
+  // Récompenses vocales : on relit l'intervalle configuré à chaque minute
+  const voiceTicks = new Map();
+  setInterval(async () => {
+    for (const g of c.guilds.cache.values()) {
+      try {
+        const cfg = await getConfig(g.id);
+        if (!cfg.voice?.enabled) continue;
+        const every = Math.max(1, cfg.voice.intervalMinutes ?? 5);
+        const n = (voiceTicks.get(g.id) ?? 0) + 1;
+        if (n < every) { voiceTicks.set(g.id, n); continue; }
+        voiceTicks.set(g.id, 0);
+        const r = await tickVoiceRewards(g);
+        if (r.rewarded) console.log(`[vocal] ${g.name} : ${r.rewarded} récompensé(s)`);
+      } catch (e) { console.error("[vocal]", e.message); }
+    }
+  }, 60_000).unref();
 
   // Libérations automatiques d'Alcatraz
   setInterval(async () => {
