@@ -1,44 +1,67 @@
 // =============================================================================
-//   0x — BOT DE GESTION DU SERVEUR NAOYA
-//   Fichier unique. Deuxième fichier nécessaire : package.json
+//   0x  —  BOT DE GESTION DU SERVEUR NAOYA
+//   Fichier unique. Second fichier nécessaire : package.json
 // =============================================================================
 //
-//  DÉPLOIEMENT (depuis un téléphone)
+//   VERROU PROPRIETAIRE
+//     Toute la configuration de 0x est reservee a l'identifiant
+//        840997886162108416
+//     Sections verrouillees : Configuration, Automod, Protection, Permissions,
+//     Niveaux, Economie, Compteurs, et /logs (sauf la consultation).
+//     Ni un administrateur, ni le proprietaire du serveur ne peut y toucher.
+//     Le staff garde Moderation, Publications, Tickets et Giveaways selon
+//     son niveau de perm.
+//     Pour changer de proprietaire : variable Railway OWNER_ID.
 //
-//  1) https://discord.com/developers/applications → New Application → nom "0x"
-//     · Bot → Reset Token → copie le token
-//     · Bot → ACTIVE : Server Members Intent + Message Content Intent + Presence Intent
-//     · General Information → copie l'Application ID
+//   MISE EN ROUTE : UN SEUL BOUTON
+//     Tape /panel puis appuie sur "Tout installer". Il indexe les salons,
+//     classe les roles staff par niveau, branche les trois compteurs vocaux,
+//     cree le role Alcatraz s'il manque, repere le salon de bienvenue et
+//     celui des colis, verifie les categories de tickets et les permissions,
+//     puis active automod + anti-raid + anti-nuke + journaux + niveaux +
+//     economie avec des reglages calibres pour un tres gros serveur.
+//     "Publier les panneaux" pose ensuite les boutons pour les membres.
+//     Les six interrupteurs principaux sont directement sur l'accueil.
 //
-//  2) GitHub → nouveau repo privé → Add file → crée "package.json" puis "index.js"
+//   TROIS COMMANDES, TOUT LE RESTE AU DOIGT
+//     /panel   le panneau de contrôle — il ouvre sur la liste de ce qu'il
+//              reste à régler, puis chaque section se pilote au bouton
+//     /help    mode d'emploi, adapté à ton niveau de permission
+//     /logs    routage des journaux (map / scan / set / reset / actif)
 //
-//  3) railway.app → Deploy from GitHub repo → Variables :
-//        DISCORD_TOKEN = ton token
-//        CLIENT_ID     = ton Application ID
-//        GUILD_ID      = ID du serveur Naoya (commandes immédiates)
-//     Settings → Builder → Railpack
+//   LES MEMBRES NE TAPENT AUCUNE COMMANDE
+//     /panel → Publications publie des panneaux à boutons dans tes salons :
+//       · Espace membre  : niveau, solde, quotidien, travail, classements,
+//                          boutique, envoi de coins
+//       · Tickets        : menu des 6 catégories
+//       · Confessions    : bouton anonyme
+//       · Menu de rôles  : rôles à cocher
 //
-//  4) Postgres OBLIGATOIRE pour un serveur de cette taille :
-//     + New → Database → PostgreSQL, puis dans le bot :
-//        DATABASE_URL = ${{Postgres.DATABASE_URL}}
+//   INSTALLATION
+//   1) discord.com/developers → Bot → ACTIVER LES TROIS INTENTS :
+//        Server Members · Message Content · Presence
+//        (sans Presence, le compteur "Connectés" reste vide)
+//   2) GitHub : package.json + index.js
+//   3) Railway : DISCORD_TOKEN · CLIENT_ID · GUILD_ID
+//                DATABASE_URL = ${{Postgres.DATABASE_URL}}
+//                Settings → Builder → Railpack
+//   4) Invitation, Administrateur (l'anti-nuke lit les logs d'audit) :
+//      discord.com/oauth2/authorize?client_id=TON_ID&scope=bot+applications.commands&permissions=8
+//      Puis Paramètres du serveur → Rôles → 0x tout en haut.
+//   5) Tape /panel. Il te dit tout ce qui reste à faire, dans l'ordre.
 //
-//  5) Invitation (remplace TON_APPLICATION_ID) — Administrateur recommandé
-//     car l'anti-nuke a besoin des logs d'audit :
-//     https://discord.com/oauth2/authorize?client_id=TON_APPLICATION_ID&scope=bot+applications.commands&permissions=8
-//     Puis Paramètres du serveur → Rôles → mets le rôle de 0x TOUT EN HAUT.
+//   NIVEAUX DE PERMISSION (0 à 6)
+//     0 Membre · 1 Helper/Animateur · 2 Modérateur · 3 Modérateur+/Juge
+//     4 Gestion · 5 Administrateur · 6 Owner/Couronne
+//     Panneau → Permissions → Détection automatique classe tes rôles seul.
+//     Un modérateur ne peut jamais viser un niveau égal ou supérieur au sien.
 //
-//  6) Première configuration dans Discord :
-//        /logs scan            → indexe les salons
-//        /logs map             → vérifie où part chaque type de log
-//        /config staff role:@Staff
-//        /config alcatraz role:@Alcatraz
-//        /ticket panel
-//        /config view
-//
-//  DÉTECTION AUTOMATIQUE : le bot reconnaît tes salons par leur nom
-//  (logs-msgs, bannissements, expulsions, logs-vocaux, automod, logs-raid,
-//  compteur-tickets, se-confesser, niveaux, absences, Tickets Staff, etc.).
-//  Rien à configurer salon par salon. `/logs set` sert à forcer une exception.
+//   COMPTEURS VOCAUX (salons verrouillés)
+//     Membres   humains uniquement, bots exclus
+//     Connectés humains non hors-ligne
+//     Vocal     humains en vocal, lu sur les états vocaux et non sur le cache
+//     Détection par le motif "Nom :" — sinon Panneau → Compteurs.
+//     Discord limite les renommages à 2 par 10 min et par salon.
 // =============================================================================
 
 import {
@@ -47,6 +70,7 @@ import {
   AuditLogEvent,
   ButtonBuilder,
   ButtonStyle,
+  ChannelSelectMenuBuilder,
   ChannelType,
   Client,
   EmbedBuilder,
@@ -57,22 +81,39 @@ import {
   Partials,
   PermissionFlagsBits,
   REST,
+  RoleSelectMenuBuilder,
   Routes,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
+  UserSelectMenuBuilder,
 } from "discord.js";
 import { createServer } from "node:http";
 import pg from "pg";
 
 
 /* ========================================================================== */
-/*                   1 — CONSTANTES ET DETECTION DES SALONS                   */
+/*             1 - CONSTANTES, PROPRIETAIRE, DETECTION DES SALONS             */
 /* ========================================================================== */
 
 // core.js — constantes, résolution automatique des salons, helpers.
 
+
+const BRAND = "0x • Naoya";
+
+/**
+ * Propriétaire de 0x — la SEULE personne autorisée à modifier la configuration.
+ * Modifiable sans toucher au code via la variable Railway OWNER_ID.
+ */
+const OWNER_ID = process.env.OWNER_ID || "840997886162108416";
+const isOwner = (id) => id === OWNER_ID;
+
+const ICONS = {
+  ban: "\u26D4", kick: "\uD83D\uDC62", timeout: "\uD83D\uDD07", warn: "\u26A0\uFE0F", jail: "\uD83E\uDD1A",
+  ok: "\u2705", no: "\u274C", info: "\u2139\uFE0F", coin: "\uD83E\uDE99", level: "\uD83D\uDCC8",
+  ticket: "\uD83C\uDFAB", gift: "\uD83C\uDF81", shield: "\uD83D\uDEE1\uFE0F", alert: "\uD83D\uDEA8",
+};
 
 const COLORS = {
   primary: 0x5865f2,
@@ -245,15 +286,42 @@ function resolveFuncChannel(guild, key, config) {
 /*                                  HELPERS                                   */
 /* ========================================================================== */
 
-function embed({ title, description, color = COLORS.primary, fields = [], footer, thumb, image } = {}) {
+function embed({ title, description, color = COLORS.primary, fields = [], footer, thumb, image, author, guild } = {}) {
   const e = new EmbedBuilder().setColor(color).setTimestamp();
   if (title) e.setTitle(title.slice(0, 256));
   if (description) e.setDescription(description.slice(0, 4000));
   if (fields.length) e.addFields(fields.slice(0, 25).map((f) => ({ ...f, value: String(f.value).slice(0, 1024) || "—" })));
-  if (footer) e.setFooter({ text: footer.slice(0, 2048) });
+  if (author) e.setAuthor(author);
+  if (guild) e.setFooter({ text: footer ? `${footer} • ${BRAND}` : BRAND, iconURL: guild.iconURL({ size: 64 }) ?? undefined });
+  else if (footer) e.setFooter({ text: footer.slice(0, 2048) });
   if (thumb) e.setThumbnail(thumb);
   if (image) e.setImage(image);
   return e;
+}
+
+const BAR_FULL = "▰";
+const BAR_EMPTY = "▱";
+
+/** Barre de progression compacte. */
+function bar(current, total, size = 12) {
+  const ratio = total > 0 ? Math.min(1, Math.max(0, current / total)) : 0;
+  const filled = Math.round(ratio * size);
+  return `${BAR_FULL.repeat(filled)}${BAR_EMPTY.repeat(size - filled)} \`${Math.round(ratio * 100)}%\``;
+}
+
+/** Encadré de sanction, mise en forme commune. */
+function actionEmbed({ icon, action, target, moderator, reason, extra = [], color, guild }) {
+  return embed({
+    guild,
+    color,
+    author: { name: `${icon}  ${action}` },
+    description: `**${target.tag ?? target.user?.tag ?? target}**\n\`${target.id ?? "—"}\``,
+    fields: [
+      ...extra,
+      { name: "Modérateur", value: moderator ? `<@${moderator.id}>` : "—", inline: true },
+      { name: "Raison", value: reason || "Non précisée" },
+    ],
+  });
 }
 
 function ts(date, style = "R") {
@@ -317,10 +385,116 @@ function canSend(channel) {
   return channel.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks]) ?? false;
 }
 
+
 const EPH = { flags: MessageFlags.Ephemeral };
 
 /* ========================================================================== */
-/*                    2 — STOCKAGE (POSTGRESQL / MEMOIRE)                     */
+/*                         2 - NIVEAUX DE PERMISSION                          */
+/* ========================================================================== */
+
+// perms.js — système de permissions par niveau (perm 0 → 6).
+
+
+const PERM_LABELS = {
+  7: "Propriétaire de 0x",
+  0: "Membre",
+  1: "Perm 1 — Helper / Animateur",
+  2: "Perm 2 — Modérateur",
+  3: "Perm 3 — Modérateur+ / Juge",
+  4: "Perm 4 — Gestion",
+  5: "Perm 5 — Administrateur",
+  6: "Perm 6 — Owner / Couronne",
+};
+
+/** Niveau requis par défaut pour chaque commande (ou "commande sous-commande"). */
+const DEFAULT_COMMAND_LEVELS = {
+  // Niveau 0 — tout le monde
+  ping: 0, help: 0, rank: 0, top: 0, coins: 0, daily: 0, work: 0, pay: 0,
+  userinfo: 0, serverinfo: 0, avatar: 0, confession: 0, boutique: 0, acheter: 0,
+
+  // Niveau 1 — helpers, animateurs
+  sondage: 1, clear: 1, warn: 1, historique: 1,
+  "ticket ajouter": 1, "ticket retirer": 1, "ticket renommer": 1,
+
+  // Niveau 2 — modérateurs
+  timeout: 2, untimeout: 2, kick: 2, slowmode: 2, lock: 2, unlock: 2,
+  alcatraz: 2, liberer: 2, "ticket stats": 2,
+
+  // Niveau 3 — modérateurs+ / juges
+  ban: 3, unban: 3, delsanction: 3, absence: 3, absences: 3, say: 3, drop: 3,
+
+  // Niveau 4 — gestion
+  gw: 4, panel: 4, "coins-admin": 4, clearsanctions: 4, "ticket panel": 4, compteurs: 4,
+
+  // Niveau 5 — administration
+  config: 5, automod: 5, logs: 5,
+
+  // Niveau 6 — owners uniquement
+  protection: 6, lockdown: 6, perms: 6,
+};
+
+/** Motifs de noms de rôles → niveau, pour la détection automatique. */
+const AUTO_PATTERNS = [
+  { level: 6, re: /\b(owner|fondateur|fondatrice|couronne|proprietaire|propriétaire)\b/i },
+  { level: 5, re: /\b(admin|administrateur|administratrice|direction)\b/i },
+  { level: 4, re: /\b(gestion|gestionnaire|responsable|resp\b|head|manager)\b/i },
+  { level: 3, re: /\b(juge|tribunal|mod[eé]rateur\+|modo\+|superviseur|community)\b/i },
+  { level: 2, re: /\b(mod[eé]rateur|mod[eé]ratrice|modo|moderation|modération)\b/i },
+  { level: 1, re: /\b(helper|animateur|animatrice|anim\b|staff|support|assistant)\b/i },
+];
+
+/** Niveau effectif d'un membre. */
+function permLevel(member, config) {
+  if (!member?.guild) return 0;
+  if (isOwner(member.id)) return 7;           // au-dessus de tout, intouchable
+  if (member.id === member.guild.ownerId) return 6;
+
+  const override = config?.perms?.users?.[member.id];
+  if (override !== undefined) return Number(override);
+
+  let level = member.permissions.has(PermissionFlagsBits.Administrator) ? 5 : 0;
+  const roles = config?.perms?.roles ?? {};
+  for (const [roleId, lvl] of Object.entries(roles)) {
+    if (member.roles.cache.has(roleId) && Number(lvl) > level) level = Number(lvl);
+  }
+  return level;
+}
+
+/** Niveau requis pour une commande (la sous-commande est prioritaire). */
+function requiredLevel(commandName, sub, config) {
+  const custom = config?.perms?.commands ?? {};
+  const key = sub ? `${commandName} ${sub}` : commandName;
+  if (custom[key] !== undefined) return Number(custom[key]);
+  if (custom[commandName] !== undefined) return Number(custom[commandName]);
+  if (DEFAULT_COMMAND_LEVELS[key] !== undefined) return DEFAULT_COMMAND_LEVELS[key];
+  if (DEFAULT_COMMAND_LEVELS[commandName] !== undefined) return DEFAULT_COMMAND_LEVELS[commandName];
+  return 0;
+}
+
+/** Détecte les rôles staff par leur nom et propose un tableau de perms. */
+function autoDetectRoles(guild) {
+  const found = [];
+  for (const role of guild.roles.cache.values()) {
+    if (role.id === guild.id || role.managed) continue;
+    for (const p of AUTO_PATTERNS) {
+      if (p.re.test(role.name)) { found.push({ role, level: p.level }); break; }
+    }
+  }
+  // Un rôle plus haut dans la hiérarchie ne peut pas avoir un niveau plus bas
+  found.sort((a, b) => b.role.position - a.role.position);
+  let ceiling = 6;
+  for (const f of found) { f.level = Math.min(f.level, ceiling); ceiling = f.level; }
+  return found.sort((a, b) => b.level - a.level || b.role.position - a.role.position);
+}
+
+/** Vérifie qu'un modérateur peut agir sur une cible selon les perms. */
+function canActOn(actorLevel, targetMember, config) {
+  const targetLevel = permLevel(targetMember, config);
+  return actorLevel > targetLevel;
+}
+
+/* ========================================================================== */
+/*                    3 - STOCKAGE (POSTGRESQL / MEMOIRE)                     */
 /* ========================================================================== */
 
 // db.js — PostgreSQL avec repli mémoire.
@@ -332,6 +506,12 @@ const DEFAULT_CONFIG = {
   logsEnabled: true,
   logOverrides: {},
   funcOverrides: {},
+
+  // Salons compteurs forcés (sinon détection par motif "Nom :")
+  counters: { members: null, online: null, voice: null },
+
+  // Système de perms : rôle → niveau, membre → niveau, commande → niveau requis
+  perms: { roles: {}, users: {}, commands: {} },
 
   autoroleId: null,
   welcomeChannelId: null,
@@ -388,8 +568,11 @@ const DEFAULT_CONFIG = {
     workMin: 40,
     workMax: 180,
     workCooldownMs: 30 * 60_000,
-    dropChance: 0,
-    shop: [],
+    dropChannelId: null,
+    dropChance: 0,      // % de chance par message dans le salon de drops
+    dropMin: 100,
+    dropMax: 800,
+    shop: [],           // [{ id, name, price, roleId, stock }]
   },
 };
 
@@ -639,6 +822,12 @@ async function dueGiveaways() {
   return mem.giveaways.filter((g) => !g.ended && new Date(g.ends_at) <= new Date());
 }
 
+async function listActiveGiveaways(guildId, limit = 25) {
+  if (ready) return (await q("SELECT * FROM giveaways WHERE guild_id=$1 AND ended=FALSE ORDER BY ends_at ASC LIMIT $2", [guildId, limit])).rows;
+  return mem.giveaways.filter((g) => g.guild_id === guildId && !g.ended)
+    .sort((a, b) => new Date(a.ends_at) - new Date(b.ends_at)).slice(0, limit);
+}
+
 async function endGiveaway(id) {
   if (ready) await q("UPDATE giveaways SET ended=TRUE WHERE id=$1", [id]);
   else { const g = mem.giveaways.find((x) => x.id === id); if (g) g.ended = true; }
@@ -731,7 +920,7 @@ async function listAbsences(guildId) {
 }
 
 /* ========================================================================== */
-/*                     3 — AUTOMOD, ANTI-RAID, ANTI-NUKE                      */
+/*                     4 - AUTOMOD, ANTI-RAID, ANTI-NUKE                      */
 /* ========================================================================== */
 
 // guard.js — automod, anti-raid, anti-nuke.
@@ -760,6 +949,7 @@ setInterval(() => {
 function exempt(message, automod) {
   const member = message.member;
   if (!member) return true;
+  if (isOwner(member.id)) return true;
   if (member.permissions.has(PermissionFlagsBits.ManageMessages)) return true;
   if (automod.ignoredChannels?.includes(message.channel.id)) return true;
   if (automod.ignoredChannels?.includes(message.channel.parentId)) return true;
@@ -918,6 +1108,7 @@ function trackNuke(guild, executorId, kind, config) {
 }
 
 function isWhitelisted(guild, userId, config) {
+  if (isOwner(userId)) return true;
   if (userId === guild.ownerId) return true;
   if (userId === guild.client.user.id) return true;
   return config.antinuke?.whitelist?.includes(userId) ?? false;
@@ -961,7 +1152,7 @@ async function lockAllChannels(guild, lock, reason) {
 }
 
 /* ========================================================================== */
-/*          4 — TICKETS, GIVEAWAYS, COMPTEURS, CONFESSIONS, ALCATRAZ          */
+/*            5 - TICKETS, GIVEAWAYS, COMPTEURS, PANNEAUX PUBLICS             */
 /* ========================================================================== */
 
 // features.js — tickets, giveaways, compteurs vocaux, confessions, alcatraz.
@@ -987,30 +1178,153 @@ async function log(guild, routeKey, e) {
 /*                            COMPTEURS VOCAUX                                */
 /* ========================================================================== */
 
-async function updateCounters(guild) {
-  const voiceCount = guild.channels.cache
-    .filter((c) => c.type === ChannelType.GuildVoice || c.type === ChannelType.GuildStageVoice)
-    .reduce((t, c) => t + c.members.size, 0);
+/**
+ * Met à jour les salons compteurs (vocaux verrouillés).
+ *  - Membres   : humains uniquement, bots exclus
+ *  - Connectés : humains non hors-ligne
+ *  - Vocal     : humains actuellement en vocal, tous salons confondus
+ * Les valeurs indisponibles ne sont jamais écrites (on ne remplace pas par 0).
+ */
+async function computeCounts(guild) {
+  // Bots : fiables en cache (peu nombreux, reçus au démarrage).
+  const cachedBots = guild.members.cache.filter((m) => m.user.bot).size;
+  const members = Math.max(0, guild.memberCount - cachedBots);
 
-  let online = 0;
-  for (const m of guild.members.cache.values()) {
-    if (m.presence && m.presence.status !== "offline") online++;
+  // Vocal : on lit les états vocaux, PAS channel.members (qui dépend du cache membres).
+  let voice = 0;
+  for (const vs of guild.voiceStates.cache.values()) {
+    if (!vs.channelId) continue;
+    const m = guild.members.cache.get(vs.id);
+    if (m?.user?.bot) continue;
+    voice++;
   }
 
-  const values = { members: guild.memberCount, online: online || null, voice: voiceCount };
+  // Connectés : nécessite l'intent Presence + le cache membres.
+  let online = null;
+  const cacheRatio = guild.memberCount > 0 ? guild.members.cache.size / guild.memberCount : 0;
+  if (cacheRatio > 0.5) {
+    let n = 0;
+    for (const m of guild.members.cache.values()) {
+      if (m.user.bot) continue;
+      if (m.presence && m.presence.status !== "offline") n++;
+    }
+    online = n > 0 ? n : null; // 0 = presences non reçues → on n'écrit rien
+  }
+
+  return { members, online, voice, cacheRatio };
+}
+
+const lastCounterValue = new Map();
+
+async function updateCounters(guild, force = false) {
+  const config = await getConfig(guild.id);
+  const counts = await computeCounts(guild);
+  const report = [];
 
   for (const counter of COUNTERS) {
-    const value = values[counter.key];
-    if (value === null) continue;
-    const channel = guild.channels.cache.find(
-      (c) => (c.type === ChannelType.GuildVoice || c.type === ChannelType.GuildStageVoice) && counter.test.test(c.name)
-    );
-    if (!channel || !channel.manageable) continue;
+    const value = counts[counter.key];
+    if (value === null || value === undefined) {
+      report.push({ key: counter.key, status: "indisponible" });
+      continue;
+    }
+
+    // Salon forcé via /config compteur, sinon détection par motif "Nom :"
+    const forced = config.counters?.[counter.key];
+    let channel = forced ? guild.channels.cache.get(forced) : null;
+    if (!channel) {
+      channel = guild.channels.cache.find(
+        (c) => (c.type === ChannelType.GuildVoice || c.type === ChannelType.GuildStageVoice) && counter.test.test(c.name)
+      );
+    }
+    if (!channel) { report.push({ key: counter.key, value, status: "salon introuvable" }); continue; }
+    if (!channel.manageable) { report.push({ key: counter.key, value, status: "permission manquante" }); continue; }
+
     const next = counter.template.replace("{n}", num(value));
-    if (channel.name === next) continue;
-    await channel.setName(next, "Compteur automatique").catch(() => null);
-    await new Promise((r) => setTimeout(r, 1500));
+    if (channel.name === next) { report.push({ key: counter.key, value, status: "à jour" }); continue; }
+
+    const memoKey = `${guild.id}:${counter.key}`;
+    if (!force && lastCounterValue.get(memoKey) === value) { report.push({ key: counter.key, value, status: "inchangé" }); continue; }
+
+    const ok = await channel.setName(next, "Compteur 0x").then(() => true).catch((e) => {
+      report.push({ key: counter.key, value, status: `échec : ${e.message.slice(0, 60)}` });
+      return false;
+    });
+    if (ok) { lastCounterValue.set(memoKey, value); report.push({ key: counter.key, value, status: "mis à jour" }); }
+    await new Promise((r) => setTimeout(r, 2000));
   }
+
+  return { counts, report };
+}
+
+/* ========================================================================== */
+/*                          BOUTIQUE ET DROPS DE COINS                        */
+/* ========================================================================== */
+
+const activeDrops = new Map(); // messageId -> { amount, claimed }
+
+function dropComponents(id) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`drop:claim:${id}`).setLabel("Récupérer").setStyle(ButtonStyle.Success).setEmoji("📦")
+  )];
+}
+
+async function launchDrop(guild, channel, amount) {
+  if (!channel || !canSend(channel)) return null;
+  const config = await getConfig(guild.id);
+  const id = Math.random().toString(36).slice(2, 10);
+  const message = await channel.send({
+    embeds: [embed({
+      guild,
+      author: { name: "📦  Colis lâché" },
+      description: `Un colis de **${config.economy.currency} ${num(amount)}** vient de tomber.\nPremier arrivé, premier servi.`,
+      color: COLORS.gold,
+    })],
+    components: dropComponents(id),
+  }).catch(() => null);
+  if (!message) return null;
+  activeDrops.set(id, { amount, claimed: false, guildId: guild.id });
+  setTimeout(() => {
+    const d = activeDrops.get(id);
+    if (d && !d.claimed) {
+      activeDrops.delete(id);
+      message.edit({
+        embeds: [embed({ guild, author: { name: "📦  Colis perdu" }, description: "Personne n'a été assez rapide.", color: COLORS.neutral })],
+        components: [],
+      }).catch(() => null);
+    }
+  }, 120_000);
+  return message;
+}
+
+async function claimDrop(interaction, id) {
+  const drop = activeDrops.get(id);
+  if (!drop || drop.claimed) return interaction.reply({ content: "Ce colis a déjà été récupéré.", ...EPH });
+  drop.claimed = true;
+  activeDrops.delete(id);
+
+  const config = await getConfig(interaction.guild.id);
+  const total = await addCoins(interaction.guild.id, interaction.user.id, drop.amount);
+
+  await interaction.update({
+    embeds: [embed({
+      guild: interaction.guild,
+      author: { name: "📦  Colis récupéré" },
+      description: `${interaction.user} empoche **${config.economy.currency} ${num(drop.amount)}**.`,
+      color: COLORS.success,
+    })],
+    components: [],
+  }).catch(() => null);
+
+  await log(interaction.guild, "coins", embed({
+    guild: interaction.guild,
+    author: { name: "🪙  Colis récupéré" },
+    color: COLORS.gold,
+    fields: [
+      { name: "Membre", value: interaction.user.tag, inline: true },
+      { name: "Montant", value: num(drop.amount), inline: true },
+      { name: "Nouveau solde", value: num(total), inline: true },
+    ],
+  }));
 }
 
 /* ========================================================================== */
@@ -1368,981 +1682,1927 @@ async function releaseFromJail(guild, member, by = "Automatique") {
   return { ok: true, restored: valid.length };
 }
 
+
+const pbtn = (id, label, style = ButtonStyle.Secondary, emoji) => {
+  const b = new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style);
+  if (emoji) b.setEmoji(emoji);
+  return b;
+};
+
 /* ========================================================================== */
-/*                            5 — COMMANDES SLASH                             */
+/*                              PANNEAUX PUBLICS                              */
 /* ========================================================================== */
 
-// commands.js — toutes les commandes slash de 0x.
+function memberPanel(guild) {
+  return {
+    embeds: [embed({ guild, author: { name: "🧭  Espace membre" }, color: COLORS.primary,
+      description: "Tout ce que tu peux faire ici, sans taper une seule commande.",
+      fields: [
+        { name: `${ICONS.level} Niveau`, value: "Ta progression XP", inline: true },
+        { name: `${ICONS.coin} Solde`, value: "Tes coins", inline: true },
+        { name: "🎁 Quotidien", value: "Une fois par jour", inline: true },
+        { name: "💼 Travail", value: "Toutes les 30 min", inline: true },
+        { name: "🏆 Classement", value: "Top XP et coins", inline: true },
+        { name: "🛒 Boutique", value: "Rôles à acheter", inline: true },
+      ] })],
+    components: [
+      new ActionRowBuilder().addComponents(
+        pbtn("pub:rank", "Mon niveau", ButtonStyle.Primary, "📈"),
+        pbtn("pub:coins", "Mon solde", ButtonStyle.Primary, "🪙"),
+        pbtn("pub:daily", "Quotidien", ButtonStyle.Success, "🎁"),
+        pbtn("pub:work", "Travailler", ButtonStyle.Success, "💼"),
+      ),
+      new ActionRowBuilder().addComponents(
+        pbtn("pub:top:xp", "Top XP", ButtonStyle.Secondary, "🏆"),
+        pbtn("pub:top:coins", "Top coins", ButtonStyle.Secondary, "💰"),
+        pbtn("pub:shop", "Boutique", ButtonStyle.Secondary, "🛒"),
+        pbtn("pub:pay", "Envoyer des coins", ButtonStyle.Secondary, "🤝"),
+      ),
+    ],
+  };
+}
+
+function confessionPanel(guild) {
+  return {
+    embeds: [embed({ guild, author: { name: "🕵️  Confessions anonymes" }, color: COLORS.purple,
+      description: "Ton message est publié sans ton nom. Les modérateurs conservent une trace pour éviter les abus." })],
+    components: [new ActionRowBuilder().addComponents(pbtn("pub:confess", "Écrire une confession", ButtonStyle.Primary, "✍️"))],
+  };
+}
+
+/* ========================================================================== */
+/*                        6 - ACTIONS (LOGIQUE METIER)                        */
+/* ========================================================================== */
+
+// actions.js — la logique métier, appelable depuis n'importe quelle interface.
+// Chaque fonction renvoie { ok, title, text, color } prêt à afficher.
 
 
-const POLL = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"];
+const ok = (title, text, color = COLORS.success) => ({ ok: true, title, text, color });
+const no = (text) => ({ ok: false, title: "Impossible", text, color: COLORS.danger });
+
+/** Vérifie hiérarchie Discord + niveau de perm avant toute sanction. */
+function checkTarget(guild, actor, target, config) {
+  if (!target) return "Membre introuvable sur le serveur.";
+  if (target.id === actor.id) return "Tu ne peux pas te cibler toi-même.";
+  if (isOwner(target.id)) return "C'est le propriétaire de 0x — il ne peut pas être ciblé.";
+  if (target.id === guild.ownerId) return "C'est le propriétaire du serveur.";
+  if (target.id === guild.members.me.id) return "Je ne vais pas me sanctionner moi-même.";
+
+  const actorLevel = permLevel(actor, config);
+  const targetLevel = permLevel(target, config);
+  if (actorLevel <= targetLevel)
+    return `**${target.user.tag}** est de niveau ${targetLevel}, toi ${actorLevel}. Il faut un niveau strictement supérieur.`;
+
+  if (target.roles.highest.position >= guild.members.me.roles.highest.position)
+    return "Mon rôle est trop bas. Remonte le rôle de 0x au-dessus dans les paramètres du serveur.";
+  return null;
+}
+
+/* ================================ SANCTIONS =============================== */
+
+async function actionWarn(guild, target, moderator, reason) {
+  const total = await addSanction(guild.id, target.id, moderator.id, "warn", reason);
+  await tryDm(target.user, guild.name, "Avertissement", reason);
+  await log(guild, "warn", embed({
+    guild, color: COLORS.warning, author: { name: `${ICONS.warn}  Avertissement` },
+    description: `**${target.user.tag}**\n\`${target.id}\``,
+    fields: [
+      { name: "Total", value: `${total}`, inline: true },
+      { name: "Modérateur", value: `<@${moderator.id}>`, inline: true },
+      { name: "Raison", value: reason },
+    ],
+  }));
+  return ok("Avertissement enregistré", `**${target.user.tag}** cumule **${total}** avertissement(s).`, COLORS.warning);
+}
+
+async function actionTimeout(guild, target, moderator, ms, reason) {
+  if (!ms || ms < 5000 || ms > 28 * 864e5) return no("Durée invalide. Exemples : `30s`, `10m`, `2h`, `7d` (max 28j).");
+  if (!target.moderatable) return no("Je ne peux pas réduire ce membre au silence.");
+  await target.timeout(ms, `${moderator.tag} — ${reason}`);
+  await addSanction(guild.id, target.id, moderator.id, "timeout", reason, ms);
+  await tryDm(target.user, guild.name, "Réduction au silence", reason, formatDuration(ms));
+  await log(guild, "timeout", embed({
+    guild, color: COLORS.warning, author: { name: `${ICONS.timeout}  Timeout` },
+    description: `**${target.user.tag}**\n\`${target.id}\``,
+    fields: [
+      { name: "Durée", value: formatDuration(ms), inline: true },
+      { name: "Modérateur", value: `<@${moderator.id}>`, inline: true },
+      { name: "Raison", value: reason },
+    ],
+  }));
+  return ok("Membre réduit au silence", `**${target.user.tag}** est muet pendant ${formatDuration(ms)}.`, COLORS.warning);
+}
+
+async function actionUntimeout(guild, target, moderator) {
+  await target.timeout(null, moderator.tag);
+  await log(guild, "timeout", embed({
+    guild, color: COLORS.success, author: { name: `${ICONS.ok}  Timeout levé` },
+    fields: [{ name: "Membre", value: target.user.tag, inline: true }, { name: "Par", value: `<@${moderator.id}>`, inline: true }],
+  }));
+  return ok("Timeout levé", `**${target.user.tag}** peut de nouveau parler.`);
+}
+
+async function actionKick(guild, target, moderator, reason) {
+  if (!target.kickable) return no("Je ne peux pas expulser ce membre.");
+  await tryDm(target.user, guild.name, "Expulsion", reason);
+  await target.kick(`${moderator.tag} — ${reason}`);
+  await addSanction(guild.id, target.id, moderator.id, "kick", reason);
+  await log(guild, "kick", embed({
+    guild, color: COLORS.warning, author: { name: `${ICONS.kick}  Expulsion` },
+    description: `**${target.user.tag}**\n\`${target.id}\``,
+    fields: [{ name: "Modérateur", value: `<@${moderator.id}>`, inline: true }, { name: "Raison", value: reason }],
+  }));
+  return ok("Membre expulsé", `**${target.user.tag}** a été expulsé.`, COLORS.warning);
+}
+
+async function actionBan(guild, target, moderator, reason, purgeDays = 0) {
+  if (!target.bannable) return no("Je ne peux pas bannir ce membre.");
+  await tryDm(target.user, guild.name, "Bannissement", reason);
+  await guild.bans.create(target.id, { reason: `${moderator.tag} — ${reason}`, deleteMessageSeconds: purgeDays * 86400 });
+  await addSanction(guild.id, target.id, moderator.id, "ban", reason);
+  await log(guild, "ban", embed({
+    guild, color: COLORS.danger, author: { name: `${ICONS.ban}  Bannissement` },
+    description: `**${target.user.tag}**\n\`${target.id}\``,
+    fields: [{ name: "Modérateur", value: `<@${moderator.id}>`, inline: true }, { name: "Raison", value: reason }],
+  }));
+  return ok("Membre banni", `**${target.user.tag}** a été banni.`, COLORS.danger);
+}
+
+async function actionUnban(guild, userId, moderator, reason) {
+  const ban = await guild.bans.fetch(userId).catch(() => null);
+  if (!ban) return no("Aucun bannissement pour cet identifiant.");
+  await guild.bans.remove(userId, `${moderator.tag} — ${reason}`);
+  await log(guild, "ban", embed({
+    guild, color: COLORS.success, author: { name: `${ICONS.ok}  Débannissement` },
+    fields: [{ name: "Membre", value: `${ban.user.tag} (\`${userId}\`)`, inline: true }, { name: "Par", value: `<@${moderator.id}>`, inline: true }],
+  }));
+  return ok("Débanni", `**${ban.user.tag}** peut revenir.`);
+}
+
+async function actionJail(guild, target, moderator, reason, ms) {
+  const r = await sendToJail(guild, target, moderator, reason, ms);
+  if (!r.ok) return no(r.error);
+  await tryDm(target.user, guild.name, "Alcatraz", reason, ms ? formatDuration(ms) : "Indéterminée");
+  return ok("Envoyé en Alcatraz",
+    `**${target.user.tag}** est enfermé pour ${ms ? formatDuration(ms) : "une durée indéterminée"}.\n${r.roles} rôle(s) mis de côté, restaurés à la libération.`,
+    COLORS.danger);
+}
+
+async function actionFree(guild, target, moderator) {
+  const r = await releaseFromJail(guild, target, moderator.tag);
+  return r.ok ? ok("Libéré", `**${target.user.tag}** retrouve ses ${r.restored} rôle(s).`) : no(r.error);
+}
+
+async function actionHistory(guild, target) {
+  const rows = await listSanctions(guild.id, target.id, null, 15);
+  if (!rows.length) return { ok: true, title: "Casier vierge", text: `Aucune sanction pour **${target.user.tag}**.`, color: COLORS.success };
+  const labels = { warn: `${ICONS.warn} Avertissement`, timeout: `${ICONS.timeout} Timeout`, kick: `${ICONS.kick} Expulsion`, ban: `${ICONS.ban} Bannissement`, alcatraz: `${ICONS.jail} Alcatraz` };
+  return {
+    ok: true, color: COLORS.warning,
+    title: `Historique de ${target.user.tag}`,
+    text: rows.map((r) => `\`#${r.id}\` ${labels[r.type] ?? r.type} — ${r.reason}\n<@${r.moderator_id}> · <t:${Math.floor(new Date(r.created_at).getTime() / 1000)}:R>`).join("\n\n"),
+  };
+}
+
+async function actionClearSanctions(guild, target) {
+  const n = await clearSanctions(guild.id, target.id);
+  return ok("Casier effacé", `${n} sanction(s) supprimée(s) pour **${target.user.tag}**.`);
+}
+
+async function actionDeleteSanction(guild, id) {
+  const done = await deleteSanction(guild.id, id);
+  return done ? ok("Sanction supprimée", `La sanction \`#${id}\` a été retirée du casier.`) : no(`Aucune sanction \`#${id}\`.`);
+}
+
+/* ================================= PURGE ================================== */
+
+async function actionPurge(channel, amount, targetId, moderator) {
+  const fetched = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+  if (!fetched) return no("Lecture des messages impossible dans ce salon.");
+  const cutoff = Date.now() - 13.5 * 864e5;
+  let pool = [...fetched.values()].filter((m) => m.createdTimestamp > cutoff && !m.pinned);
+  if (targetId) pool = pool.filter((m) => m.author.id === targetId);
+  const slice = pool.slice(0, amount);
+  if (!slice.length) return no("Aucun message supprimable (plus de 14 jours ou épinglé).");
+  const deleted = await channel.bulkDelete(slice, true);
+  await log(channel.guild, "messagePurge", embed({
+    guild: channel.guild, color: COLORS.neutral, author: { name: "🧹  Purge" },
+    fields: [
+      { name: "Salon", value: `${channel}`, inline: true },
+      { name: "Messages", value: `${deleted.size}`, inline: true },
+      { name: "Par", value: `<@${moderator.id}>`, inline: true },
+    ],
+  }));
+  return ok("Purge effectuée", `${deleted.size} message(s) supprimé(s).`);
+}
+
+/* ================================ ÉCONOMIE ================================ */
+
+async function actionDaily(guild, user) {
+  const config = await getConfig(guild.id);
+  if (!config.economy.enabled) return no("L'économie est désactivée.");
+  const w = await getWallet(guild.id, user.id);
+  const now = Date.now();
+  const last = w.lastDaily ? new Date(w.lastDaily).getTime() : 0;
+  if (now - last < 20 * 36e5)
+    return no(`Déjà récupéré. Reviens <t:${Math.floor((last + 24 * 36e5) / 1000)}:R>.`);
+  const streak = now - last < 48 * 36e5 ? (w.streak ?? 0) + 1 : 1;
+  const bonus = Math.min(streak, 10) * 25;
+  const gain = config.economy.dailyAmount + bonus;
+  const total = await addCoins(guild.id, user.id, gain);
+  await stampEconomy(guild.id, user.id, "daily", new Date(), streak);
+  return ok("Récompense quotidienne",
+    `Tu reçois **${config.economy.currency} ${num(gain)}**${bonus ? ` (dont ${num(bonus)} de série)` : ""}.\nSolde : **${num(total)}** · série de ${streak} jour(s).`,
+    COLORS.gold);
+}
+
+const JOBS = ["as modéré le chat", "as rangé les vocaux", "as animé un event", "as aidé un nouveau", "as trié les tickets", "as tenu la boutique"];
+
+async function actionWork(guild, user) {
+  const config = await getConfig(guild.id);
+  if (!config.economy.enabled) return no("L'économie est désactivée.");
+  const w = await getWallet(guild.id, user.id);
+  const last = w.lastWork ? new Date(w.lastWork).getTime() : 0;
+  if (Date.now() - last < config.economy.workCooldownMs)
+    return no(`Repose-toi. Prochain travail <t:${Math.floor((last + config.economy.workCooldownMs) / 1000)}:R>.`);
+  const gain = config.economy.workMin + Math.floor(Math.random() * (config.economy.workMax - config.economy.workMin + 1));
+  const total = await addCoins(guild.id, user.id, gain);
+  await stampEconomy(guild.id, user.id, "work", new Date());
+  return ok("Travail terminé",
+    `Tu ${JOBS[Math.floor(Math.random() * JOBS.length)]} et gagnes **${config.economy.currency} ${num(gain)}**.\nSolde : **${num(total)}**.`,
+    COLORS.success);
+}
+
+async function actionBuy(guild, member, itemId) {
+  const config = await getConfig(guild.id);
+  if (!config.economy.enabled) return no("L'économie est désactivée.");
+  const item = config.economy.shop.find((x) => x.id === itemId);
+  if (!item) return no("Article introuvable.");
+  const role = guild.roles.cache.get(item.roleId);
+  if (!role) return no("Le rôle lié à cet article n'existe plus. Préviens un gestionnaire.");
+  if (member.roles.cache.has(role.id)) return no("Tu possèdes déjà cet article.");
+  if (role.position >= guild.members.me.roles.highest.position) return no("Je ne peux pas attribuer ce rôle (il est au-dessus du mien).");
+  if (item.stock !== null && item.stock !== undefined && item.stock <= 0) return no("Rupture de stock.");
+
+  const w = await getWallet(guild.id, member.id);
+  if (w.coins < item.price) return no(`Il te manque ${config.economy.currency} **${num(item.price - w.coins)}**.`);
+
+  await addCoins(guild.id, member.id, -item.price);
+  await member.roles.add(role.id, `Boutique : ${item.name}`).catch(() => null);
+  if (item.stock !== null && item.stock !== undefined) {
+    await updateConfig(guild.id, { economy: { shop: config.economy.shop.map((x) => (x.id === item.id ? { ...x, stock: x.stock - 1 } : x)) } });
+  }
+  await log(guild, "coins", embed({
+    guild, color: COLORS.gold, author: { name: `${ICONS.coin}  Achat boutique` },
+    fields: [
+      { name: "Membre", value: member.user.tag, inline: true },
+      { name: "Article", value: item.name, inline: true },
+      { name: "Prix", value: num(item.price), inline: true },
+    ],
+  }));
+  return ok("Achat validé", `Tu obtiens **${item.name}** ${role} pour ${config.economy.currency} ${num(item.price)}.`, COLORS.gold);
+}
+
+async function actionPay(guild, from, toUser, amount) {
+  const config = await getConfig(guild.id);
+  if (!config.economy.enabled) return no("L'économie est désactivée.");
+  if (toUser.id === from.id) return no("Tu ne peux pas te payer toi-même.");
+  if (toUser.bot) return no("Les bots n'ont pas de portefeuille.");
+  const w = await getWallet(guild.id, from.id);
+  if (w.coins < amount) return no(`Solde insuffisant (${num(w.coins)}).`);
+  await addCoins(guild.id, from.id, -amount);
+  await addCoins(guild.id, toUser.id, amount);
+  await log(guild, "coins", embed({
+    guild, color: COLORS.gold, author: { name: `${ICONS.coin}  Transfert` },
+    fields: [
+      { name: "De", value: from.tag ?? from.user?.tag ?? `<@${from.id}>`, inline: true },
+      { name: "Vers", value: toUser.tag, inline: true },
+      { name: "Montant", value: num(amount), inline: true },
+    ],
+  }));
+  return ok("Transfert effectué", `**${config.economy.currency} ${num(amount)}** envoyés à ${toUser}.`, COLORS.gold);
+}
+
+async function actionGrantCoins(guild, target, amount, moderator, reason) {
+  const total = await addCoins(guild.id, target.id, amount);
+  await log(guild, "coins", embed({
+    guild, color: COLORS.gold, author: { name: `${ICONS.coin}  Ajustement` },
+    fields: [
+      { name: "Membre", value: target.user?.tag ?? target.tag, inline: true },
+      { name: "Montant", value: `${amount >= 0 ? "+" : ""}${num(amount)}`, inline: true },
+      { name: "Par", value: `<@${moderator.id}>`, inline: true },
+      { name: "Raison", value: reason || "Non précisée" },
+    ],
+  }));
+  return ok("Solde ajusté", `${amount >= 0 ? "+" : ""}${num(amount)} — nouveau solde : **${num(total)}**.`, COLORS.gold);
+}
+
+/* ========================================================================== */
+/*                        7 - INSTALLATION AUTOMATIQUE                        */
+/* ========================================================================== */
+
+// setup.js — installation automatique. Un bouton, tout est branché.
+
+
+/** Réglages appliqués par défaut — calibrés pour un très gros serveur. */
+const RECOMMENDED = {
+  logsEnabled: true,
+  levelsEnabled: true,
+  automod: {
+    enabled: true, antiInvite: true, antiLink: false, antiSpam: true,
+    spamThreshold: 6, spamWindowMs: 7000, spamTimeoutMinutes: 10,
+    maxMentions: 6, capsPercent: 80, maxEmojis: 0, warnOnDelete: true,
+  },
+  antiraid: {
+    enabled: true, joinThreshold: 10, joinWindowMs: 10_000,
+    minAccountAgeDays: 3, onRaid: "lockdown", lockdownMinutes: 15,
+  },
+  antinuke: {
+    enabled: true, channelDeleteMax: 3, roleDeleteMax: 3, banMax: 5, kickMax: 5,
+    windowMs: 20_000, punishment: "strip",
+  },
+  economy: {
+    enabled: true, currency: "🪙", dailyAmount: 250,
+    workMin: 40, workMax: 180, workCooldownMs: 30 * 60_000,
+    dropMin: 100, dropMax: 800, dropChance: 0,
+  },
+};
+
+/** Noms de salons cherchés pour les fonctions optionnelles. */
+const WELCOME_NAMES = ["bienvenue", "welcome", "arrivees", "arrivée", "arrivees-membres", "annonces", "chat"];
+
+const step = (ok, label, detail) => ({ ok, label, detail });
+
+/**
+ * Configure tout ce qui peut l'être automatiquement.
+ * @returns {Promise<{steps: Array, applied: number, missing: number}>}
+ */
+async function autoSetup(guild, user) {
+  const steps = [];
+  const patch = structuredClone(RECOMMENDED);
+  const me = guild.members.me;
+
+  /* 1 — index des salons ------------------------------------------------- */
+  const idx = buildIndex(guild);
+  const routed = Object.keys(LOG_ROUTES).filter((k) => findChannel(guild, LOG_ROUTES[k])).length;
+  steps.push(step(routed > 0, "Salons indexés",
+    `${idx.channels} salons, ${idx.categories} catégories — ${routed}/${Object.keys(LOG_ROUTES).length} types de journaux routés`));
+
+  /* 2 — niveaux de permission -------------------------------------------- */
+  const detected = autoDetectRoles(guild);
+  if (detected.length) {
+    patch.perms = { roles: Object.fromEntries(detected.map((d) => [d.role.id, d.level])) };
+    steps.push(step(true, "Rôles staff classés",
+      detected.map((d) => `\`${d.level}\` ${d.role}`).join(" · ")));
+  } else {
+    steps.push(step(false, "Rôles staff non reconnus",
+      "Aucun nom de rôle du type Admin, Gestion, Modérateur, Animateur — à classer à la main dans Permissions"));
+  }
+
+  /* 3 — rôle staff pour les tickets --------------------------------------- */
+  const entryStaff = [...detected].filter((d) => d.level >= 1).sort((a, b) => a.level - b.level)[0];
+  if (entryStaff) {
+    patch.staffRoleId = entryStaff.role.id;
+    steps.push(step(true, "Rôle staff des tickets", `${entryStaff.role} verra les tickets ouverts`));
+  } else {
+    steps.push(step(false, "Rôle staff des tickets", "À définir dans Configuration — sans lui personne ne voit les tickets"));
+  }
+
+  /* 4 — rôle Alcatraz ------------------------------------------------------ */
+  let jail = guild.roles.cache.find((r) => /alcatraz|prison|prisonnier|jail/i.test(r.name) && !r.managed);
+  if (!jail && me.permissions.has(PermissionFlagsBits.ManageRoles)) {
+    jail = await guild.roles.create({
+      name: "🤚 Alcatraz", color: 0x2b2d31, permissions: [],
+      reason: `Installation automatique de 0x par ${user.tag}`,
+    }).catch(() => null);
+    if (jail) steps.push(step(true, "Rôle Alcatraz créé", `${jail} — pense à lui retirer l'accès aux salons publics`));
+  }
+  if (jail) {
+    patch.jailRoleId = jail.id;
+    if (!steps.some((s) => s.label === "Rôle Alcatraz créé")) steps.push(step(true, "Rôle Alcatraz trouvé", `${jail}`));
+  } else {
+    steps.push(step(false, "Rôle Alcatraz", "Création impossible — donne-moi la permission Gérer les rôles"));
+  }
+
+  /* 5 — compteurs vocaux --------------------------------------------------- */
+  const counters = {};
+  const foundCounters = [];
+  for (const c of COUNTERS) {
+    const ch = guild.channels.cache.find(
+      (x) => (x.type === ChannelType.GuildVoice || x.type === ChannelType.GuildStageVoice) && c.test.test(x.name));
+    if (ch) { counters[c.key] = ch.id; foundCounters.push(`${c.key} → ${ch.name}`); }
+  }
+  patch.counters = counters;
+  steps.push(step(foundCounters.length === COUNTERS.length,
+    `Compteurs vocaux (${foundCounters.length}/${COUNTERS.length})`,
+    foundCounters.length ? foundCounters.join(" · ") : "Aucun salon vocal au format « Nom : nombre »"));
+
+  /* 6 — salons fonctionnels ------------------------------------------------ */
+  const funcFound = Object.keys(FUNC_CHANNELS).filter((k) => findChannel(guild, FUNC_CHANNELS[k]));
+  steps.push(step(funcFound.length >= 6, `Salons fonctionnels (${funcFound.length}/${Object.keys(FUNC_CHANNELS).length})`,
+    funcFound.length ? funcFound.join(", ") : "Aucun détecté"));
+
+  /* 7 — salon d'accueil ---------------------------------------------------- */
+  const welcome = findChannel(guild, WELCOME_NAMES);
+  if (welcome && canSend(welcome)) {
+    patch.welcomeChannelId = welcome.id;
+    steps.push(step(true, "Salon de bienvenue", `${welcome}`));
+  } else {
+    steps.push(step(false, "Salon de bienvenue", "Aucun salon nommé bienvenue/welcome — à définir dans Configuration"));
+  }
+
+  /* 8 — salon des colis ---------------------------------------------------- */
+  const drops = findChannel(guild, FUNC_CHANNELS.drops);
+  if (drops) { patch.economy.dropChannelId = drops.id; steps.push(step(true, "Salon des colis", `${drops}`)); }
+
+  /* 9 — catégories de tickets ---------------------------------------------- */
+  const cats = TICKET_TYPES.filter((t) => findCategory(guild, t.categories));
+  steps.push(step(cats.length === TICKET_TYPES.length, `Catégories de tickets (${cats.length}/${TICKET_TYPES.length})`,
+    cats.length === TICKET_TYPES.length ? "Toutes trouvées"
+      : `Manquantes : ${TICKET_TYPES.filter((t) => !cats.includes(t)).map((t) => t.label).join(", ")}`));
+
+  /* 10 — permissions du bot ------------------------------------------------ */
+  const missingPerms = [];
+  if (!me.permissions.has(PermissionFlagsBits.ViewAuditLog)) missingPerms.push("Voir les logs d'audit");
+  if (!me.permissions.has(PermissionFlagsBits.ManageRoles)) missingPerms.push("Gérer les rôles");
+  if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) missingPerms.push("Gérer les salons");
+  if (!me.permissions.has(PermissionFlagsBits.BanMembers)) missingPerms.push("Bannir");
+  if (!me.permissions.has(PermissionFlagsBits.ModerateMembers)) missingPerms.push("Réduire au silence");
+  steps.push(step(missingPerms.length === 0, "Permissions du bot",
+    missingPerms.length ? `Manquantes : ${missingPerms.join(", ")} — réinvite-moi en Administrateur` : "Toutes présentes"));
+
+  /* 11 — enregistrement ---------------------------------------------------- */
+  await updateConfig(guild.id, patch);
+  steps.push(step(true, "Protections activées",
+    "Automod, anti-raid, anti-nuke, journaux, niveaux et économie sont en marche avec les réglages recommandés"));
+
+  /* 12 — mise à jour immédiate --------------------------------------------- */
+  await updateCounters(guild, true).catch(() => null);
+  await refreshTicketCounter(guild).catch(() => null);
+
+  return {
+    steps,
+    applied: steps.filter((s) => s.ok).length,
+    missing: steps.filter((s) => !s.ok).length,
+  };
+}
+
+/** Publie d'un coup tous les panneaux publics dans les salons détectés. */
+async function publishAll(guild) {
+  const config = await getConfig(guild.id);
+  const done = [];
+
+  const ticketCh = findChannel(guild, FUNC_CHANNELS.ticketPanel);
+  if (ticketCh && canSend(ticketCh)) {
+    await ticketCh.send({
+      embeds: [embed({ guild, author: { name: `${ICONS.ticket}  Centre d'aide` }, color: COLORS.primary,
+        description: "Choisis le type de ticket dans le menu. Un salon privé sera créé avec le staff concerné.\n\nLes ouvertures abusives sont sanctionnées." })],
+      components: ticketPanelComponents(),
+    }).catch(() => null);
+    done.push(`Tickets → ${ticketCh}`);
+  }
+
+  const confessCh = findChannel(guild, FUNC_CHANNELS.confessionPost);
+  if (confessCh && canSend(confessCh)) {
+    await confessCh.send(confessionPanel(guild)).catch(() => null);
+    done.push(`Confessions → ${confessCh}`);
+  }
+
+  const memberCh = findChannel(guild, ["commandes", "cmds", "bot", "chat"]);
+  if (memberCh && canSend(memberCh)) {
+    await memberCh.send(memberPanel(guild)).catch(() => null);
+    done.push(`Espace membre → ${memberCh}`);
+  }
+
+  return done;
+}
+
+/** Résumé visuel d'une installation. */
+function setupReport(guild, result) {
+  return embed({
+    guild,
+    color: result.missing === 0 ? COLORS.success : COLORS.warning,
+    author: { name: "⚡  Installation automatique" },
+    description: [
+      result.missing === 0
+        ? `### ${ICONS.ok} Tout est branché`
+        : `### ${result.applied} étape(s) réussie(s), ${result.missing} à finir à la main`,
+      "",
+      ...result.steps.map((s) => `${s.ok ? "✅" : "⚠️"} **${s.label}**\n └ ${s.detail}`),
+    ].join("\n").slice(0, 4000),
+    footer: "Relance l'installation quand tu changes ton serveur — rien n'est écrasé inutilement",
+  });
+}
+
+/* ========================================================================== */
+/*                          8 - PANNEAU DE CONTROLE                           */
+/* ========================================================================== */
+
+// panel.js — l'interface. Tout se pilote ici, au doigt.
+
+
+/* ========================================================================== */
+/*                                  SECTIONS                                  */
+/* ========================================================================== */
+
+const SECTIONS = [
+  // ownerOnly : sections qui MODIFIENT le bot → réservées au propriétaire
+  { id: "mod", label: "Modération", emoji: "🛡️", level: 1, desc: "Sanctionner, purger, consulter un casier" },
+  { id: "publish", label: "Publications", emoji: "📢", level: 3, desc: "Panneaux, menus de rôles, annonces, sondages" },
+  { id: "tickets", label: "Tickets", emoji: "🎫", level: 4, desc: "Panneau d'ouverture, statistiques" },
+  { id: "gw", label: "Giveaways", emoji: "🎁", level: 4, desc: "Lancer, terminer, retirer au sort" },
+  { id: "counters", label: "Compteurs", emoji: "📊", level: 4, desc: "Membres, connectés, vocal", ownerOnly: true },
+  { id: "eco", label: "Économie", emoji: "🪙", level: 4, desc: "Coins, boutique, colis", ownerOnly: true },
+  { id: "levels", label: "Niveaux", emoji: "📈", level: 5, desc: "XP et récompenses de rôle", ownerOnly: true },
+  { id: "automod", label: "Automod", emoji: "🤖", level: 5, desc: "Filtres de messages", ownerOnly: true },
+  { id: "config", label: "Configuration", emoji: "⚙️", level: 5, desc: "Rôles clés, accueil, autorole", ownerOnly: true },
+  { id: "protect", label: "Protection", emoji: "🚨", level: 6, desc: "Anti-raid, anti-nuke, lockdown", ownerOnly: true },
+  { id: "perms", label: "Permissions", emoji: "🔐", level: 6, desc: "Niveau de chaque rôle", ownerOnly: true },
+];
+
+/** Vue de refus quand quelqu'un touche à une section verrouillée. */
+function lockedView(guild, section) {
+  return {
+    embeds: [embed({
+      guild,
+      color: COLORS.danger,
+      author: { name: "🔒  Section verrouillée" },
+      description: `**${section.emoji} ${section.label}** modifie la configuration de 0x.
+Seul <@${OWNER_ID}> peut y accéder.`,
+      footer: "Verrou par identifiant — ni un administrateur ni le propriétaire du serveur ne peut le contourner",
+    })],
+    components: [backRow()],
+  };
+}
+
+/** Le membre a-t-il le droit d'ouvrir cette section ? */
+function canOpen(section, member, config) {
+  if (!section) return false;
+  if (section.ownerOnly && !isOwner(member.id)) return false;
+  return permLevel(member, config) >= section.level;
+}
+
+const btn = (id, label, style = ButtonStyle.Secondary, emoji) => {
+  const b = new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style);
+  if (emoji) b.setEmoji(emoji);
+  return b;
+};
+const rows = (...components) => components.map((c) => new ActionRowBuilder().addComponents(c));
+const backRow = () => new ActionRowBuilder().addComponents(btn("p:home", "Retour", ButtonStyle.Secondary, "◀️"));
+const onOff = (v) => (v ? "🟢 activé" : "🔴 coupé");
+
+async function respond(i, payload) {
+  try {
+    if (i.isModalSubmit() && !i.isFromMessage()) return await i.reply({ ...payload, ...EPH });
+    if (i.replied || i.deferred) return await i.editReply(payload);
+    return await i.update(payload);
+  } catch {
+    return i.followUp({ ...payload, ...EPH }).catch(() => null);
+  }
+}
+
+/** Retourne au panneau après une action, avec un bandeau de résultat. */
+async function feedback(i, result, sectionId) {
+  const view = await buildSection(sectionId ?? "home", i, await getConfig(i.guildId));
+  const banner = embed({
+    guild: i.guild,
+    color: result.color ?? COLORS.success,
+    author: { name: `${result.ok === false ? ICONS.no : ICONS.ok}  ${result.title ?? "Terminé"}` },
+    description: result.text,
+  });
+  return respond(i, { embeds: [banner, ...view.embeds], components: view.components });
+}
+
+/* ========================================================================== */
+/*                             DIAGNOSTIC D'ACCUEIL                           */
+/* ========================================================================== */
+
+async function diagnose(guild, config) {
+  const items = [];
+  const push = (ok, label, hint) => items.push({ ok, label, hint });
+
+  push(usingDatabase(), "Base de données PostgreSQL",
+    "Ajoute un service Postgres sur Railway puis la variable DATABASE_URL — sinon tout est perdu au redémarrage");
+
+  const routed = Object.keys(LOG_ROUTES).filter((k) => resolveLogChannel(guild, k, config)).length;
+  push(routed >= Object.keys(LOG_ROUTES).length * 0.8, `Salons de logs détectés (${routed}/${Object.keys(LOG_ROUTES).length})`,
+    "Lance /logs scan, puis /logs map pour voir ce qui manque");
+
+  push(Object.keys(config.perms.roles).length > 0, "Niveaux de permission attribués",
+    "Panneau → Permissions → Détection automatique");
+
+  push(!!config.staffRoleId, "Rôle staff défini",
+    "Panneau → Configuration — nécessaire pour l'accès aux tickets");
+
+  push(!!config.jailRoleId || !!guild.roles.cache.find((r) => /alcatraz|prison/i.test(r.name)),
+    "Rôle Alcatraz défini", "Panneau → Configuration — nécessaire pour la commande d'enfermement");
+
+  const cats = TICKET_TYPES.filter((t) => findCategory(guild, t.categories)).length;
+  push(cats === TICKET_TYPES.length, `Catégories de tickets (${cats}/${TICKET_TYPES.length})`,
+    "Les catégories doivent s'appeler Tickets Staff, Tickets Abus, Tickets Animation, Tickets Coins, Tickets Partenariats, Tickets Couronne");
+
+  const counts = await computeCounts(guild);
+  push(counts.online !== null, "Intent Presence (compteur Connectés)",
+    "Portail développeur → Bot → active Presence Intent");
+  push(counts.cacheRatio > 0.5, `Cache des membres (${Math.round(counts.cacheRatio * 100)}%)`,
+    "Portail développeur → Bot → active Server Members Intent");
+
+  const me = guild.members.me;
+  push(me.permissions.has(PermissionFlagsBits.ViewAuditLog), "Accès aux logs d'audit",
+    "Nécessaire à l'anti-nuke pour identifier qui agit");
+  push(me.roles.highest.position >= guild.roles.cache.size - 3 || me.permissions.has(PermissionFlagsBits.Administrator),
+    "Position du rôle de 0x", "Paramètres du serveur → Rôles → remonte 0x tout en haut");
+
+  return items;
+}
+
+async function homeView(i, config) {
+  const level = permLevel(i.member, config);
+  const owner = isOwner(i.user.id);
+  const checks = owner ? await diagnose(i.guild, config) : [];
+  const counts = await computeCounts(i.guild);
+  const problems = checks.filter((c) => !c.ok);
+
+  const dot = (v) => (v ? "🟢" : "🔴");
+  const etat = [
+    `${dot(config.automod.enabled)} Automod`,
+    `${dot(config.antiraid.enabled)} Anti-raid`,
+    `${dot(config.antinuke.enabled)} Anti-nuke`,
+    `${dot(config.logsEnabled)} Journaux`,
+    `${dot(config.levelsEnabled)} Niveaux`,
+    `${dot(config.economy.enabled)} Économie`,
+  ].join("  ·  ");
+
+  const main = embed({
+    guild: i.guild,
+    author: { name: "0x  —  panneau de contrôle" },
+    color: !owner ? COLORS.primary : problems.length ? COLORS.warning : COLORS.success,
+    description: [
+      `**${i.guild.name}** · ${num(counts.members)} membres · ${counts.voice} en vocal`,
+      `Ton niveau : **${PERM_LABELS[level]}**`,
+      "",
+      etat,
+      "",
+      !owner
+        ? `### ${ICONS.info} Sections opérationnelles`
+        : problems.length
+        ? `### ${ICONS.alert} ${problems.length} point(s) à régler`
+        : `### ${ICONS.ok} Tout est en place`,
+      ...(!owner
+        ? ["Les réglages de 0x sont verrouillés. Tu as accès aux sections de travail ci-dessous."]
+        : problems.length
+        ? ["Appuie sur **Tout installer** — il règle presque tout seul.", "",
+           ...problems.slice(0, 6).map((p) => `🔴 **${p.label}**\n └ ${p.hint}`)]
+        : ["Aucune action requise."]),
+    ].join("\n"),
+    footer: owner ? "Tout installer = détection et branchement automatiques" : undefined,
+  });
+
+  const allowed = SECTIONS.filter((s) => canOpen(s, i.member, config));
+  const components = [];
+
+  if (owner) {
+    components.push(new ActionRowBuilder().addComponents(
+      btn("p:setup:run", "Tout installer", ButtonStyle.Success, "⚡"),
+      btn("p:setup:publish", "Publier les panneaux", ButtonStyle.Primary, "📢"),
+      btn("p:setup:defaults", "Réglages recommandés", ButtonStyle.Secondary, "🎚️"),
+      btn("p:home", "Rafraîchir", ButtonStyle.Secondary, "🔄"),
+    ));
+    components.push(new ActionRowBuilder().addComponents(
+      btn("p:sw:automod", "Automod", config.automod.enabled ? ButtonStyle.Success : ButtonStyle.Danger),
+      btn("p:sw:antiraid", "Anti-raid", config.antiraid.enabled ? ButtonStyle.Success : ButtonStyle.Danger),
+      btn("p:sw:antinuke", "Anti-nuke", config.antinuke.enabled ? ButtonStyle.Success : ButtonStyle.Danger),
+      btn("p:sw:logs", "Journaux", config.logsEnabled ? ButtonStyle.Success : ButtonStyle.Danger),
+      btn("p:sw:levels", "Niveaux", config.levelsEnabled ? ButtonStyle.Success : ButtonStyle.Danger),
+    ));
+  }
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("p:go")
+    .setPlaceholder(allowed.length ? "Réglages détaillés…" : "Aucune section accessible à ton niveau")
+    .setDisabled(!allowed.length)
+    .addOptions(allowed.length
+      ? allowed.map((s) => ({ label: s.label, value: s.id, emoji: s.emoji, description: s.desc.slice(0, 100) }))
+      : [{ label: "—", value: "none" }]);
+  components.push(new ActionRowBuilder().addComponents(menu));
+
+  return { embeds: [main], components };
+}
+
+/* ========================================================================== */
+/*                            CONSTRUCTION DES VUES                           */
+/* ========================================================================== */
+
+async function buildSection(id, i, config) {
+  const guild = i.guild;
+  const level = permLevel(i.member, config);
+  const section = SECTIONS.find((s) => s.id === id);
+  if (id !== "home" && section) {
+    if (section.ownerOnly && !isOwner(i.user.id)) return lockedView(guild, section);
+    if (level < section.level) {
+      return { embeds: [embed({ guild, color: COLORS.danger, author: { name: `${ICONS.no}  Accès refusé` },
+        description: `Cette section demande **${PERM_LABELS[section.level]}**.` })], components: [backRow()] };
+    }
+  }
+
+  if (id === "home") return homeView(i, config);
+
+  /* ------------------------------ MODÉRATION ----------------------------- */
+  if (id === "mod") {
+    return {
+      embeds: [embed({ guild, author: { name: `${ICONS.shield}  Modération` }, color: COLORS.primary,
+        description: "Choisis un membre pour ouvrir sa fiche : avertissement, timeout, expulsion, bannissement, Alcatraz, casier.",
+        footer: "Tu ne peux agir que sur un niveau de perm inférieur au tien" })],
+      components: [
+        new ActionRowBuilder().addComponents(
+          new UserSelectMenuBuilder().setCustomId("p:mod:pick").setPlaceholder("Sélectionne un membre…")),
+        new ActionRowBuilder().addComponents(
+          btn("p:mod:purge", "Purger ce salon", ButtonStyle.Danger, "🧹"),
+          btn("p:mod:unban", "Débannir un ID", ButtonStyle.Secondary, "♻️"),
+          btn("p:mod:lock", isLockdown(guild.id) ? "Lockdown actif" : "Verrouiller le salon", ButtonStyle.Secondary, "🔒"),
+        ),
+        backRow(),
+      ],
+    };
+  }
+
+  /* ---------------------------- CONFIGURATION ---------------------------- */
+  if (id === "config") {
+    const show = (v, kind = "role") => (v ? (kind === "role" ? `<@&${v}>` : `<#${v}>`) : "_non défini_");
+    return {
+      embeds: [embed({ guild, author: { name: "⚙️  Configuration générale" }, color: COLORS.primary,
+        fields: [
+          { name: "Rôle staff", value: show(config.staffRoleId), inline: true },
+          { name: "Rôle Alcatraz", value: show(config.jailRoleId), inline: true },
+          { name: "Autorole", value: show(config.autoroleId), inline: true },
+          { name: "Salon d'accueil", value: show(config.welcomeChannelId, "ch"), inline: true },
+          { name: "Message d'accueil", value: `\`${config.welcomeMessage}\`` },
+        ] })],
+      components: [
+        new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("p:config:staff").setPlaceholder("Rôle staff (accès tickets)")),
+        new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("p:config:jail").setPlaceholder("Rôle Alcatraz (prison)")),
+        new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("p:config:autorole").setPlaceholder("Autorole à l'arrivée")),
+        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:config:welcome")
+          .setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon de bienvenue")),
+        new ActionRowBuilder().addComponents(
+          btn("p:config:msg", "Message d'accueil", ButtonStyle.Primary, "✏️"),
+          btn("p:home", "Retour", ButtonStyle.Secondary, "◀️")),
+      ],
+    };
+  }
+
+  /* -------------------------------- AUTOMOD ------------------------------ */
+  if (id === "automod") {
+    const a = config.automod;
+    return {
+      embeds: [embed({ guild, author: { name: "🤖  Automod" }, color: a.enabled ? COLORS.success : COLORS.neutral,
+        description: `État général : **${onOff(a.enabled)}**`,
+        fields: [
+          { name: "Invitations Discord", value: onOff(a.antiInvite), inline: true },
+          { name: "Tous les liens", value: onOff(a.antiLink), inline: true },
+          { name: "Flood", value: a.antiSpam ? `🟢 ${a.spamThreshold} msg / ${Math.round(a.spamWindowMs / 1000)}s` : "🔴 coupé", inline: true },
+          { name: "Mentions max", value: a.maxMentions ? `${a.maxMentions}` : "illimité", inline: true },
+          { name: "Majuscules", value: a.capsPercent ? `${a.capsPercent}%` : "coupé", inline: true },
+          { name: "Émojis max", value: a.maxEmojis ? `${a.maxEmojis}` : "illimité", inline: true },
+          { name: "Mots interdits", value: `${a.bannedWords.length}`, inline: true },
+          { name: "Rôles exemptés", value: a.exemptRoles.length ? a.exemptRoles.map((r) => `<@&${r}>`).join(" ") : "_aucun_" },
+          { name: "Salons ignorés", value: a.ignoredChannels.length ? a.ignoredChannels.map((c) => `<#${c}>`).join(" ") : "_aucun_" },
+        ] })],
+      components: [
+        new ActionRowBuilder().addComponents(
+          btn("p:automod:t:enabled", "Automod", a.enabled ? ButtonStyle.Success : ButtonStyle.Danger),
+          btn("p:automod:t:antiInvite", "Invitations", a.antiInvite ? ButtonStyle.Success : ButtonStyle.Danger),
+          btn("p:automod:t:antiLink", "Liens", a.antiLink ? ButtonStyle.Success : ButtonStyle.Danger),
+          btn("p:automod:t:antiSpam", "Flood", a.antiSpam ? ButtonStyle.Success : ButtonStyle.Danger),
+        ),
+        new ActionRowBuilder().addComponents(
+          btn("p:automod:seuils", "Régler les seuils", ButtonStyle.Primary, "🎚️"),
+          btn("p:automod:mots", "Mots interdits", ButtonStyle.Primary, "🚫"),
+        ),
+        new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("p:automod:exempt")
+          .setPlaceholder("Ajouter/retirer un rôle exempté")),
+        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:automod:ignore")
+          .setChannelTypes(ChannelType.GuildText, ChannelType.GuildCategory).setPlaceholder("Ajouter/retirer un salon ignoré")),
+        backRow(),
+      ],
+    };
+  }
+
+  /* ------------------------------ PROTECTION ----------------------------- */
+  if (id === "protect") {
+    const { antiraid: ar, antinuke: an } = config;
+    return {
+      embeds: [embed({ guild, author: { name: `${ICONS.alert}  Protection` }, color: COLORS.danger,
+        fields: [
+          { name: "Anti-raid", value: ar.enabled
+            ? `🟢 ${ar.joinThreshold} arrivées / ${Math.round(ar.joinWindowMs / 1000)}s\nComptes < ${ar.minAccountAgeDays}j signalés\nRéaction : **${ar.onRaid}**` : "🔴 coupé", inline: true },
+          { name: "Anti-nuke", value: an.enabled
+            ? `🟢 salons ${an.channelDeleteMax} · rôles ${an.roleDeleteMax} · bans ${an.banMax}\nFenêtre ${Math.round(an.windowMs / 1000)}s\nSanction : **${an.punishment}**` : "🔴 coupé", inline: true },
+          { name: "Lockdown", value: isLockdown(guild.id) ? "🔒 **actif**" : "🔓 inactif", inline: true },
+          { name: "Liste blanche anti-nuke", value: an.whitelist.length ? an.whitelist.map((u) => `<@${u}>`).join(" ") : "_vide_" },
+        ] })],
+      components: [
+        new ActionRowBuilder().addComponents(
+          btn("p:protect:t:antiraid", "Anti-raid", ar.enabled ? ButtonStyle.Success : ButtonStyle.Danger),
+          btn("p:protect:t:antinuke", "Anti-nuke", an.enabled ? ButtonStyle.Success : ButtonStyle.Danger),
+          btn("p:protect:lock:on", "Verrouiller tout", ButtonStyle.Danger, "🔒"),
+          btn("p:protect:lock:off", "Déverrouiller", ButtonStyle.Success, "🔓"),
+        ),
+        new ActionRowBuilder().addComponents(
+          btn("p:protect:raidcfg", "Réglages anti-raid", ButtonStyle.Primary, "🎚️"),
+          btn("p:protect:nukecfg", "Réglages anti-nuke", ButtonStyle.Primary, "🎚️"),
+        ),
+        new ActionRowBuilder().addComponents(new UserSelectMenuBuilder().setCustomId("p:protect:wl")
+          .setPlaceholder("Ajouter/retirer de la liste blanche")),
+        backRow(),
+      ],
+    };
+  }
+
+  /* ----------------------------- PERMISSIONS ----------------------------- */
+  if (id === "perms") {
+    const byLevel = {};
+    for (const [rid, lvl] of Object.entries(config.perms.roles)) {
+      const role = guild.roles.cache.get(rid);
+      if (role) (byLevel[lvl] ??= []).push(role.toString());
+    }
+    return {
+      embeds: [embed({ guild, author: { name: `${ICONS.shield}  Permissions` }, color: COLORS.gold,
+        description: [6, 5, 4, 3, 2, 1].map((l) => `**${PERM_LABELS[l]}**\n${byLevel[l]?.join(" ") ?? "_aucun rôle_"}`).join("\n\n"),
+        fields: Object.keys(config.perms.users).length
+          ? [{ name: "Forçages individuels", value: Object.entries(config.perms.users).map(([u, l]) => `\`${l}\` <@${u}>`).join("\n").slice(0, 1000) }]
+          : [],
+        footer: "Le propriétaire du serveur est toujours niveau 6" })],
+      components: [
+        new ActionRowBuilder().addComponents(
+          btn("p:perms:auto", "Détection automatique", ButtonStyle.Primary, "🪄"),
+          btn("p:perms:cmds", "Niveau des commandes", ButtonStyle.Secondary, "📋"),
+          btn("p:perms:reset", "Réinitialiser", ButtonStyle.Danger, "🗑️"),
+        ),
+        new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("p:perms:role").setPlaceholder("Choisir un rôle à classer")),
+        new ActionRowBuilder().addComponents(new UserSelectMenuBuilder().setCustomId("p:perms:user").setPlaceholder("Forcer le niveau d'une personne")),
+        backRow(),
+      ],
+    };
+  }
+
+  /* -------------------------------- TICKETS ------------------------------ */
+  if (id === "tickets") {
+    const s = await ticketStats(guild.id);
+    const cats = TICKET_TYPES.map((t) => `${findCategory(guild, t.categories) ? "✅" : "🔴"} ${t.emoji} ${t.label}`);
+    return {
+      embeds: [embed({ guild, author: { name: `${ICONS.ticket}  Tickets` }, color: COLORS.primary,
+        description: cats.join("\n"),
+        fields: [
+          { name: "Ouverts", value: `${s.open}`, inline: true },
+          { name: "7 jours", value: `${s.week}`, inline: true },
+          { name: "Total", value: `${s.total}`, inline: true },
+          { name: "Rôle staff", value: config.staffRoleId ? `<@&${config.staffRoleId}>` : "_non défini — à faire dans Configuration_" },
+        ] })],
+      components: [
+        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:tickets:publish")
+          .setChannelTypes(ChannelType.GuildText).setPlaceholder("Publier le panneau de tickets dans…")),
+        new ActionRowBuilder().addComponents(
+          btn("p:tickets:refresh", "Actualiser le compteur", ButtonStyle.Primary, "🔄"),
+          btn("p:home", "Retour", ButtonStyle.Secondary, "◀️")),
+      ],
+    };
+  }
+
+  /* ------------------------------- COMPTEURS ----------------------------- */
+  if (id === "counters") {
+    const { counts, report } = await updateCounters(guild, false);
+    const labels = { members: "Membres (bots exclus)", online: "Connectés", voice: "En vocal" };
+    return {
+      embeds: [embed({ guild, author: { name: "📊  Compteurs vocaux" }, color: COLORS.primary,
+        description: report.map((r) => {
+          const good = ["mis à jour", "à jour", "inchangé"].includes(r.status);
+          return `${good ? "✅" : "⚠️"} **${labels[r.key]}** — ${r.value ?? "—"}\n └ _${r.status}_`;
+        }).join("\n"),
+        fields: [
+          { name: "Cache membres", value: `${num(guild.members.cache.size)} / ${num(guild.memberCount)}`, inline: true },
+          { name: "États vocaux", value: `${guild.voiceStates.cache.size}`, inline: true },
+          { name: "Presence", value: counts.online === null ? "🔴 intent manquant" : "🟢 disponible", inline: true },
+        ],
+        footer: "Discord limite les renommages à 2 par 10 min et par salon" })],
+      components: [
+        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:counters:set:members")
+          .setChannelTypes(ChannelType.GuildVoice).setPlaceholder("Salon du compteur Membres")),
+        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:counters:set:online")
+          .setChannelTypes(ChannelType.GuildVoice).setPlaceholder("Salon du compteur Connectés")),
+        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:counters:set:voice")
+          .setChannelTypes(ChannelType.GuildVoice).setPlaceholder("Salon du compteur Vocal")),
+        new ActionRowBuilder().addComponents(
+          btn("p:counters:force", "Forcer la mise à jour", ButtonStyle.Primary, "🔄"),
+          btn("p:home", "Retour", ButtonStyle.Secondary, "◀️")),
+      ],
+    };
+  }
+
+  /* -------------------------------- NIVEAUX ------------------------------ */
+  if (id === "levels") {
+    const rewards = Object.entries(config.levelRewards).sort((a, b) => a[0] - b[0])
+      .map(([lvl, rid]) => `Niveau **${lvl}** → <@&${rid}>`);
+    return {
+      embeds: [embed({ guild, author: { name: `${ICONS.level}  Niveaux` }, color: COLORS.primary,
+        description: `Système d'XP : **${onOff(config.levelsEnabled)}**\nAnnonces : ${resolveFuncChannel(guild, "levelUp", config) ?? "_salon du message_"}`,
+        fields: [{ name: "Récompenses", value: rewards.length ? rewards.join("\n") : "_aucune_" }] })],
+      components: [
+        new ActionRowBuilder().addComponents(
+          btn("p:levels:t", config.levelsEnabled ? "Couper les niveaux" : "Activer les niveaux",
+            config.levelsEnabled ? ButtonStyle.Danger : ButtonStyle.Success),
+          btn("p:home", "Retour", ButtonStyle.Secondary, "◀️")),
+        new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("p:levels:reward")
+          .setPlaceholder("Rôle à offrir à un niveau…")),
+        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:levels:channel")
+          .setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon des annonces de niveau")),
+      ],
+    };
+  }
+
+  /* -------------------------------- ÉCONOMIE ----------------------------- */
+  if (id === "eco") {
+    const e = config.economy;
+    const items = e.shop.map((x) => `**${x.name}** — ${e.currency} ${num(x.price)} → <@&${x.roleId}>${x.stock != null ? ` · stock ${x.stock}` : ""}`);
+    const comps = [
+      new ActionRowBuilder().addComponents(
+        btn("p:eco:t", e.enabled ? "Couper l'économie" : "Activer l'économie", e.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
+        btn("p:eco:montants", "Montants", ButtonStyle.Primary, "🎚️"),
+        btn("p:eco:drop", "Lâcher un colis", ButtonStyle.Primary, "📦"),
+      ),
+      new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("p:eco:additem")
+        .setPlaceholder("Ajouter un article : choisis le rôle offert")),
+      new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("p:eco:dropch")
+        .setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon des colis automatiques")),
+    ];
+    if (e.shop.length) {
+      comps.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId("p:eco:del")
+        .setPlaceholder("Retirer un article de la boutique")
+        .addOptions(e.shop.slice(0, 25).map((x) => ({ label: x.name.slice(0, 100), value: x.id, description: `${num(x.price)} coins` })))));
+    }
+    comps.push(backRow());
+    return {
+      embeds: [embed({ guild, author: { name: `${ICONS.coin}  Économie` }, color: COLORS.gold,
+        description: `État : **${onOff(e.enabled)}** · monnaie ${e.currency}`,
+        fields: [
+          { name: "Quotidien", value: num(e.dailyAmount), inline: true },
+          { name: "Travail", value: `${num(e.workMin)} – ${num(e.workMax)}`, inline: true },
+          { name: "Colis", value: e.dropChannelId ? `<#${e.dropChannelId}> · ${e.dropChance}%` : "_manuel_", inline: true },
+          { name: "Boutique", value: items.length ? items.join("\n") : "_vide_" },
+        ] })],
+      components: comps,
+    };
+  }
+
+  /* ------------------------------- GIVEAWAYS ----------------------------- */
+  if (id === "gw") {
+    const active = await listActiveGiveaways(guild.id);
+    const comps = [new ActionRowBuilder().addComponents(
+      btn("p:gw:new", "Lancer un giveaway", ButtonStyle.Success, "🎁"),
+      btn("p:home", "Retour", ButtonStyle.Secondary, "◀️"))];
+    if (active.length) {
+      comps.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId("p:gw:pick")
+        .setPlaceholder("Agir sur un giveaway en cours")
+        .addOptions(active.slice(0, 25).map((g) => ({ label: g.prize.slice(0, 100), value: String(g.id), description: `fin ${new Date(g.ends_at).toLocaleString("fr-FR")}` })))));
+    }
+    return {
+      embeds: [embed({ guild, author: { name: `${ICONS.gift}  Giveaways` }, color: COLORS.gold,
+        description: active.length
+          ? active.map((g) => `\`#${g.id}\` **${g.prize}** — ${g.winners} gagnant(s), fin ${ts(g.ends_at)}`).join("\n")
+          : "_Aucun giveaway en cours._",
+        footer: "Le giveaway est publié dans le salon où tu as ouvert le panneau" })],
+      components: comps,
+    };
+  }
+
+  /* ------------------------------ PUBLICATIONS --------------------------- */
+  if (id === "publish") {
+    return {
+      embeds: [embed({ guild, author: { name: "📢  Publications" }, color: COLORS.primary,
+        description: [
+          "**Panneau membres** — boutons Niveau, Solde, Daily, Travail, Classement, Boutique",
+          "**Panneau tickets** — menu d'ouverture de ticket",
+          "**Panneau confession** — bouton de confession anonyme",
+          "**Menu de rôles** — rôles à cocher",
+          "",
+          "Choisis quoi publier, puis le salon.",
+        ].join("\n") })],
+      components: [
+        new ActionRowBuilder().addComponents(
+          btn("p:setup:publish", "Tout publier automatiquement", ButtonStyle.Success, "⚡"),
+        ),
+        new ActionRowBuilder().addComponents(
+          btn("p:publish:pick:member", "Panneau membres", ButtonStyle.Primary, "🧭"),
+          btn("p:publish:pick:ticket", "Panneau tickets", ButtonStyle.Primary, "🎫"),
+          btn("p:publish:pick:confess", "Confessions", ButtonStyle.Primary, "🕵️"),
+        ),
+        new ActionRowBuilder().addComponents(
+          btn("p:publish:roles", "Menu de rôles", ButtonStyle.Secondary, "🎭"),
+          btn("p:publish:say", "Annonce", ButtonStyle.Secondary, "📣"),
+          btn("p:publish:poll", "Sondage", ButtonStyle.Secondary, "📊"),
+        ),
+        backRow(),
+      ],
+    };
+  }
+
+  return homeView(i, config);
+}
+
+/* ========================================================================== */
+/*                                  MODALES                                   */
+/* ========================================================================== */
+
+function modal(id, title, fields) {
+  const m = new ModalBuilder().setCustomId(id).setTitle(title.slice(0, 45));
+  for (const f of fields) {
+    const input = new TextInputBuilder()
+      .setCustomId(f.id).setLabel(f.label.slice(0, 45))
+      .setStyle(f.long ? TextInputStyle.Paragraph : TextInputStyle.Short)
+      .setRequired(f.required ?? false);
+    if (f.value) input.setValue(String(f.value).slice(0, 4000));
+    if (f.placeholder) input.setPlaceholder(f.placeholder.slice(0, 100));
+    if (f.max) input.setMaxLength(f.max);
+    m.addComponents(new ActionRowBuilder().addComponents(input));
+  }
+  return m;
+}
+
+const REASON = { id: "reason", label: "Raison", required: true, max: 400 };
+const DURATION = { id: "duration", label: "Durée (30s, 10m, 2h, 7d)", placeholder: "vide = indéterminée", max: 12 };
+
+/* ========================================================================== */
+/*                                  ROUTEUR                                   */
+/* ========================================================================== */
+
+async function handlePanel(i) {
+  const id = i.customId;
+  if (!id.startsWith("p:") && !id.startsWith("pm:") && !id.startsWith("pub:")) return false;
+
+  const config = await getConfig(i.guildId);
+  const level = permLevel(i.member, config);
+  const parts = id.split(":");
+
+  /* ---------------------------- PANNEAUX PUBLICS -------------------------- */
+  if (parts[0] === "pub") return handlePublic(i, parts, config);
+
+  /* -------------------------------- MODALES ------------------------------- */
+  if (parts[0] === "pm") return handleModal(i, parts, config, level);
+
+  /* ------------------------------ NAVIGATION ------------------------------ */
+  if (id === "p:home") return respond(i, await buildSection("home", i, config));
+  if (id === "p:go") return respond(i, await buildSection(i.values[0], i, config));
+
+  // Installation automatique et interrupteurs : propriétaire uniquement
+  if (parts[1] === "setup" || parts[1] === "sw") {
+    if (!isOwner(i.user.id)) {
+      return respond(i, { embeds: [embed({ guild: i.guild, color: COLORS.danger,
+        author: { name: "🔒  Verrouillé" },
+        description: `Seul <@${OWNER_ID}> peut modifier la configuration de 0x.` })], components: [backRow()] });
+    }
+
+    if (parts[1] === "sw") {
+      const key = parts[2];
+      if (key === "logs") await updateConfig(i.guildId, { logsEnabled: !config.logsEnabled });
+      else if (key === "levels") await updateConfig(i.guildId, { levelsEnabled: !config.levelsEnabled });
+      else await updateConfig(i.guildId, { [key]: { enabled: !config[key].enabled } });
+      return respond(i, await buildSection("home", i, await getConfig(i.guildId)));
+    }
+
+    if (parts[2] === "run") {
+      await i.deferUpdate();
+      const result = await autoSetup(i.guild, i.user);
+      const view = await buildSection("home", i, await getConfig(i.guildId));
+      return respond(i, { embeds: [setupReport(i.guild, result)], components: view.components });
+    }
+
+    if (parts[2] === "publish") {
+      await i.deferUpdate();
+      const done = await publishAll(i.guild);
+      return feedback(i, done.length
+        ? { ok: true, title: `${done.length} panneau(x) publié(s)`, text: done.join("\n") }
+        : { ok: false, title: "Rien publié", text: "Aucun salon cible trouvé. Passe par Publications pour choisir toi-même.", color: COLORS.warning });
+    }
+
+    if (parts[2] === "defaults") {
+      await updateConfig(i.guildId, structuredClone(RECOMMENDED));
+      return feedback(i, { ok: true, title: "Réglages recommandés appliqués",
+        text: "Automod, anti-raid, anti-nuke, journaux, niveaux et économie sont calibrés pour un serveur de ta taille." });
+    }
+  }
+
+  const section = parts[1];
+  const action = parts[2];
+  const arg = parts[3];
+  const sec = SECTIONS.find((s) => s.id === section);
+  if (sec?.ownerOnly && !isOwner(i.user.id)) return respond(i, lockedView(i.guild, sec));
+  if (level < (sec?.level ?? 6)) {
+    return respond(i, { embeds: [embed({ guild: i.guild, color: COLORS.danger,
+      author: { name: `${ICONS.no}  Accès refusé` }, description: `Cette section demande **${PERM_LABELS[sec?.level ?? 6]}**.` })],
+      components: [backRow()] });
+  }
+
+  /* ------------------------------ MODÉRATION ------------------------------ */
+  if (section === "mod") {
+    if (action === "pick") return showMemberCard(i, i.values[0], config);
+    if (action === "card") return showMemberCard(i, arg, config);
+
+    if (action === "purge") return i.showModal(modal("pm:mod:purge", "Purger le salon",
+      [{ id: "amount", label: "Nombre de messages (1-100)", required: true, max: 3 },
+       { id: "user", label: "Limiter à un identifiant (optionnel)", max: 25 }]));
+
+    if (action === "unban") return i.showModal(modal("pm:mod:unban", "Débannir",
+      [{ id: "userid", label: "Identifiant de l'utilisateur", required: true, max: 25 }, REASON]));
+
+    if (action === "lock") {
+      const locked = i.channel.permissionOverwrites.cache.get(i.guild.id)?.deny.has(PermissionFlagsBits.SendMessages);
+      await i.channel.permissionOverwrites.edit(i.guild.roles.everyone, { SendMessages: locked ? null : false });
+      return feedback(i, { ok: true, title: locked ? "Salon déverrouillé" : "Salon verrouillé",
+        text: `${i.channel} — ${locked ? "les membres peuvent réécrire" : "plus personne ne peut écrire"}.`,
+        color: locked ? COLORS.success : COLORS.danger }, "mod");
+    }
+
+    const target = await i.guild.members.fetch(arg).catch(() => null);
+    if (["warn", "timeout", "kick", "ban", "jail", "free", "untimeout", "coins", "clear"].includes(action)) {
+      if (!target) return feedback(i, { ok: false, title: "Introuvable", text: "Ce membre a quitté le serveur.", color: COLORS.danger }, "mod");
+      const problem = checkTarget(i.guild, i.member, target, config);
+      if (problem && !["free", "untimeout"].includes(action))
+        return feedback(i, { ok: false, title: "Action refusée", text: problem, color: COLORS.danger }, "mod");
+    }
+
+    const gate = { warn: 1, timeout: 2, untimeout: 2, kick: 2, ban: 3, jail: 2, free: 2, clear: 4, coins: 4, hist: 1 };
+    if (level < (gate[action] ?? 6))
+      return feedback(i, { ok: false, title: "Niveau insuffisant", text: `Cette action demande **${PERM_LABELS[gate[action]]}**.`, color: COLORS.danger }, "mod");
+
+    if (action === "warn") return i.showModal(modal(`pm:mod:warn:${arg}`, "Avertir", [REASON]));
+    if (action === "timeout") return i.showModal(modal(`pm:mod:timeout:${arg}`, "Réduire au silence",
+      [{ ...DURATION, required: true, placeholder: "10m" }, REASON]));
+    if (action === "kick") return i.showModal(modal(`pm:mod:kick:${arg}`, "Expulser", [REASON]));
+    if (action === "ban") return i.showModal(modal(`pm:mod:ban:${arg}`, "Bannir",
+      [REASON, { id: "purge", label: "Purger ses messages (0-7 jours)", placeholder: "0", max: 1 }]));
+    if (action === "jail") return i.showModal(modal(`pm:mod:jail:${arg}`, "Envoyer en Alcatraz", [REASON, DURATION]));
+    if (action === "coins") return i.showModal(modal(`pm:mod:coins:${arg}`, "Ajuster les coins",
+      [{ id: "amount", label: "Montant (négatif pour retirer)", required: true, max: 10 }, { id: "reason", label: "Raison", max: 200 }]));
+
+    if (action === "untimeout") return feedback(i, await actionUntimeout(i.guild, target, i.user), "mod");
+    if (action === "free") return feedback(i, await actionFree(i.guild, target, i.user), "mod");
+    if (action === "clear") return feedback(i, await actionClearSanctions(i.guild, target), "mod");
+    if (action === "hist") {
+      const h = await actionHistory(i.guild, await i.guild.members.fetch(arg).catch(() => null) ?? { id: arg, user: { tag: arg } });
+      return respond(i, { embeds: [embed({ guild: i.guild, color: h.color, author: { name: `📋  ${h.title}` }, description: h.text })],
+        components: [new ActionRowBuilder().addComponents(btn(`p:mod:card:${arg}`, "Retour à la fiche", ButtonStyle.Secondary, "◀️"))] });
+    }
+  }
+
+  /* ---------------------------- CONFIGURATION ----------------------------- */
+  if (section === "config") {
+    if (action === "staff") { await updateConfig(i.guildId, { staffRoleId: i.values[0] }); return feedback(i, { ok: true, title: "Rôle staff défini", text: `<@&${i.values[0]}> a désormais accès aux tickets.` }, "config"); }
+    if (action === "jail") { await updateConfig(i.guildId, { jailRoleId: i.values[0] }); return feedback(i, { ok: true, title: "Rôle Alcatraz défini", text: `<@&${i.values[0]}> sera le rôle de prison.` }, "config"); }
+    if (action === "autorole") {
+      const role = i.guild.roles.cache.get(i.values[0]);
+      if (role.position >= i.guild.members.me.roles.highest.position)
+        return feedback(i, { ok: false, title: "Rôle trop haut", text: "Ce rôle est au-dessus du mien, je ne pourrai pas l'attribuer.", color: COLORS.danger }, "config");
+      await updateConfig(i.guildId, { autoroleId: role.id });
+      return feedback(i, { ok: true, title: "Autorole défini", text: `${role} sera donné à chaque arrivée.` }, "config");
+    }
+    if (action === "welcome") { await updateConfig(i.guildId, { welcomeChannelId: i.values[0] }); return feedback(i, { ok: true, title: "Salon d'accueil défini", text: `<#${i.values[0]}>` }, "config"); }
+    if (action === "msg") return i.showModal(modal("pm:config:msg", "Message d'accueil",
+      [{ id: "text", label: "Variables : {user} {tag} {server} {count}", required: true, long: true, value: config.welcomeMessage, max: 500 }]));
+  }
+
+  /* -------------------------------- AUTOMOD ------------------------------- */
+  if (section === "automod") {
+    if (action === "t") {
+      const v = !config.automod[arg];
+      await updateConfig(i.guildId, { automod: { [arg]: v } });
+      return respond(i, await buildSection("automod", i, await getConfig(i.guildId)));
+    }
+    if (action === "seuils") {
+      const a = config.automod;
+      return i.showModal(modal("pm:automod:seuils", "Seuils de l'automod", [
+        { id: "spam", label: "Flood : messages / secondes", value: `${a.spamThreshold}/${Math.round(a.spamWindowMs / 1000)}`, max: 8 },
+        { id: "mentions", label: "Mentions max (0 = illimité)", value: `${a.maxMentions}`, max: 3 },
+        { id: "caps", label: "Majuscules % (0 = coupé)", value: `${a.capsPercent}`, max: 3 },
+        { id: "emojis", label: "Émojis max (0 = illimité)", value: `${a.maxEmojis}`, max: 3 },
+      ]));
+    }
+    if (action === "mots") return i.showModal(modal("pm:automod:mots", "Mots interdits",
+      [{ id: "words", label: "Séparés par des virgules", long: true, value: config.automod.bannedWords.join(", "), max: 2000 }]));
+    if (action === "exempt" || action === "ignore") {
+      const key = action === "exempt" ? "exemptRoles" : "ignoredChannels";
+      const list = [...config.automod[key]];
+      const v = i.values[0];
+      const idx = list.indexOf(v);
+      idx === -1 ? list.push(v) : list.splice(idx, 1);
+      await updateConfig(i.guildId, { automod: { [key]: list } });
+      return respond(i, await buildSection("automod", i, await getConfig(i.guildId)));
+    }
+  }
+
+  /* ------------------------------ PROTECTION ------------------------------ */
+  if (section === "protect") {
+    if (action === "t") {
+      const v = !config[arg].enabled;
+      await updateConfig(i.guildId, { [arg]: { enabled: v } });
+      return respond(i, await buildSection("protect", i, await getConfig(i.guildId)));
+    }
+    if (action === "lock") {
+      const on = arg === "on";
+      await i.deferUpdate();
+      const n = await lockAllChannels(i.guild, on, `Panneau — ${i.user.tag}`);
+      on ? setLockdown(i.guildId, 60) : clearLockdown(i.guildId);
+      await log(i.guild, "raid", embed({ guild: i.guild, color: on ? COLORS.danger : COLORS.success,
+        author: { name: on ? "🔒  Lockdown activé" : "🔓  Lockdown levé" },
+        fields: [{ name: "Par", value: i.user.tag, inline: true }, { name: "Salons", value: `${n}`, inline: true }] }));
+      return feedback(i, { ok: true, title: on ? "Serveur verrouillé" : "Serveur déverrouillé", text: `${n} salon(s) traité(s).`,
+        color: on ? COLORS.danger : COLORS.success }, "protect");
+    }
+    if (action === "raidcfg") {
+      const ar = config.antiraid;
+      return i.showModal(modal("pm:protect:raid", "Réglages anti-raid", [
+        { id: "threshold", label: "Arrivées déclenchant l'alerte", value: `${ar.joinThreshold}`, max: 3 },
+        { id: "window", label: "Fenêtre (secondes)", value: `${Math.round(ar.joinWindowMs / 1000)}`, max: 4 },
+        { id: "age", label: "Âge minimum du compte (jours, 0=off)", value: `${ar.minAccountAgeDays}`, max: 3 },
+        { id: "mode", label: "Réaction : lockdown / kick / off", value: ar.onRaid, max: 10 },
+      ]));
+    }
+    if (action === "nukecfg") {
+      const an = config.antinuke;
+      return i.showModal(modal("pm:protect:nuke", "Réglages anti-nuke", [
+        { id: "chan", label: "Suppressions de salons max", value: `${an.channelDeleteMax}`, max: 3 },
+        { id: "role", label: "Suppressions de rôles max", value: `${an.roleDeleteMax}`, max: 3 },
+        { id: "ban", label: "Bannissements max", value: `${an.banMax}`, max: 3 },
+        { id: "window", label: "Fenêtre (secondes)", value: `${Math.round(an.windowMs / 1000)}`, max: 4 },
+        { id: "mode", label: "Sanction : strip / ban / alert", value: an.punishment, max: 10 },
+      ]));
+    }
+    if (action === "wl") {
+      const list = [...config.antinuke.whitelist];
+      const v = i.values[0];
+      const idx = list.indexOf(v);
+      idx === -1 ? list.push(v) : list.splice(idx, 1);
+      await updateConfig(i.guildId, { antinuke: { whitelist: list } });
+      return feedback(i, { ok: true, title: idx === -1 ? "Ajouté à la liste blanche" : "Retiré de la liste blanche",
+        text: `<@${v}> ${idx === -1 ? "ne déclenchera plus" : "déclenchera de nouveau"} l'anti-nuke.` }, "protect");
+    }
+  }
+
+  /* ------------------------------ PERMISSIONS ----------------------------- */
+  if (section === "perms") {
+    if (action === "auto") {
+      const found = autoDetectRoles(i.guild);
+      if (!found.length) return feedback(i, { ok: false, title: "Rien détecté",
+        text: "Aucun nom de rôle reconnu. Classe-les à la main avec le menu Rôle ci-dessous.", color: COLORS.warning }, "perms");
+      const roles = { ...config.perms.roles };
+      for (const f of found) roles[f.role.id] = f.level;
+      await updateConfig(i.guildId, { perms: { roles } });
+      return feedback(i, { ok: true, title: `${found.length} rôle(s) classés`,
+        text: found.map((f) => `\`${f.level}\` ${f.role}`).join("\n") }, "perms");
+    }
+    if (action === "reset") { await updateConfig(i.guildId, { perms: { roles: {}, users: {}, commands: {} } }); return feedback(i, { ok: true, title: "Perms réinitialisées", text: "Tout est remis à zéro." }, "perms"); }
+    if (action === "cmds") {
+      const byLevel = {};
+      for (const s of SECTIONS) (byLevel[s.level] ??= []).push(`${s.emoji} ${s.label}`);
+      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: "📋  Niveau requis par section" },
+        fields: [6, 5, 4, 3, 2, 1].filter((l) => byLevel[l]).map((l) => ({ name: PERM_LABELS[l], value: byLevel[l].join("\n") })),
+        footer: "Dans Modération : avertir 1 · timeout/kick/alcatraz 2 · bannir 3 · casier 4" })],
+        components: [new ActionRowBuilder().addComponents(btn("p:perms", "Retour", ButtonStyle.Secondary, "◀️"))] });
+    }
+    if (action === "role" || action === "user") {
+      const targetId = i.values[0];
+      if (action === "user" && isOwner(targetId))
+        return feedback(i, { ok: false, title: "Impossible", text: `<@${OWNER_ID}> est propriétaire de 0x : son niveau ne se modifie pas.`, color: COLORS.danger }, "perms");
+      const kind = action;
+      const menu = new StringSelectMenuBuilder().setCustomId(`p:perms:lvl:${kind}_${targetId}`)
+        .setPlaceholder("Choisis le niveau…")
+        .addOptions([0, 1, 2, 3, 4, 5, 6].map((l) => ({ label: PERM_LABELS[l], value: String(l) })));
+      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: `${ICONS.shield}  Niveau à attribuer` },
+        description: kind === "role" ? `Rôle : <@&${targetId}>` : `Membre : <@${targetId}>`,
+        footer: "Niveau 0 = retirer du système" })],
+        components: [new ActionRowBuilder().addComponents(menu), new ActionRowBuilder().addComponents(btn("p:perms", "Annuler", ButtonStyle.Secondary, "◀️"))] });
+    }
+    if (action === "lvl") {
+      const [kind, targetId] = arg.split("_");
+      const lvl = Number(i.values[0]);
+      if (kind === "role") {
+        const roles = { ...config.perms.roles };
+        if (lvl === 0) delete roles[targetId]; else roles[targetId] = lvl;
+        await updateConfig(i.guildId, { perms: { roles } });
+        return feedback(i, { ok: true, title: "Niveau attribué", text: `<@&${targetId}> → **${PERM_LABELS[lvl]}**` }, "perms");
+      }
+      const users = { ...config.perms.users };
+      if (lvl === 0) delete users[targetId]; else users[targetId] = lvl;
+      await updateConfig(i.guildId, { perms: { users } });
+      return feedback(i, { ok: true, title: "Forçage appliqué", text: `<@${targetId}> → **${PERM_LABELS[lvl]}**` }, "perms");
+    }
+  }
+
+  /* -------------------------------- TICKETS ------------------------------- */
+  if (section === "tickets") {
+    if (action === "publish") {
+      const ch = i.guild.channels.cache.get(i.values[0]);
+      if (!canSend(ch)) return feedback(i, { ok: false, title: "Salon inaccessible", text: `Je ne peux pas écrire dans ${ch}.`, color: COLORS.danger }, "tickets");
+      await ch.send({ embeds: [embed({ guild: i.guild, author: { name: `${ICONS.ticket}  Centre d'aide` }, color: COLORS.primary,
+        description: "Choisis le type de ticket dans le menu. Un salon privé sera créé avec le staff concerné.\n\nLes ouvertures abusives sont sanctionnées." })],
+        components: ticketPanelComponents() });
+      return feedback(i, { ok: true, title: "Panneau publié", text: `Le menu de tickets est en ligne dans ${ch}.` }, "tickets");
+    }
+    if (action === "refresh") { await refreshTicketCounter(i.guild); return feedback(i, { ok: true, title: "Compteur actualisé", text: "Le salon compteur-tickets est à jour." }, "tickets"); }
+  }
+
+  /* ------------------------------- COMPTEURS ------------------------------ */
+  if (section === "counters") {
+    if (action === "set") { await updateConfig(i.guildId, { counters: { ...config.counters, [arg]: i.values[0] } }); return feedback(i, { ok: true, title: "Compteur rattaché", text: `**${arg}** → <#${i.values[0]}>` }, "counters"); }
+    if (action === "force") { await i.deferUpdate(); await updateCounters(i.guild, true); return respond(i, await buildSection("counters", i, config)); }
+  }
+
+  /* -------------------------------- NIVEAUX ------------------------------- */
+  if (section === "levels") {
+    if (action === "t") { await updateConfig(i.guildId, { levelsEnabled: !config.levelsEnabled }); return respond(i, await buildSection("levels", i, await getConfig(i.guildId))); }
+    if (action === "channel") { await updateConfig(i.guildId, { funcOverrides: { ...config.funcOverrides, levelUp: i.values[0] } }); return feedback(i, { ok: true, title: "Salon défini", text: `Les montées de niveau seront annoncées dans <#${i.values[0]}>.` }, "levels"); }
+    if (action === "reward") return i.showModal(modal(`pm:levels:reward:${i.values[0]}`, "Récompense de niveau",
+      [{ id: "level", label: "À quel niveau donner ce rôle ?", required: true, placeholder: "10", max: 3 }]));
+  }
+
+  /* -------------------------------- ÉCONOMIE ------------------------------ */
+  if (section === "eco") {
+    if (action === "t") { await updateConfig(i.guildId, { economy: { enabled: !config.economy.enabled } }); return respond(i, await buildSection("eco", i, await getConfig(i.guildId))); }
+    if (action === "montants") {
+      const e = config.economy;
+      return i.showModal(modal("pm:eco:montants", "Montants de l'économie", [
+        { id: "currency", label: "Symbole de la monnaie", value: e.currency, max: 8 },
+        { id: "daily", label: "Récompense quotidienne", value: `${e.dailyAmount}`, max: 8 },
+        { id: "work", label: "Travail : min-max", value: `${e.workMin}-${e.workMax}`, max: 16 },
+        { id: "drop", label: "Colis : min-max", value: `${e.dropMin}-${e.dropMax}`, max: 16 },
+        { id: "chance", label: "Chance de colis par message (%)", value: `${e.dropChance}`, max: 3 },
+      ]));
+    }
+    if (action === "additem") return i.showModal(modal(`pm:eco:additem:${i.values[0]}`, "Nouvel article", [
+      { id: "name", label: "Nom de l'article", required: true, max: 60 },
+      { id: "price", label: "Prix en coins", required: true, max: 10 },
+      { id: "stock", label: "Stock (vide = illimité)", max: 6 },
+    ]));
+    if (action === "del") {
+      const shop = config.economy.shop.filter((x) => x.id !== i.values[0]);
+      await updateConfig(i.guildId, { economy: { shop } });
+      return feedback(i, { ok: true, title: "Article retiré", text: "La boutique a été mise à jour." }, "eco");
+    }
+    if (action === "dropch") { await updateConfig(i.guildId, { economy: { dropChannelId: i.values[0] } }); return feedback(i, { ok: true, title: "Salon des colis", text: `Les colis tomberont dans <#${i.values[0]}>.` }, "eco"); }
+    if (action === "drop") {
+      const e = config.economy;
+      const ch = e.dropChannelId ? i.guild.channels.cache.get(e.dropChannelId) : resolveFuncChannel(i.guild, "drops", config) ?? i.channel;
+      const amount = e.dropMin + Math.floor(Math.random() * (e.dropMax - e.dropMin + 1));
+      const msg = await launchDrop(i.guild, ch, amount);
+      return feedback(i, msg ? { ok: true, title: "Colis lâché", text: `${num(amount)} coins à récupérer dans ${ch}.`, color: COLORS.gold }
+        : { ok: false, title: "Échec", text: `Impossible d'écrire dans ${ch}.`, color: COLORS.danger }, "eco");
+    }
+  }
+
+  /* ------------------------------- GIVEAWAYS ------------------------------ */
+  if (section === "gw") {
+    if (action === "new") return i.showModal(modal("pm:gw:new", "Nouveau giveaway", [
+      { id: "prize", label: "Ce qui est à gagner", required: true, max: 200 },
+      { id: "duration", label: "Durée (30m, 6h, 2d)", required: true, max: 10 },
+      { id: "winners", label: "Nombre de gagnants", value: "1", max: 2 },
+    ]));
+    if (action === "pick") {
+      const gid = i.values[0];
+      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: `${ICONS.gift}  Giveaway #${gid}` },
+        description: "Que veux-tu faire ?" })],
+        components: [new ActionRowBuilder().addComponents(
+          btn(`p:gw:end:${gid}`, "Terminer maintenant", ButtonStyle.Danger, "🏁"),
+          btn(`p:gw:reroll:${gid}`, "Retirer au sort", ButtonStyle.Primary, "🎲"),
+          btn("p:gw", "Retour", ButtonStyle.Secondary, "◀️"))] });
+    }
+    if (action === "end" || action === "reroll") {
+      const g = await getGiveaway(Number(arg));
+      if (!g) return feedback(i, { ok: false, title: "Introuvable", text: "Ce giveaway n'existe plus.", color: COLORS.danger }, "gw");
+      await i.deferUpdate();
+      const w = await drawGiveaway(i.client, g, action === "reroll" ? 1 : null);
+      return feedback(i, { ok: true, title: action === "reroll" ? "Nouveau tirage" : "Giveaway terminé",
+        text: w.length ? `Gagnant(s) : ${w.map((x) => `<@${x}>`).join(", ")}` : "Aucun participant.", color: COLORS.gold }, "gw");
+    }
+  }
+
+  /* ------------------------------ PUBLICATIONS ---------------------------- */
+  if (section === "publish") {
+    if (action === "pick") {
+      const what = arg;
+      const labels = { member: "Panneau membres", ticket: "Panneau tickets", confess: "Panneau confessions" };
+      return respond(i, { embeds: [embed({ guild: i.guild, author: { name: `📢  ${labels[what]}` },
+        description: "Dans quel salon veux-tu le publier ?" })],
+        components: [
+          new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId(`p:publish:go:${what}`)
+            .setChannelTypes(ChannelType.GuildText).setPlaceholder("Choisis le salon…")),
+          new ActionRowBuilder().addComponents(btn("p:publish", "Annuler", ButtonStyle.Secondary, "◀️")),
+        ] });
+    }
+    if (action === "go") {
+      const ch = i.guild.channels.cache.get(i.values[0]);
+      if (!canSend(ch)) return feedback(i, { ok: false, title: "Salon inaccessible", text: `Je ne peux pas écrire dans ${ch}.`, color: COLORS.danger }, "publish");
+      if (arg === "member") await ch.send(memberPanel(i.guild));
+      else if (arg === "confess") await ch.send(confessionPanel(i.guild));
+      else await ch.send({ embeds: [embed({ guild: i.guild, author: { name: `${ICONS.ticket}  Centre d'aide` },
+        description: "Choisis le type de ticket dans le menu ci-dessous." })], components: ticketPanelComponents() });
+      return feedback(i, { ok: true, title: "Publié", text: `Le panneau est en ligne dans ${ch}.` }, "publish");
+    }
+    if (action === "roles") return i.showModal(modal("pm:publish:roles", "Menu de rôles", [
+      { id: "title", label: "Titre du menu", required: true, max: 100 },
+      { id: "roles", label: "Rôles : mentions ou IDs séparés par ,", required: true, long: true, max: 500 },
+    ]));
+    if (action === "say") return i.showModal(modal("pm:publish:say", "Annonce",
+      [{ id: "text", label: "Texte de l'annonce", required: true, long: true, max: 3000 },
+       { id: "title", label: "Titre (vide = message simple)", max: 100 }]));
+    if (action === "poll") return i.showModal(modal("pm:publish:poll", "Sondage",
+      [{ id: "question", label: "Question", required: true, max: 200 },
+       { id: "options", label: "Choix séparés par des virgules", required: true, long: true, max: 500 }]));
+  }
+
+  return respond(i, await buildSection(section, i, config));
+}
+
+/* ========================================================================== */
+/*                            FICHE D'UN MEMBRE                               */
+/* ========================================================================== */
+
+async function showMemberCard(i, userId, config) {
+  const member = await i.guild.members.fetch(userId).catch(() => null);
+  if (!member) return feedback(i, { ok: false, title: "Introuvable", text: "Ce membre n'est pas sur le serveur.", color: COLORS.danger }, "mod");
+
+  const warns = await countSanctions(i.guild.id, userId, "warn");
+  const all = await countSanctions(i.guild.id, userId);
+  const lvl = await getUserLevel(i.guild.id, userId);
+  const wallet = await getWallet(i.guild.id, userId);
+  const targetLevel = permLevel(member, config);
+  const muted = member.communicationDisabledUntil && member.communicationDisabledUntil > new Date();
+
+  const card = embed({
+    guild: i.guild,
+    author: { name: `${ICONS.shield}  ${member.user.tag}` },
+    color: muted ? COLORS.warning : COLORS.primary,
+    description: `\`${member.id}\` · **${PERM_LABELS[targetLevel]}**${muted ? `\n${ICONS.timeout} Muet jusqu'à ${ts(member.communicationDisabledUntil)}` : ""}`,
+    fields: [
+      { name: "Avertissements", value: `${warns}`, inline: true },
+      { name: "Sanctions totales", value: `${all}`, inline: true },
+      { name: "Compte créé", value: ts(member.user.createdAt), inline: true },
+      { name: "A rejoint", value: member.joinedAt ? ts(member.joinedAt) : "—", inline: true },
+      { name: "Niveau", value: `${lvl.level} · ${num(lvl.xp)} XP`, inline: true },
+      { name: "Coins", value: num(wallet.coins), inline: true },
+      { name: "Rôles", value: member.roles.cache.filter((r) => r.id !== i.guild.id).sort((a, b) => b.position - a.position).map((r) => r.toString()).slice(0, 10).join(" ") || "_aucun_" },
+    ],
+  }).setThumbnail(member.user.displayAvatarURL({ size: 256 }));
+
+  return respond(i, {
+    embeds: [card],
+    components: [
+      new ActionRowBuilder().addComponents(
+        btn(`p:mod:warn:${userId}`, "Avertir", ButtonStyle.Secondary, "⚠️"),
+        btn(`p:mod:timeout:${userId}`, "Timeout", ButtonStyle.Secondary, "🔇"),
+        btn(`p:mod:untimeout:${userId}`, "Rendre la parole", ButtonStyle.Secondary, "🔊"),
+        btn(`p:mod:kick:${userId}`, "Expulser", ButtonStyle.Danger, "👢"),
+        btn(`p:mod:ban:${userId}`, "Bannir", ButtonStyle.Danger, "⛔"),
+      ),
+      new ActionRowBuilder().addComponents(
+        btn(`p:mod:jail:${userId}`, "Alcatraz", ButtonStyle.Danger, "🤚"),
+        btn(`p:mod:free:${userId}`, "Libérer", ButtonStyle.Success, "🕊️"),
+        btn(`p:mod:hist:${userId}`, "Casier", ButtonStyle.Primary, "📋"),
+        btn(`p:mod:clear:${userId}`, "Effacer casier", ButtonStyle.Secondary, "🧽"),
+        btn(`p:mod:coins:${userId}`, "Coins", ButtonStyle.Secondary, "🪙"),
+      ),
+      new ActionRowBuilder().addComponents(
+        btn("p:mod", "Autre membre", ButtonStyle.Secondary, "🔁"),
+        btn("p:home", "Accueil", ButtonStyle.Secondary, "🏠"),
+      ),
+    ],
+  });
+}
+
+/* ========================================================================== */
+/*                          TRAITEMENT DES MODALES                            */
+/* ========================================================================== */
+
+async function handleModal(i, parts, config, level) {
+  const [, section, action, arg] = parts;
+  const sec = SECTIONS.find((s) => s.id === section);
+  if (sec?.ownerOnly && !isOwner(i.user.id)) return respond(i, lockedView(i.guild, sec));
+  const f = (id) => i.fields.getTextInputValue(id)?.trim() ?? "";
+
+  if (section === "mod") {
+    if (action === "purge") {
+      const amount = Math.min(100, Math.max(1, parseInt(f("amount"), 10) || 0));
+      const uid = f("user").replace(/\D/g, "") || null;
+      return feedback(i, await actionPurge(i.channel, amount, uid, i.user), "mod");
+    }
+    if (action === "unban") return feedback(i, await actionUnban(i.guild, f("userid").replace(/\D/g, ""), i.user, f("reason") || "Non précisée"), "mod");
+
+    const target = await i.guild.members.fetch(arg).catch(() => null);
+    if (!target) return feedback(i, { ok: false, title: "Introuvable", text: "Ce membre a quitté le serveur.", color: COLORS.danger }, "mod");
+    const reason = f("reason") || "Non précisée";
+
+    if (action === "warn") return feedback(i, await actionWarn(i.guild, target, i.user, reason), "mod");
+    if (action === "timeout") return feedback(i, await actionTimeout(i.guild, target, i.user, parseDuration(f("duration")), reason), "mod");
+    if (action === "kick") return feedback(i, await actionKick(i.guild, target, i.user, reason), "mod");
+    if (action === "ban") return feedback(i, await actionBan(i.guild, target, i.user, reason, Math.min(7, Math.max(0, parseInt(f("purge"), 10) || 0))), "mod");
+    if (action === "jail") return feedback(i, await actionJail(i.guild, target, i.user, reason, parseDuration(f("duration"))), "mod");
+    if (action === "coins") {
+      const amount = parseInt(f("amount"), 10);
+      if (!Number.isFinite(amount)) return feedback(i, { ok: false, title: "Montant invalide", text: "Entre un nombre entier.", color: COLORS.danger }, "mod");
+      return feedback(i, await actionGrantCoins(i.guild, target, amount, i.user, f("reason")), "mod");
+    }
+  }
+
+  if (section === "config" && action === "msg") {
+    await updateConfig(i.guildId, { welcomeMessage: f("text") });
+    return feedback(i, { ok: true, title: "Message d'accueil enregistré", text: f("text") }, "config");
+  }
+
+  if (section === "automod") {
+    if (action === "seuils") {
+      const [thr, win] = f("spam").split("/").map((x) => parseInt(x, 10));
+      const patch = {};
+      if (Number.isFinite(thr) && thr >= 3) patch.spamThreshold = Math.min(30, thr);
+      if (Number.isFinite(win) && win >= 3) patch.spamWindowMs = Math.min(120, win) * 1000;
+      const m = parseInt(f("mentions"), 10); if (Number.isFinite(m)) patch.maxMentions = Math.min(30, Math.max(0, m));
+      const c = parseInt(f("caps"), 10); if (Number.isFinite(c)) patch.capsPercent = Math.min(100, Math.max(0, c));
+      const e = parseInt(f("emojis"), 10); if (Number.isFinite(e)) patch.maxEmojis = Math.min(50, Math.max(0, e));
+      await updateConfig(i.guildId, { automod: patch });
+      return feedback(i, { ok: true, title: "Seuils enregistrés", text: "L'automod applique déjà les nouvelles valeurs." }, "automod");
+    }
+    if (action === "mots") {
+      const words = f("words").split(",").map((w) => w.trim().toLowerCase()).filter(Boolean);
+      await updateConfig(i.guildId, { automod: { bannedWords: [...new Set(words)] } });
+      return feedback(i, { ok: true, title: "Liste enregistrée", text: `${words.length} mot(s) interdit(s).` }, "automod");
+    }
+  }
+
+  if (section === "protect") {
+    if (action === "raid") {
+      const patch = {};
+      const t = parseInt(f("threshold"), 10); if (Number.isFinite(t)) patch.joinThreshold = Math.max(3, Math.min(50, t));
+      const w = parseInt(f("window"), 10); if (Number.isFinite(w)) patch.joinWindowMs = Math.max(5, Math.min(120, w)) * 1000;
+      const a = parseInt(f("age"), 10); if (Number.isFinite(a)) patch.minAccountAgeDays = Math.max(0, Math.min(90, a));
+      const m = f("mode").toLowerCase(); if (["lockdown", "kick", "off"].includes(m)) patch.onRaid = m;
+      await updateConfig(i.guildId, { antiraid: patch });
+      return feedback(i, { ok: true, title: "Anti-raid enregistré", text: "Les nouveaux seuils sont actifs." }, "protect");
+    }
+    if (action === "nuke") {
+      const patch = {};
+      const c = parseInt(f("chan"), 10); if (Number.isFinite(c)) patch.channelDeleteMax = Math.max(1, Math.min(20, c));
+      const r = parseInt(f("role"), 10); if (Number.isFinite(r)) patch.roleDeleteMax = Math.max(1, Math.min(20, r));
+      const b = parseInt(f("ban"), 10); if (Number.isFinite(b)) patch.banMax = Math.max(1, Math.min(30, b));
+      const w = parseInt(f("window"), 10); if (Number.isFinite(w)) patch.windowMs = Math.max(5, Math.min(120, w)) * 1000;
+      const m = f("mode").toLowerCase(); if (["strip", "ban", "alert"].includes(m)) patch.punishment = m;
+      await updateConfig(i.guildId, { antinuke: patch });
+      return feedback(i, { ok: true, title: "Anti-nuke enregistré", text: "Les nouveaux seuils sont actifs." }, "protect");
+    }
+  }
+
+  if (section === "levels" && action === "reward") {
+    const lvl = parseInt(f("level"), 10);
+    if (!Number.isFinite(lvl) || lvl < 1) return feedback(i, { ok: false, title: "Niveau invalide", text: "Entre un nombre supérieur à 0.", color: COLORS.danger }, "levels");
+    await updateConfig(i.guildId, { levelRewards: { ...config.levelRewards, [lvl]: arg } });
+    return feedback(i, { ok: true, title: "Récompense enregistrée", text: `<@&${arg}> sera donné au niveau **${lvl}**.` }, "levels");
+  }
+
+  if (section === "eco") {
+    if (action === "montants") {
+      const patch = {};
+      const cur = f("currency"); if (cur) patch.currency = cur.slice(0, 8);
+      const d = parseInt(f("daily"), 10); if (Number.isFinite(d)) patch.dailyAmount = Math.max(0, d);
+      const [wmin, wmax] = f("work").split("-").map((x) => parseInt(x, 10));
+      if (Number.isFinite(wmin) && Number.isFinite(wmax) && wmin <= wmax) { patch.workMin = wmin; patch.workMax = wmax; }
+      const [dmin, dmax] = f("drop").split("-").map((x) => parseInt(x, 10));
+      if (Number.isFinite(dmin) && Number.isFinite(dmax) && dmin <= dmax) { patch.dropMin = dmin; patch.dropMax = dmax; }
+      const ch = parseInt(f("chance"), 10); if (Number.isFinite(ch)) patch.dropChance = Math.max(0, Math.min(100, ch));
+      await updateConfig(i.guildId, { economy: patch });
+      return feedback(i, { ok: true, title: "Montants enregistrés", text: "L'économie utilise déjà les nouvelles valeurs.", color: COLORS.gold }, "eco");
+    }
+    if (action === "additem") {
+      const name = f("name");
+      const price = parseInt(f("price"), 10);
+      if (!name || !Number.isFinite(price) || price < 1) return feedback(i, { ok: false, title: "Article invalide", text: "Il faut un nom et un prix positif.", color: COLORS.danger }, "eco");
+      const role = i.guild.roles.cache.get(arg);
+      if (!role || role.position >= i.guild.members.me.roles.highest.position)
+        return feedback(i, { ok: false, title: "Rôle inutilisable", text: "Ce rôle est au-dessus du mien ou n'existe plus.", color: COLORS.danger }, "eco");
+      const stockRaw = parseInt(f("stock"), 10);
+      const item = { id: name.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40) || `a${Date.now()}`, name, price, roleId: arg, stock: Number.isFinite(stockRaw) ? stockRaw : null };
+      await updateConfig(i.guildId, { economy: { shop: [...config.economy.shop, item] } });
+      return feedback(i, { ok: true, title: "Article ajouté", text: `**${name}** — ${num(price)} coins → ${role}`, color: COLORS.gold }, "eco");
+    }
+  }
+
+  if (section === "gw" && action === "new") {
+    const ms = parseDuration(f("duration"));
+    if (!ms || ms < 60_000) return feedback(i, { ok: false, title: "Durée invalide", text: "Minimum 1 minute. Exemples : `30m`, `6h`, `2d`.", color: COLORS.danger }, "gw");
+    const winners = Math.max(1, Math.min(20, parseInt(f("winners"), 10) || 1));
+    const gid = await createGiveaway({ guildId: i.guildId, channelId: i.channelId, prize: f("prize"), winners,
+      hostId: i.user.id, requiredRole: null, endsAt: new Date(Date.now() + ms) });
+    await postGiveaway(i.client, gid, i.channel);
+    return feedback(i, { ok: true, title: "Giveaway lancé", text: `\`#${gid}\` **${f("prize")}** — ${winners} gagnant(s), fin dans ${formatDuration(ms)}.`, color: COLORS.gold }, "gw");
+  }
+
+  if (section === "publish") {
+    if (action === "roles") {
+      const ids = f("roles").match(/\d{15,25}/g) ?? [];
+      const roles = ids.map((id) => i.guild.roles.cache.get(id)).filter(Boolean).slice(0, 20);
+      if (!roles.length) return feedback(i, { ok: false, title: "Aucun rôle valide", text: "Mentionne les rôles ou colle leurs identifiants, séparés par des virgules.", color: COLORS.danger }, "publish");
+      const top = i.guild.members.me.roles.highest.position;
+      const bad = roles.filter((r) => r.position >= top || r.managed);
+      if (bad.length) return feedback(i, { ok: false, title: "Rôles inutilisables", text: `Je ne peux pas gérer ${bad.join(", ")}.`, color: COLORS.danger }, "publish");
+      const menu = new StringSelectMenuBuilder().setCustomId("rolemenu").setPlaceholder("Choisis tes rôles")
+        .setMinValues(0).setMaxValues(roles.length)
+        .addOptions(roles.map((r) => ({ label: r.name.slice(0, 100), value: r.id })));
+      await i.channel.send({ embeds: [embed({ guild: i.guild, author: { name: `🎭  ${f("title")}` },
+        description: "Sélectionne les rôles que tu veux. Désélectionne pour les retirer." })],
+        components: [new ActionRowBuilder().addComponents(menu)] });
+      return feedback(i, { ok: true, title: "Menu publié", text: `${roles.length} rôle(s) proposés dans ${i.channel}.` }, "publish");
+    }
+    if (action === "say") {
+      const title = f("title");
+      const text = f("text").replaceAll("\\n", "\n");
+      await i.channel.send(title
+        ? { embeds: [embed({ guild: i.guild, author: { name: `📣  ${title}` }, description: text })] }
+        : { content: text });
+      return feedback(i, { ok: true, title: "Annonce publiée", text: `Envoyée dans ${i.channel}.` }, "publish");
+    }
+    if (action === "poll") {
+      const POLL = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"];
+      const opts = f("options").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 10);
+      if (opts.length < 2) return feedback(i, { ok: false, title: "Sondage invalide", text: "Il faut au moins 2 choix séparés par des virgules.", color: COLORS.danger }, "publish");
+      const msg = await i.channel.send({ embeds: [embed({ guild: i.guild, author: { name: `📊  ${f("question")}` },
+        description: opts.map((o, n) => `${POLL[n]} ${o}`).join("\n\n"), footer: `Lancé par ${i.user.tag}` })] });
+      for (let n = 0; n < opts.length; n++) await msg.react(POLL[n]).catch(() => null);
+      return feedback(i, { ok: true, title: "Sondage publié", text: `${opts.length} choix dans ${i.channel}.` }, "publish");
+    }
+  }
+
+  if (section === "pub") {
+    if (action === "confess") return postConfession(i, f("text"));
+    if (action === "pay") {
+      const uid = f("user").replace(/\D/g, "");
+      const amount = parseInt(f("amount"), 10);
+      const to = await i.client.users.fetch(uid).catch(() => null);
+      if (!to) return i.reply({ content: "Membre introuvable. Colle son identifiant.", ...EPH });
+      if (!Number.isFinite(amount) || amount < 1) return i.reply({ content: "Montant invalide.", ...EPH });
+      const r = await actionPay(i.guild, i.user, to, amount);
+      return i.reply({ embeds: [embed({ guild: i.guild, color: r.color, author: { name: `${r.ok ? ICONS.ok : ICONS.no}  ${r.title}` }, description: r.text })], ...EPH });
+    }
+  }
+
+  return respond(i, await buildSection("home", i, config));
+}
+
+/* ========================================================================== */
+/*                       BOUTONS DES PANNEAUX PUBLICS                         */
+/* ========================================================================== */
+
+async function handlePublic(i, parts, config) {
+  const [, action, arg] = parts;
+  const reply = (payload) => i.reply({ ...payload, ...EPH });
+  const card = (r) => reply({ embeds: [embed({ guild: i.guild, color: r.color,
+    author: { name: `${r.ok === false ? ICONS.no : ICONS.ok}  ${r.title}` }, description: r.text })] });
+
+  if (action === "rank") {
+    const { xp, level, rank } = await getUserLevel(i.guildId, i.user.id);
+    if (!xp) return reply({ content: "Tu n'as pas encore d'XP. Participe au chat." });
+    const cur = xpForLevel(level), next = xpForLevel(level + 1);
+    return reply({ embeds: [embed({ guild: i.guild, author: { name: `${ICONS.level}  Niveau de ${i.user.username}` },
+      description: `## Niveau ${level}\n${bar(xp - cur, next - cur)}\n**${num(xp - cur)} / ${num(next - cur)}** XP vers le niveau ${level + 1}`,
+      fields: [{ name: "XP total", value: num(xp), inline: true }, { name: "Classement", value: rank ? `#${rank}` : "—", inline: true }] })
+      .setThumbnail(i.user.displayAvatarURL({ size: 128 }))] });
+  }
+
+  if (action === "coins") {
+    const w = await getWallet(i.guildId, i.user.id);
+    return reply({ embeds: [embed({ guild: i.guild, color: COLORS.gold, author: { name: `${ICONS.coin}  Ton solde` },
+      description: `## ${config.economy.currency} ${num(w.coins)}`,
+      footer: w.streak ? `Série quotidienne : ${w.streak} jour(s)` : undefined })] });
+  }
+
+  if (action === "daily") return card(await actionDaily(i.guild, i.user));
+  if (action === "work") return card(await actionWork(i.guild, i.user));
+
+  if (action === "top") {
+    const medals = ["🥇", "🥈", "🥉"];
+    if (arg === "coins") {
+      const r = await topCoins(i.guildId, 10);
+      if (!r.length) return reply({ content: "Personne n'a encore de coins." });
+      return reply({ embeds: [embed({ guild: i.guild, color: COLORS.gold, author: { name: "💰  Top coins" },
+        description: r.map((x, n) => `${medals[n] ?? `**${n + 1}.**`} <@${x.userId}> — ${config.economy.currency} **${num(x.coins)}**`).join("\n") })] });
+    }
+    const r = await topLevels(i.guildId, 10);
+    if (!r.length) return reply({ content: "Personne n'a encore d'XP." });
+    return reply({ embeds: [embed({ guild: i.guild, author: { name: "🏆  Top niveaux" },
+      description: r.map((x, n) => `${medals[n] ?? `**${n + 1}.**`} <@${x.userId}> — niveau **${x.level}** · ${num(x.xp)} XP`).join("\n") })] });
+  }
+
+  if (action === "shop") {
+    const shop = config.economy.shop;
+    if (!shop.length) return reply({ content: "La boutique est vide pour le moment." });
+    const w = await getWallet(i.guildId, i.user.id);
+    const menu = new StringSelectMenuBuilder().setCustomId("pub:buy").setPlaceholder("Acheter un article…")
+      .addOptions(shop.slice(0, 25).map((x) => ({ label: x.name.slice(0, 100), value: x.id,
+        description: `${num(x.price)} coins${x.stock != null ? ` · stock ${x.stock}` : ""}`.slice(0, 100) })));
+    return reply({ embeds: [embed({ guild: i.guild, color: COLORS.gold, author: { name: "🛒  Boutique" },
+      description: shop.map((x) => `${w.coins >= x.price ? "🟢" : "🔴"} **${x.name}** — ${config.economy.currency} ${num(x.price)}\n<@&${x.roleId}>`).join("\n\n"),
+      footer: `Ton solde : ${num(w.coins)}` })], components: [new ActionRowBuilder().addComponents(menu)] });
+  }
+
+  if (action === "buy") return card(await actionBuy(i.guild, i.member, i.values[0]));
+
+  if (action === "pay") return i.showModal(modal("pm:pub:pay", "Envoyer des coins",
+    [{ id: "user", label: "Identifiant du destinataire", required: true, max: 25 },
+     { id: "amount", label: "Montant", required: true, max: 10 }]));
+
+  if (action === "confess") return i.showModal(modal("pm:pub:confess", "Confession anonyme",
+    [{ id: "text", label: "Ta confession", required: true, long: true, max: 1500 }]));
+
+  return false;
+}
+
+/* ========================================================================== */
+/*                          9 - LES TROIS COMMANDES                           */
+/* ========================================================================== */
+
+// commands.js — trois commandes seulement. Tout le reste passe par /panel.
+
 
 const commands = [];
 const def = (data, execute) => commands.push({ data, execute });
 
 /* ========================================================================== */
-/*                                MODÉRATION                                  */
+/*                                  /panel                                    */
 /* ========================================================================== */
 
-def(new SlashCommandBuilder().setName("ban").setDescription("Bannit un membre")
-  .addUserOption((o) => o.setName("membre").setDescription("Le membre").setRequired(true))
-  .addStringOption((o) => o.setName("raison").setDescription("Raison"))
-  .addIntegerOption((o) => o.setName("purge").setDescription("Supprimer ses messages des N derniers jours").setMinValue(0).setMaxValue(7))
-  .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers.toString()),
+def(new SlashCommandBuilder()
+  .setName("panel")
+  .setDescription("Ouvre le panneau de contrôle de 0x")
+  .setDefaultMemberPermissions(null),
   async (i) => {
-    const user = i.options.getUser("membre");
-    const reason = i.options.getString("raison") ?? "Non précisée";
-    const days = i.options.getInteger("purge") ?? 0;
-    const member = await i.guild.members.fetch(user.id).catch(() => null);
-    if (member) {
-      const p = hierarchyCheck(i, member);
-      if (p) return i.reply({ content: p, ...EPH });
-      if (!member.bannable) return i.reply({ content: "Je ne peux pas bannir ce membre.", ...EPH });
-      await tryDm(user, i.guild.name, "Bannissement", reason);
-    }
-    await i.guild.bans.create(user.id, { reason: `${i.user.tag} — ${reason}`, deleteMessageSeconds: days * 86400 });
-    await addSanction(i.guild.id, user.id, i.user.id, "ban", reason);
-    await i.reply({ embeds: [embed({ title: "Membre banni", color: COLORS.danger, description: `**${user.tag}** a été banni.`, fields: [{ name: "Raison", value: reason }] })] });
-    await log(i.guild, "ban", embed({ title: "Bannissement", color: COLORS.danger, fields: [
-      { name: "Membre", value: `${user.tag} (\`${user.id}\`)`, inline: true },
-      { name: "Modérateur", value: i.user.tag, inline: true },
-      { name: "Raison", value: reason }] }));
-  });
+    const config = await getConfig(i.guildId);
+    const level = permLevel(i.member, config);
 
-def(new SlashCommandBuilder().setName("unban").setDescription("Révoque un bannissement")
-  .addStringOption((o) => o.setName("identifiant").setDescription("ID de l'utilisateur").setRequired(true))
-  .addStringOption((o) => o.setName("raison").setDescription("Raison"))
-  .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers.toString()),
-  async (i) => {
-    const id = i.options.getString("identifiant").replace(/\D/g, "");
-    const reason = i.options.getString("raison") ?? "Non précisée";
-    const ban = await i.guild.bans.fetch(id).catch(() => null);
-    if (!ban) return i.reply({ content: "Aucun bannissement pour cet identifiant.", ...EPH });
-    await i.guild.bans.remove(id, `${i.user.tag} — ${reason}`);
-    await i.reply({ content: `**${ban.user.tag}** a été débanni.`, ...EPH });
-    await log(i.guild, "ban", embed({ title: "Débannissement", color: COLORS.success, fields: [
-      { name: "Membre", value: `${ban.user.tag} (\`${id}\`)`, inline: true },
-      { name: "Modérateur", value: i.user.tag, inline: true },
-      { name: "Raison", value: reason }] }));
-  });
-
-def(new SlashCommandBuilder().setName("kick").setDescription("Expulse un membre")
-  .addUserOption((o) => o.setName("membre").setDescription("Le membre").setRequired(true))
-  .addStringOption((o) => o.setName("raison").setDescription("Raison"))
-  .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers.toString()),
-  async (i) => {
-    const user = i.options.getUser("membre");
-    const reason = i.options.getString("raison") ?? "Non précisée";
-    const member = await i.guild.members.fetch(user.id).catch(() => null);
-    if (!member) return i.reply({ content: "Ce membre n'est pas sur le serveur.", ...EPH });
-    const p = hierarchyCheck(i, member);
-    if (p) return i.reply({ content: p, ...EPH });
-    if (!member.kickable) return i.reply({ content: "Je ne peux pas expulser ce membre.", ...EPH });
-    await tryDm(user, i.guild.name, "Expulsion", reason);
-    await member.kick(`${i.user.tag} — ${reason}`);
-    await addSanction(i.guild.id, user.id, i.user.id, "kick", reason);
-    await i.reply({ embeds: [embed({ title: "Membre expulsé", color: COLORS.warning, description: `**${user.tag}** a été expulsé.`, fields: [{ name: "Raison", value: reason }] })] });
-    await log(i.guild, "kick", embed({ title: "Expulsion", color: COLORS.warning, fields: [
-      { name: "Membre", value: `${user.tag} (\`${user.id}\`)`, inline: true },
-      { name: "Modérateur", value: i.user.tag, inline: true },
-      { name: "Raison", value: reason }] }));
-  });
-
-def(new SlashCommandBuilder().setName("timeout").setDescription("Réduit un membre au silence")
-  .addUserOption((o) => o.setName("membre").setDescription("Le membre").setRequired(true))
-  .addStringOption((o) => o.setName("duree").setDescription("Ex. 30s, 10m, 2h, 7d (max 28d)").setRequired(true))
-  .addStringOption((o) => o.setName("raison").setDescription("Raison"))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers.toString()),
-  async (i) => {
-    const user = i.options.getUser("membre");
-    const ms = parseDuration(i.options.getString("duree"));
-    const reason = i.options.getString("raison") ?? "Non précisée";
-    if (!ms || ms < 5000 || ms > 28 * 864e5) return i.reply({ content: "Durée invalide. Format : `30s`, `10m`, `2h`, `7d` (max 28d).", ...EPH });
-    const member = await i.guild.members.fetch(user.id).catch(() => null);
-    if (!member) return i.reply({ content: "Ce membre n'est pas sur le serveur.", ...EPH });
-    const p = hierarchyCheck(i, member);
-    if (p) return i.reply({ content: p, ...EPH });
-    if (!member.moderatable) return i.reply({ content: "Je ne peux pas sanctionner ce membre.", ...EPH });
-    await member.timeout(ms, `${i.user.tag} — ${reason}`);
-    await addSanction(i.guild.id, user.id, i.user.id, "timeout", reason, ms);
-    await tryDm(user, i.guild.name, "Réduction au silence", reason, formatDuration(ms));
-    await i.reply({ embeds: [embed({ title: "Membre réduit au silence", color: COLORS.warning, description: `**${user.tag}** est muet pendant ${formatDuration(ms)}.`, fields: [{ name: "Raison", value: reason }] })] });
-    await log(i.guild, "timeout", embed({ title: "Timeout", color: COLORS.warning, fields: [
-      { name: "Membre", value: `${user.tag} (\`${user.id}\`)`, inline: true },
-      { name: "Durée", value: formatDuration(ms), inline: true },
-      { name: "Modérateur", value: i.user.tag, inline: true },
-      { name: "Raison", value: reason }] }));
-  });
-
-def(new SlashCommandBuilder().setName("untimeout").setDescription("Rend la parole à un membre")
-  .addUserOption((o) => o.setName("membre").setDescription("Le membre").setRequired(true))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers.toString()),
-  async (i) => {
-    const user = i.options.getUser("membre");
-    const member = await i.guild.members.fetch(user.id).catch(() => null);
-    if (!member) return i.reply({ content: "Membre introuvable.", ...EPH });
-    await member.timeout(null, i.user.tag);
-    await i.reply({ content: `**${user.tag}** peut de nouveau parler.`, ...EPH });
-    await log(i.guild, "timeout", embed({ title: "Timeout levé", color: COLORS.success, fields: [
-      { name: "Membre", value: user.tag, inline: true }, { name: "Modérateur", value: i.user.tag, inline: true }] }));
-  });
-
-def(new SlashCommandBuilder().setName("warn").setDescription("Avertit un membre")
-  .addUserOption((o) => o.setName("membre").setDescription("Le membre").setRequired(true))
-  .addStringOption((o) => o.setName("raison").setDescription("Raison").setRequired(true))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers.toString()),
-  async (i) => {
-    const user = i.options.getUser("membre");
-    const reason = i.options.getString("raison");
-    const member = await i.guild.members.fetch(user.id).catch(() => null);
-    if (member) { const p = hierarchyCheck(i, member); if (p) return i.reply({ content: p, ...EPH }); }
-    const total = await addSanction(i.guild.id, user.id, i.user.id, "warn", reason);
-    await tryDm(user, i.guild.name, "Avertissement", reason);
-    await i.reply({ embeds: [embed({ title: "Avertissement enregistré", color: COLORS.warning,
-      description: `**${user.tag}** cumule **${total}** avertissement(s).`, fields: [{ name: "Raison", value: reason }] })] });
-    await log(i.guild, "warn", embed({ title: "Avertissement", color: COLORS.warning, fields: [
-      { name: "Membre", value: `${user.tag} (\`${user.id}\`)`, inline: true },
-      { name: "Total", value: `${total}`, inline: true },
-      { name: "Modérateur", value: i.user.tag, inline: true },
-      { name: "Raison", value: reason }] }));
-  });
-
-def(new SlashCommandBuilder().setName("historique").setDescription("Historique complet des sanctions d'un membre")
-  .addUserOption((o) => o.setName("membre").setDescription("Le membre").setRequired(true))
-  .addStringOption((o) => o.setName("type").setDescription("Filtrer")
-    .addChoices({ name: "avertissements", value: "warn" }, { name: "timeouts", value: "timeout" },
-      { name: "expulsions", value: "kick" }, { name: "bannissements", value: "ban" }, { name: "alcatraz", value: "alcatraz" }))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers.toString()),
-  async (i) => {
-    const user = i.options.getUser("membre");
-    const type = i.options.getString("type");
-    const rows = await listSanctions(i.guild.id, user.id, type, 20);
-    if (!rows.length) return i.reply({ content: `Aucune sanction enregistrée pour **${user.tag}**.`, ...EPH });
-    const labels = { warn: "Avertissement", timeout: "Timeout", kick: "Expulsion", ban: "Bannissement", alcatraz: "Alcatraz" };
-    const body = rows.map((r) => `\`#${r.id}\` **${labels[r.type] ?? r.type}** — ${r.reason}\npar <@${r.moderator_id}> · ${ts(r.created_at)}`).join("\n\n");
-    await i.reply({ embeds: [embed({ title: `Historique de ${user.tag} (${rows.length})`, color: COLORS.warning, description: body })], ...EPH });
-  });
-
-def(new SlashCommandBuilder().setName("delsanction").setDescription("Supprime une sanction par son numéro")
-  .addIntegerOption((o) => o.setName("identifiant").setDescription("Numéro affiché par /historique").setRequired(true))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers.toString()),
-  async (i) => {
-    const id = i.options.getInteger("identifiant");
-    const ok = await deleteSanction(i.guild.id, id);
-    await i.reply({ content: ok ? `Sanction \`#${id}\` supprimée.` : `Aucune sanction \`#${id}\`.`, ...EPH });
-  });
-
-def(new SlashCommandBuilder().setName("clearsanctions").setDescription("Efface toutes les sanctions d'un membre")
-  .addUserOption((o) => o.setName("membre").setDescription("Le membre").setRequired(true))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild.toString()),
-  async (i) => {
-    const user = i.options.getUser("membre");
-    const n = await clearSanctions(i.guild.id, user.id);
-    await i.reply({ content: `${n} sanction(s) effacée(s) pour **${user.tag}**.`, ...EPH });
-  });
-
-def(new SlashCommandBuilder().setName("clear").setDescription("Supprime des messages récents")
-  .addIntegerOption((o) => o.setName("nombre").setDescription("1 à 100").setRequired(true).setMinValue(1).setMaxValue(100))
-  .addUserOption((o) => o.setName("membre").setDescription("Ne supprimer que ses messages"))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages.toString()),
-  async (i) => {
-    const amount = i.options.getInteger("nombre");
-    const target = i.options.getUser("membre");
-    await i.deferReply(EPH);
-    const fetched = await i.channel.messages.fetch({ limit: 100 });
-    const cutoff = Date.now() - 13.5 * 864e5;
-    let pool = [...fetched.values()].filter((m) => m.createdTimestamp > cutoff && !m.pinned);
-    if (target) pool = pool.filter((m) => m.author.id === target.id);
-    const toDelete = pool.slice(0, amount);
-    if (!toDelete.length) return i.editReply("Aucun message supprimable (les messages de plus de 14 jours et les épinglés sont ignorés).");
-    const deleted = await i.channel.bulkDelete(toDelete, true);
-    await i.editReply(`${deleted.size} message(s) supprimé(s).`);
-    await log(i.guild, "messagePurge", embed({ title: "Purge", color: COLORS.neutral, fields: [
-      { name: "Salon", value: `${i.channel}`, inline: true }, { name: "Quantité", value: `${deleted.size}`, inline: true },
-      { name: "Modérateur", value: i.user.tag, inline: true }, ...(target ? [{ name: "Cible", value: target.tag, inline: true }] : [])] }));
-  });
-
-def(new SlashCommandBuilder().setName("slowmode").setDescription("Règle le mode lent du salon")
-  .addIntegerOption((o) => o.setName("secondes").setDescription("0 pour désactiver").setRequired(true).setMinValue(0).setMaxValue(21600))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels.toString()),
-  async (i) => {
-    const s = i.options.getInteger("secondes");
-    await i.channel.setRateLimitPerUser(s, i.user.tag);
-    await i.reply({ content: s ? `Mode lent : ${s}s.` : "Mode lent désactivé.", ...EPH });
-  });
-
-def(new SlashCommandBuilder().setName("lock").setDescription("Verrouille ce salon")
-  .addStringOption((o) => o.setName("raison").setDescription("Raison"))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels.toString()),
-  async (i) => {
-    const reason = i.options.getString("raison") ?? "Non précisée";
-    await i.channel.permissionOverwrites.edit(i.guild.roles.everyone, { SendMessages: false });
-    await i.reply({ embeds: [embed({ title: "Salon verrouillé", color: COLORS.danger, description: `Par ${i.user}.`, fields: [{ name: "Raison", value: reason }] })] });
-  });
-
-def(new SlashCommandBuilder().setName("unlock").setDescription("Déverrouille ce salon")
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels.toString()),
-  async (i) => {
-    await i.channel.permissionOverwrites.edit(i.guild.roles.everyone, { SendMessages: null });
-    await i.reply({ embeds: [embed({ title: "Salon déverrouillé", color: COLORS.success })] });
-  });
-
-def(new SlashCommandBuilder().setName("lockdown").setDescription("Verrouille ou déverrouille TOUT le serveur (anti-raid)")
-  .addStringOption((o) => o.setName("action").setDescription("Activer ou lever").setRequired(true)
-    .addChoices({ name: "activer", value: "on" }, { name: "lever", value: "off" }))
-  .addStringOption((o) => o.setName("raison").setDescription("Raison"))
-  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator.toString()),
-  async (i) => {
-    const on = i.options.getString("action") === "on";
-    const reason = i.options.getString("raison") ?? "Lockdown manuel";
-    await i.deferReply();
-    const n = await lockAllChannels(i.guild, on, `${i.user.tag} — ${reason}`);
-    if (on) setLockdown(i.guild.id, 60); else clearLockdown(i.guild.id);
-    await i.editReply({ embeds: [embed({ title: on ? "Serveur verrouillé" : "Serveur déverrouillé",
-      color: on ? COLORS.danger : COLORS.success, description: `${n} salon(s) traité(s).`, fields: [{ name: "Raison", value: reason }] })] });
-    await log(i.guild, "raid", embed({ title: on ? "Lockdown activé" : "Lockdown levé", color: on ? COLORS.danger : COLORS.success,
-      fields: [{ name: "Par", value: i.user.tag, inline: true }, { name: "Salons", value: `${n}`, inline: true }, { name: "Raison", value: reason }] }));
-  });
-
-/* --------------------------------- ALCATRAZ ------------------------------- */
-
-def(new SlashCommandBuilder().setName("alcatraz").setDescription("Envoie un membre en Alcatraz (retire tous ses rôles)")
-  .addUserOption((o) => o.setName("membre").setDescription("Le membre").setRequired(true))
-  .addStringOption((o) => o.setName("raison").setDescription("Raison").setRequired(true))
-  .addStringOption((o) => o.setName("duree").setDescription("Ex. 2h, 7d — vide = indéterminée"))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers.toString()),
-  async (i) => {
-    const user = i.options.getUser("membre");
-    const reason = i.options.getString("raison");
-    const ms = parseDuration(i.options.getString("duree"));
-    const member = await i.guild.members.fetch(user.id).catch(() => null);
-    if (!member) return i.reply({ content: "Membre introuvable.", ...EPH });
-    const p = hierarchyCheck(i, member);
-    if (p) return i.reply({ content: p, ...EPH });
-    await i.deferReply();
-    const r = await sendToJail(i.guild, member, i.user, reason, ms);
-    if (!r.ok) return i.editReply(r.error);
-    await tryDm(user, i.guild.name, "Alcatraz", reason, ms ? formatDuration(ms) : "Indéterminée");
-    await i.editReply({ embeds: [embed({ title: "Alcatraz", color: COLORS.danger,
-      description: `**${user.tag}** est enfermé. ${r.roles} rôle(s) mis de côté, restaurés à la libération.`,
-      fields: [{ name: "Durée", value: ms ? formatDuration(ms) : "Indéterminée", inline: true }, { name: "Raison", value: reason }] })] });
-  });
-
-def(new SlashCommandBuilder().setName("liberer").setDescription("Libère un membre d'Alcatraz et restaure ses rôles")
-  .addUserOption((o) => o.setName("membre").setDescription("Le membre").setRequired(true))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers.toString()),
-  async (i) => {
-    const user = i.options.getUser("membre");
-    const member = await i.guild.members.fetch(user.id).catch(() => null);
-    if (!member) return i.reply({ content: "Membre introuvable.", ...EPH });
-    await i.deferReply();
-    const r = await releaseFromJail(i.guild, member, i.user.tag);
-    await i.editReply(r.ok ? `**${user.tag}** est libéré. ${r.restored} rôle(s) restauré(s).` : r.error);
-  });
-
-/* ========================================================================== */
-/*                                  TICKETS                                   */
-/* ========================================================================== */
-
-def(new SlashCommandBuilder().setName("ticket").setDescription("Gestion des tickets")
-  .addSubcommand((s) => s.setName("panel").setDescription("Publie le panneau de tickets")
-    .addChannelOption((o) => o.setName("salon").setDescription("Salon cible (défaut : #tickets)").addChannelTypes(ChannelType.GuildText)))
-  .addSubcommand((s) => s.setName("ajouter").setDescription("Ajoute un membre au ticket actuel")
-    .addUserOption((o) => o.setName("membre").setDescription("Le membre").setRequired(true)))
-  .addSubcommand((s) => s.setName("retirer").setDescription("Retire un membre du ticket actuel")
-    .addUserOption((o) => o.setName("membre").setDescription("Le membre").setRequired(true)))
-  .addSubcommand((s) => s.setName("renommer").setDescription("Renomme le ticket actuel")
-    .addStringOption((o) => o.setName("nom").setDescription("Nouveau nom").setRequired(true)))
-  .addSubcommand((s) => s.setName("stats").setDescription("Statistiques des tickets")),
-  async (i) => {
-    const sub = i.options.getSubcommand();
-    const config = await getConfig(i.guild.id);
-
-    if (sub === "panel") {
-      if (!i.memberPermissions.has(PermissionFlagsBits.ManageGuild))
-        return i.reply({ content: "Réservé aux gestionnaires du serveur.", ...EPH });
-      const channel = i.options.getChannel("salon") ?? resolveFuncChannel(i.guild, "ticketPanel", config) ?? i.channel;
-      const found = TICKET_TYPES.filter((t) => !!i.guild.channels.cache.find((c) => c.type === ChannelType.GuildCategory && c.name.toLowerCase().includes(t.categories[0].split("-")[1])));
-      await channel.send({
-        embeds: [embed({ title: "🎫 Centre d'aide — Naoya", color: COLORS.primary,
-          description: "Choisis le type de ticket dans le menu ci-dessous. Un salon privé sera créé avec le staff concerné.\n\nLes tickets ouverts sans raison valable sont sanctionnés." })],
-        components: ticketPanelComponents(),
-      });
-      return i.reply({ content: `Panneau publié dans ${channel}. Catégories détectées : ${found.length}/${TICKET_TYPES.length}.`, ...EPH });
+    if (level < 1 && !isOwner(i.user.id)) {
+      return i.reply({ embeds: [embed({
+        guild: i.guild,
+        color: COLORS.neutral,
+        author: { name: `${ICONS.info}  Panneau réservé au staff` },
+        description: "Tu es **Membre**. Les fonctions qui te concernent (niveau, coins, quotidien, boutique, tickets, confessions) sont sur les panneaux publiés dans les salons du serveur.",
+        footer: "Un responsable peut les publier via /panel → Publications",
+      })], ...EPH });
     }
 
-    const isTicket = /^ticket-/.test(i.channel.name);
-    if (!isTicket && sub !== "stats") return i.reply({ content: "Cette commande s'utilise dans un salon de ticket.", ...EPH });
-
-    if (sub === "ajouter") {
-      const u = i.options.getUser("membre");
-      await i.channel.permissionOverwrites.edit(u.id, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
-      return i.reply(`${u} a été ajouté au ticket.`);
-    }
-    if (sub === "retirer") {
-      const u = i.options.getUser("membre");
-      await i.channel.permissionOverwrites.delete(u.id).catch(() => null);
-      return i.reply({ content: `${u.tag} a été retiré du ticket.`, ...EPH });
-    }
-    if (sub === "renommer") {
-      const name = i.options.getString("nom").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 90);
-      await i.channel.setName(name);
-      return i.reply({ content: `Ticket renommé en \`${name}\`.`, ...EPH });
-    }
-    if (sub === "stats") {
-      const s = await ticketStats(i.guild.id);
-      return i.reply({ embeds: [embed({ title: "Tickets", fields: [
-        { name: "Ouverts", value: `${s.open}`, inline: true },
-        { name: "7 jours", value: `${s.week}`, inline: true },
-        { name: "Total", value: `${s.total}`, inline: true }] })], ...EPH });
-    }
+    const view = await buildSection("home", i, config);
+    await i.reply({ ...view, ...EPH });
   });
 
 /* ========================================================================== */
-/*                                 GIVEAWAYS                                  */
+/*                                   /help                                    */
 /* ========================================================================== */
 
-def(new SlashCommandBuilder().setName("gw").setDescription("Giveaways")
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageEvents.toString())
-  .addSubcommand((s) => s.setName("start").setDescription("Lance un giveaway")
-    .addStringOption((o) => o.setName("prix").setDescription("Ce qui est à gagner").setRequired(true))
-    .addStringOption((o) => o.setName("duree").setDescription("Ex. 30m, 6h, 2d").setRequired(true))
-    .addIntegerOption((o) => o.setName("gagnants").setDescription("Nombre de gagnants").setMinValue(1).setMaxValue(20))
-    .addRoleOption((o) => o.setName("role_requis").setDescription("Rôle obligatoire pour participer"))
-    .addChannelOption((o) => o.setName("salon").setDescription("Salon du giveaway").addChannelTypes(ChannelType.GuildText)))
-  .addSubcommand((s) => s.setName("end").setDescription("Termine un giveaway immédiatement")
-    .addIntegerOption((o) => o.setName("id").setDescription("Identifiant du giveaway").setRequired(true)))
-  .addSubcommand((s) => s.setName("reroll").setDescription("Retire un ou plusieurs gagnants")
-    .addIntegerOption((o) => o.setName("id").setDescription("Identifiant").setRequired(true))
-    .addIntegerOption((o) => o.setName("gagnants").setDescription("Combien").setMinValue(1).setMaxValue(20))),
-  async (i) => {
-    const sub = i.options.getSubcommand();
-
-    if (sub === "start") {
-      const prize = i.options.getString("prix");
-      const ms = parseDuration(i.options.getString("duree"));
-      if (!ms || ms < 60_000) return i.reply({ content: "Durée invalide (minimum 1 minute). Format : `30m`, `6h`, `2d`.", ...EPH });
-      const winners = i.options.getInteger("gagnants") ?? 1;
-      const role = i.options.getRole("role_requis");
-      const channel = i.options.getChannel("salon") ?? i.channel;
-      if (!canSend(channel)) return i.reply({ content: `Je ne peux pas écrire dans ${channel}.`, ...EPH });
-      const id = await createGiveaway({ guildId: i.guild.id, channelId: channel.id, prize, winners,
-        hostId: i.user.id, requiredRole: role?.id ?? null, endsAt: new Date(Date.now() + ms) });
-      await postGiveaway(i.client, id, channel);
-      return i.reply({ content: `Giveaway \`#${id}\` lancé dans ${channel}, fin dans ${formatDuration(ms)}.`, ...EPH });
-    }
-
-    const id = i.options.getInteger("id");
-    const g = await getGiveaway(id);
-    if (!g || g.guild_id !== i.guild.id) return i.reply({ content: "Giveaway introuvable.", ...EPH });
-
-    if (sub === "end") {
-      if (g.ended) return i.reply({ content: "Ce giveaway est déjà terminé.", ...EPH });
-      await i.deferReply(EPH);
-      const w = await drawGiveaway(i.client, g);
-      return i.editReply(w.length ? `Terminé. Gagnant(s) : ${w.map((x) => `<@${x}>`).join(", ")}` : "Terminé, aucun participant.");
-    }
-
-    if (sub === "reroll") {
-      await i.deferReply(EPH);
-      const w = await drawGiveaway(i.client, g, i.options.getInteger("gagnants") ?? 1);
-      return i.editReply(w.length ? `Nouveau tirage : ${w.map((x) => `<@${x}>`).join(", ")}` : "Aucun participant.");
-    }
-  });
-
-/* ========================================================================== */
-/*                                  ÉCONOMIE                                  */
-/* ========================================================================== */
-
-def(new SlashCommandBuilder().setName("coins").setDescription("Ton solde de coins")
-  .addUserOption((o) => o.setName("membre").setDescription("Voir le solde de quelqu'un")),
-  async (i) => {
-    const config = await getConfig(i.guild.id);
-    if (!config.economy.enabled) return i.reply({ content: "L'économie est désactivée.", ...EPH });
-    const user = i.options.getUser("membre") ?? i.user;
-    const w = await getWallet(i.guild.id, user.id);
-    await i.reply({ embeds: [embed({ title: `Solde de ${user.username}`,
-      description: `## ${config.economy.currency} ${num(w.coins)}`,
-      color: COLORS.gold, footer: w.streak ? `Série quotidienne : ${w.streak} jour(s)` : undefined })
-      .setThumbnail(user.displayAvatarURL({ size: 128 }))] });
-  });
-
-def(new SlashCommandBuilder().setName("daily").setDescription("Récupère ta récompense quotidienne"),
-  async (i) => {
-    const config = await getConfig(i.guild.id);
-    if (!config.economy.enabled) return i.reply({ content: "L'économie est désactivée.", ...EPH });
-    const w = await getWallet(i.guild.id, i.user.id);
-    const now = Date.now();
-    const last = w.lastDaily ? new Date(w.lastDaily).getTime() : 0;
-    if (now - last < 20 * 36e5) {
-      return i.reply({ content: `Déjà récupéré. Reviens ${ts(last + 24 * 36e5)}.`, ...EPH });
-    }
-    const streak = now - last < 48 * 36e5 ? (w.streak ?? 0) + 1 : 1;
-    const bonus = Math.min(streak, 10) * 25;
-    const gain = config.economy.dailyAmount + bonus;
-    const total = await addCoins(i.guild.id, i.user.id, gain);
-    await stampEconomy(i.guild.id, i.user.id, "daily", new Date(), streak);
-    await i.reply({ embeds: [embed({ title: "Récompense quotidienne", color: COLORS.gold,
-      description: `Tu reçois **${config.economy.currency} ${num(gain)}**${bonus ? ` (dont ${num(bonus)} de série)` : ""}.\nNouveau solde : **${num(total)}**`,
-      footer: `Série : ${streak} jour(s)` })] });
-  });
-
-def(new SlashCommandBuilder().setName("work").setDescription("Travaille pour gagner des coins"),
-  async (i) => {
-    const config = await getConfig(i.guild.id);
-    if (!config.economy.enabled) return i.reply({ content: "L'économie est désactivée.", ...EPH });
-    const w = await getWallet(i.guild.id, i.user.id);
-    const last = w.lastWork ? new Date(w.lastWork).getTime() : 0;
-    if (Date.now() - last < config.economy.workCooldownMs)
-      return i.reply({ content: `Repose-toi un peu. Prochain travail ${ts(last + config.economy.workCooldownMs)}.`, ...EPH });
-    const gain = config.economy.workMin + Math.floor(Math.random() * (config.economy.workMax - config.economy.workMin + 1));
-    const total = await addCoins(i.guild.id, i.user.id, gain);
-    await stampEconomy(i.guild.id, i.user.id, "work", new Date());
-    const jobs = ["as modéré le chat", "as rangé les salons vocaux", "as animé un event", "as aidé un nouveau", "as trié les tickets"];
-    await i.reply({ embeds: [embed({ title: "Travail terminé", color: COLORS.success,
-      description: `Tu ${jobs[Math.floor(Math.random() * jobs.length)]} et gagnes **${config.economy.currency} ${num(gain)}**.\nSolde : **${num(total)}**` })] });
-  });
-
-def(new SlashCommandBuilder().setName("pay").setDescription("Donne des coins à un membre")
-  .addUserOption((o) => o.setName("membre").setDescription("Bénéficiaire").setRequired(true))
-  .addIntegerOption((o) => o.setName("montant").setDescription("Combien").setRequired(true).setMinValue(1)),
-  async (i) => {
-    const config = await getConfig(i.guild.id);
-    if (!config.economy.enabled) return i.reply({ content: "L'économie est désactivée.", ...EPH });
-    const user = i.options.getUser("membre");
-    const amount = i.options.getInteger("montant");
-    if (user.id === i.user.id) return i.reply({ content: "Tu ne peux pas te payer toi-même.", ...EPH });
-    if (user.bot) return i.reply({ content: "Les bots n'ont pas de portefeuille.", ...EPH });
-    const w = await getWallet(i.guild.id, i.user.id);
-    if (w.coins < amount) return i.reply({ content: `Solde insuffisant (${num(w.coins)}).`, ...EPH });
-    await addCoins(i.guild.id, i.user.id, -amount);
-    await addCoins(i.guild.id, user.id, amount);
-    await i.reply(`${i.user} a envoyé **${config.economy.currency} ${num(amount)}** à ${user}.`);
-    await log(i.guild, "coins", embed({ title: "Transfert de coins", color: COLORS.gold, fields: [
-      { name: "De", value: i.user.tag, inline: true }, { name: "Vers", value: user.tag, inline: true },
-      { name: "Montant", value: num(amount), inline: true }] }));
-  });
-
-def(new SlashCommandBuilder().setName("coins-admin").setDescription("Ajoute ou retire des coins")
-  .addUserOption((o) => o.setName("membre").setDescription("Le membre").setRequired(true))
-  .addIntegerOption((o) => o.setName("montant").setDescription("Négatif pour retirer").setRequired(true))
-  .addStringOption((o) => o.setName("raison").setDescription("Raison"))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild.toString()),
-  async (i) => {
-    const user = i.options.getUser("membre");
-    const amount = i.options.getInteger("montant");
-    const reason = i.options.getString("raison") ?? "Non précisée";
-    const total = await addCoins(i.guild.id, user.id, amount);
-    await i.reply({ content: `${amount >= 0 ? "+" : ""}${num(amount)} pour **${user.tag}**. Nouveau solde : ${num(total)}.`, ...EPH });
-    await log(i.guild, "coins", embed({ title: "Ajustement de coins", color: COLORS.gold, fields: [
-      { name: "Membre", value: user.tag, inline: true }, { name: "Montant", value: `${amount >= 0 ? "+" : ""}${num(amount)}`, inline: true },
-      { name: "Par", value: i.user.tag, inline: true }, { name: "Raison", value: reason }] }));
-  });
-
-def(new SlashCommandBuilder().setName("top").setDescription("Classements du serveur")
-  .addStringOption((o) => o.setName("categorie").setDescription("Quel classement").setRequired(true)
-    .addChoices({ name: "niveaux", value: "xp" }, { name: "coins", value: "coins" }))
-  .addIntegerOption((o) => o.setName("taille").setDescription("1 à 25").setMinValue(1).setMaxValue(25)),
-  async (i) => {
-    const cat = i.options.getString("categorie");
-    const limit = i.options.getInteger("taille") ?? 10;
-    const config = await getConfig(i.guild.id);
-    const medals = ["🥇", "🥈", "🥉"];
-    if (cat === "xp") {
-      const rows = await topLevels(i.guild.id, limit);
-      if (!rows.length) return i.reply({ content: "Personne n'a encore d'XP.", ...EPH });
-      return i.reply({ embeds: [embed({ title: `Classement XP — ${i.guild.name}`,
-        description: rows.map((r, n) => `${medals[n] ?? `**${n + 1}.**`} <@${r.userId}> — niveau **${r.level}** · ${num(r.xp)} XP`).join("\n") })] });
-    }
-    const rows = await topCoins(i.guild.id, limit);
-    if (!rows.length) return i.reply({ content: "Personne n'a encore de coins.", ...EPH });
-    return i.reply({ embeds: [embed({ title: `Classement coins — ${i.guild.name}`, color: COLORS.gold,
-      description: rows.map((r, n) => `${medals[n] ?? `**${n + 1}.**`} <@${r.userId}> — ${config.economy.currency} **${num(r.coins)}**`).join("\n") })] });
-  });
-
-/* ========================================================================== */
-/*                                  NIVEAUX                                   */
-/* ========================================================================== */
-
-def(new SlashCommandBuilder().setName("rank").setDescription("Ton niveau et ton XP")
-  .addUserOption((o) => o.setName("membre").setDescription("Le membre")),
-  async (i) => {
-    const user = i.options.getUser("membre") ?? i.user;
-    const { xp, level, rank } = await getUserLevel(i.guild.id, user.id);
-    if (!xp) return i.reply({ content: `**${user.username}** n'a pas encore d'XP.`, ...EPH });
-    const cur = xpForLevel(level), next = xpForLevel(level + 1);
-    const p = Math.round(((xp - cur) / (next - cur)) * 20);
-    await i.reply({ embeds: [embed({ title: `Niveau de ${user.username}`,
-      description: `\`${"█".repeat(Math.max(0, p))}${"░".repeat(Math.max(0, 20 - p))}\`\n**${num(xp - cur)} / ${num(next - cur)}** XP vers le niveau ${level + 1}`,
-      fields: [{ name: "Niveau", value: `${level}`, inline: true }, { name: "XP total", value: num(xp), inline: true },
-        { name: "Classement", value: rank ? `#${rank}` : "—", inline: true }] })
-      .setThumbnail(user.displayAvatarURL({ size: 128 }))] });
-  });
-
-/* ========================================================================== */
-/*                                   STAFF                                    */
-/* ========================================================================== */
-
-def(new SlashCommandBuilder().setName("absence").setDescription("Déclare une absence staff")
-  .addStringOption((o) => o.setName("raison").setDescription("Motif").setRequired(true))
-  .addStringOption((o) => o.setName("duree").setDescription("Ex. 3d, 2sem"))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers.toString()),
-  async (i) => {
-    const reason = i.options.getString("raison");
-    const ms = parseDuration(i.options.getString("duree"));
-    const until = ms ? new Date(Date.now() + ms) : null;
-    await addAbsence(i.guild.id, i.user.id, reason, until);
-    const config = await getConfig(i.guild.id);
-    const channel = resolveFuncChannel(i.guild, "absences", config);
-    const e = embed({ title: "Absence déclarée", color: COLORS.neutral, fields: [
-      { name: "Membre", value: `${i.user}`, inline: true },
-      { name: "Retour", value: until ? ts(until) : "Non précisé", inline: true },
-      { name: "Raison", value: reason }] });
-    if (channel && canSend(channel)) await channel.send({ embeds: [e] });
-    await i.reply({ content: channel ? `Absence enregistrée et publiée dans ${channel}.` : "Absence enregistrée.", ...EPH });
-  });
-
-def(new SlashCommandBuilder().setName("absences").setDescription("Liste les absences staff en cours")
-  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers.toString()),
-  async (i) => {
-    const rows = await listAbsences(i.guild.id);
-    if (!rows.length) return i.reply({ content: "Aucune absence en cours.", ...EPH });
-    await i.reply({ embeds: [embed({ title: `Absences en cours (${rows.length})`,
-      description: rows.map((a) => `<@${a.user_id}> — ${a.reason}${a.until ? ` · retour ${ts(a.until)}` : ""}`).join("\n") })], ...EPH });
-  });
-
-def(new SlashCommandBuilder().setName("confession").setDescription("Envoie une confession anonyme"),
-  async (i) => {
-    const modal = new ModalBuilder().setCustomId("confession:modal").setTitle("Confession anonyme")
-      .addComponents(new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId("text").setLabel("Ta confession").setStyle(TextInputStyle.Paragraph)
-          .setMinLength(5).setMaxLength(1500).setRequired(true)));
-    await i.showModal(modal);
-  });
-
-/* ========================================================================== */
-/*                               UTILITAIRES                                  */
-/* ========================================================================== */
-
-def(new SlashCommandBuilder().setName("ping").setDescription("État du bot"),
+def(new SlashCommandBuilder().setName("help").setDescription("Comment fonctionne 0x"),
   async (i, { client }) => {
-    const t = Date.now();
-    await i.reply({ content: "…", ...EPH });
-    await i.editReply({ content: null, embeds: [embed({ title: "0x — état", fields: [
-      { name: "Aller-retour", value: `${Date.now() - t} ms`, inline: true },
-      { name: "WebSocket", value: `${Math.round(client.ws.ping)} ms`, inline: true },
-      { name: "Mémoire", value: `${Math.round(process.memoryUsage().rss / 1048576)} Mo`, inline: true },
-      { name: "Base de données", value: usingDatabase() ? "PostgreSQL" : "Mémoire (non persistant)", inline: true },
-      { name: "En ligne depuis", value: ts(Date.now() - client.uptime), inline: true },
-      { name: "Lockdown", value: isLockdown(i.guild.id) ? "Actif" : "Inactif", inline: true }] })] });
-  });
+    const config = await getConfig(i.guildId);
+    const level = permLevel(i.member, config);
+    const counts = await computeCounts(i.guild);
+    const owner = isOwner(i.user.id);
+    const allowed = SECTIONS.filter((s) => (!s.ownerOnly || owner) && level >= s.level);
+    const ownerLocked = SECTIONS.filter((s) => s.ownerOnly && !owner);
 
-def(new SlashCommandBuilder().setName("userinfo").setDescription("Informations sur un membre")
-  .addUserOption((o) => o.setName("membre").setDescription("Le membre")),
-  async (i) => {
-    const user = i.options.getUser("membre") ?? i.user;
-    const m = await i.guild.members.fetch(user.id).catch(() => null);
-    const warns = await countSanctions(i.guild.id, user.id, "warn");
-    const roles = m ? m.roles.cache.filter((r) => r.id !== i.guild.id).sort((a, b) => b.position - a.position)
-      .map((r) => r.toString()).slice(0, 12).join(" ") || "Aucun" : "Aucun";
-    await i.reply({ embeds: [embed({ title: user.tag, color: m?.displayColor || COLORS.primary, fields: [
-      { name: "Identifiant", value: `\`${user.id}\``, inline: true },
-      { name: "Compte créé", value: ts(user.createdAt), inline: true },
-      ...(m ? [{ name: "A rejoint", value: ts(m.joinedAt), inline: true }] : []),
-      ...(m?.communicationDisabledUntil && m.communicationDisabledUntil > new Date()
-        ? [{ name: "Muet jusqu'à", value: ts(m.communicationDisabledUntil), inline: true }] : []),
-      { name: "Avertissements", value: `${warns}`, inline: true },
-      { name: `Rôles (${m ? m.roles.cache.size - 1 : 0})`, value: roles }] })
-      .setThumbnail(user.displayAvatarURL({ size: 256 }))] });
-  });
+    const fields = [
+      {
+        name: "⚡  Mise en route",
+        value: "Ouvre **`/panel`** et appuie sur **Tout installer**. Il détecte tes salons, classe tes rôles staff, branche les compteurs, crée le rôle Alcatraz et active les protections. Puis **Publier les panneaux** pose les boutons pour les membres.",
+      },
+      {
+        name: "🧭  Trois commandes, c'est tout",
+        value: "**`/panel`** — le panneau de contrôle, tout se règle au bouton\n**`/help`** — cette page\n**`/logs map`** — où part chaque type de journal",
+      },
+      {
+        name: "👥  Pour les membres",
+        value: "Aucune commande à taper. Les panneaux publiés dans les salons donnent accès au niveau, au solde, au quotidien, au travail, aux classements, à la boutique, aux tickets et aux confessions.",
+      },
+    ];
 
-def(new SlashCommandBuilder().setName("serverinfo").setDescription("Statistiques du serveur"),
-  async (i) => {
-    const g = i.guild;
-    const voice = g.channels.cache.filter((c) => c.type === ChannelType.GuildVoice).reduce((t, c) => t + c.members.size, 0);
-    await i.reply({ embeds: [embed({ title: g.name, fields: [
-      { name: "Membres", value: num(g.memberCount), inline: true },
-      { name: "En vocal", value: `${voice}`, inline: true },
-      { name: "Boosts", value: `${g.premiumSubscriptionCount ?? 0} (niveau ${g.premiumTier})`, inline: true },
-      { name: "Salons", value: `${g.channels.cache.size}`, inline: true },
-      { name: "Rôles", value: `${g.roles.cache.size}`, inline: true },
-      { name: "Émojis", value: `${g.emojis.cache.size}`, inline: true },
-      { name: "Créé le", value: ts(g.createdAt), inline: true },
-      { name: "Propriétaire", value: `<@${g.ownerId}>`, inline: true },
-      { name: "Vérification", value: `${g.verificationLevel}`, inline: true }] })
-      .setThumbnail(g.iconURL({ size: 256 }))] });
-  });
+    if (allowed.length) {
+      fields.push({
+        name: `🔑  Tes sections dans /panel (${allowed.length}/${SECTIONS.length})`,
+        value: allowed.map((s) => `${s.emoji} **${s.label}** — ${s.desc}`).join("\n"),
+      });
+    }
 
-def(new SlashCommandBuilder().setName("avatar").setDescription("Avatar en grand")
-  .addUserOption((o) => o.setName("membre").setDescription("Le membre")),
-  async (i) => {
-    const u = i.options.getUser("membre") ?? i.user;
-    await i.reply({ embeds: [embed({ title: `Avatar de ${u.username}` }).setImage(u.displayAvatarURL({ size: 1024 }))] });
-  });
+    if (ownerLocked.length) {
+      fields.push({
+        name: "🔒  Réservé au propriétaire de 0x",
+        value: `${ownerLocked.map((s) => `${s.emoji} ${s.label}`).join(" · ")}\n\nToute la configuration est verrouillée sur <@${OWNER_ID}>. Ni un administrateur ni le propriétaire du serveur ne peut y toucher.`,
+      });
+    }
+    const levelLocked = SECTIONS.filter((s) => !s.ownerOnly && level < s.level);
+    if (levelLocked.length) {
+      fields.push({
+        name: "⬆️  Verrouillé à ton niveau",
+        value: levelLocked.map((s) => `${s.emoji} ${s.label} — demande ${PERM_LABELS[s.level]}`).join("\n"),
+      });
+    }
 
-def(new SlashCommandBuilder().setName("sondage").setDescription("Crée un sondage")
-  .addStringOption((o) => o.setName("question").setDescription("La question").setRequired(true))
-  .addStringOption((o) => o.setName("options").setDescription("Choix séparés par des virgules (2 à 10)").setRequired(true))
-  .addChannelOption((o) => o.setName("salon").setDescription("Salon cible").addChannelTypes(ChannelType.GuildText))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages.toString()),
-  async (i) => {
-    const q = i.options.getString("question");
-    const opts = i.options.getString("options").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 10);
-    if (opts.length < 2) return i.reply({ content: "Il faut au moins 2 choix séparés par des virgules.", ...EPH });
-    const channel = i.options.getChannel("salon") ?? i.channel;
-    const msg = await channel.send({ embeds: [embed({ title: q,
-      description: opts.map((o, n) => `${POLL[n]} ${o}`).join("\n\n"), footer: `Sondage de ${i.user.tag}` })] });
-    for (let n = 0; n < opts.length; n++) await msg.react(POLL[n]).catch(() => null);
-    await i.reply({ content: `Sondage publié dans ${channel}.`, ...EPH });
-  });
+    fields.push({
+      name: "⚙️  Ce que 0x fait tout seul",
+      value: [
+        "Automod (invitations, liens, flood, mentions, majuscules, mots interdits)",
+        "Anti-raid et anti-nuke avec identification par les logs d'audit",
+        "Journalisation vers tes salons, détectés par leur nom",
+        "Compteurs Membres / Connectés / Vocal",
+        "Accueil, autorole, XP, colis de coins, fins de giveaway, libérations d'Alcatraz",
+      ].map((x) => `• ${x}`).join("\n"),
+    });
 
-def(new SlashCommandBuilder().setName("say").setDescription("Fait parler le bot")
-  .addStringOption((o) => o.setName("message").setDescription("Le texte (\\n pour un saut de ligne)").setRequired(true))
-  .addChannelOption((o) => o.setName("salon").setDescription("Salon cible").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
-  .addBooleanOption((o) => o.setName("embed").setDescription("Envoyer en encadré"))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages.toString()),
-  async (i) => {
-    const text = i.options.getString("message").replaceAll("\\n", "\n");
-    const channel = i.options.getChannel("salon") ?? i.channel;
-    const asEmbed = i.options.getBoolean("embed") ?? false;
-    await channel.send(asEmbed ? { embeds: [embed({ description: text })] } : { content: text });
-    await i.reply({ content: `Envoyé dans ${channel}.`, ...EPH });
-  });
-
-def(new SlashCommandBuilder().setName("panel").setDescription("Publie un panneau de rôles")
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles.toString())
-  .addSubcommand((s) => {
-    s.setName("roles").setDescription("Menu de rôles à cocher")
-      .addStringOption((o) => o.setName("titre").setDescription("Titre du menu").setRequired(true));
-    for (let n = 1; n <= 8; n++) s.addRoleOption((o) => o.setName(`role${n}`).setDescription(`Rôle ${n}`).setRequired(n === 1));
-    s.addChannelOption((o) => o.setName("salon").setDescription("Salon cible").addChannelTypes(ChannelType.GuildText));
-    return s;
-  }),
-  async (i) => {
-    const roles = [];
-    for (let n = 1; n <= 8; n++) { const r = i.options.getRole(`role${n}`); if (r) roles.push(r); }
-    const top = i.guild.members.me.roles.highest.position;
-    const bad = roles.filter((r) => r.position >= top || r.managed);
-    if (bad.length) return i.reply({ content: `Je ne peux pas gérer : ${bad.join(", ")} (au-dessus de mon rôle, ou géré par une intégration).`, ...EPH });
-    const channel = i.options.getChannel("salon") ?? i.channel;
-    const menu = new StringSelectMenuBuilder().setCustomId("rolemenu").setPlaceholder("Choisis tes rôles")
-      .setMinValues(0).setMaxValues(roles.length)
-      .addOptions(roles.map((r) => ({ label: r.name.slice(0, 100), value: r.id })));
-    await channel.send({ embeds: [embed({ title: i.options.getString("titre"),
-      description: "Sélectionne les rôles que tu veux. Désélectionne pour les retirer." })],
-      components: [new ActionRowBuilder().addComponents(menu)] });
-    await i.reply({ content: `Menu publié dans ${channel}.`, ...EPH });
+    await i.reply({ embeds: [embed({
+      guild: i.guild,
+      author: { name: "0x  —  mode d'emploi" },
+      color: COLORS.primary,
+      description: `Ton niveau : **${PERM_LABELS[level]}**\n${num(counts.members)} membres · ${counts.voice} en vocal · latence ${Math.round(client.ws.ping)} ms · ${usingDatabase() ? "PostgreSQL" : "⚠️ mémoire volatile"}`,
+      fields,
+      footer: "Commence par /panel — il liste ce qu'il reste à régler",
+    })], ...EPH });
   });
 
 /* ========================================================================== */
-/*                              CONFIGURATION                                 */
+/*                                   /logs                                    */
 /* ========================================================================== */
 
-def(new SlashCommandBuilder().setName("logs").setDescription("Gestion des salons de logs")
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild.toString())
+def(new SlashCommandBuilder().setName("logs").setDescription("Journalisation : où part quoi")
+  .setDefaultMemberPermissions(null)
   .addSubcommand((s) => s.setName("map").setDescription("Montre quel salon reçoit quel type de log"))
+  .addSubcommand((s) => s.setName("scan").setDescription("Relance la détection des salons"))
   .addSubcommand((s) => s.setName("set").setDescription("Force un type de log vers un salon précis")
     .addStringOption((o) => o.setName("type").setDescription("Type de log").setRequired(true).setAutocomplete(true))
     .addChannelOption((o) => o.setName("salon").setDescription("Salon").addChannelTypes(ChannelType.GuildText).setRequired(true)))
   .addSubcommand((s) => s.setName("reset").setDescription("Revient à la détection automatique"))
   .addSubcommand((s) => s.setName("actif").setDescription("Active ou coupe tous les logs")
-    .addBooleanOption((o) => o.setName("valeur").setDescription("Activer ?").setRequired(true)))
-  .addSubcommand((s) => s.setName("scan").setDescription("Relance la détection des salons")),
+    .addBooleanOption((o) => o.setName("valeur").setDescription("Activer ?").setRequired(true))),
   async (i) => {
+    const config = await getConfig(i.guildId);
     const sub = i.options.getSubcommand();
-    const config = await getConfig(i.guild.id);
+
+    // "map" est en lecture seule : ouvert au staff. Le reste modifie le bot.
+    if (sub !== "map" && !isOwner(i.user.id)) {
+      return i.reply({ embeds: [embed({ guild: i.guild, color: COLORS.danger,
+        author: { name: "🔒  Verrouillé" },
+        description: `Modifier le routage des journaux change la configuration de 0x.\nSeul <@${OWNER_ID}> peut le faire.`,
+        footer: "Tu peux consulter le routage avec /logs map" })], ...EPH });
+    }
+    if (sub === "map" && permLevel(i.member, config) < 4) {
+      return i.reply({ embeds: [embed({ guild: i.guild, color: COLORS.danger,
+        author: { name: `${ICONS.no}  Accès refusé` },
+        description: `La consultation des journaux demande **${PERM_LABELS[4]}**.` })], ...EPH });
+    }
+    const keys = Object.keys(LOG_ROUTES);
 
     if (sub === "map") {
-      const keys = Object.keys(LOG_ROUTES);
       const lines = keys.map((k) => {
         const ch = resolveLogChannel(i.guild, k, config);
-        const forced = config.logOverrides?.[k] ? " *" : "";
-        return `\`${k}\`${forced} → ${ch ? `<#${ch.id}>` : "❌ non trouvé"}`;
+        return `${ch ? "✅" : "🔴"} \`${k}\`${config.logOverrides?.[k] ? "*" : ""} → ${ch ? `<#${ch.id}>` : "_non trouvé_"}`;
       });
       const half = Math.ceil(lines.length / 2);
-      await i.reply({ embeds: [embed({ title: "Routage des logs",
-        description: "`*` = forcé manuellement. Les autres sont détectés par nom de salon.",
+      const found = keys.filter((k) => resolveLogChannel(i.guild, k, config)).length;
+      return i.reply({ embeds: [embed({
+        guild: i.guild,
+        author: { name: "🗂️  Routage des journaux" },
+        color: found === keys.length ? COLORS.success : COLORS.warning,
+        description: `**${found}/${keys.length}** types routés · \`*\` = forcé manuellement`,
         fields: [
-          { name: "Événements", value: lines.slice(0, half).join("\n"), inline: true },
+          { name: "\u200b", value: lines.slice(0, half).join("\n"), inline: true },
           { name: "\u200b", value: lines.slice(half).join("\n"), inline: true },
-        ] })], ...EPH });
-      return;
+        ],
+        footer: "Les non trouvés sont simplement ignorés — rien ne casse",
+      })], ...EPH });
+    }
+
+    if (sub === "scan") {
+      const r = buildIndex(i.guild);
+      const found = keys.filter((k) => resolveLogChannel(i.guild, k, config)).length;
+      return i.reply({ content: `Indexé : **${r.channels}** salons et **${r.categories}** catégories. **${found}/${keys.length}** types de logs routés.`, ...EPH });
     }
 
     if (sub === "set") {
       const type = i.options.getString("type");
-      if (!LOG_ROUTES[type]) return i.reply({ content: "Type inconnu. Utilise l'autocomplétion.", ...EPH });
-      await updateConfig(i.guild.id, { logOverrides: { ...config.logOverrides, [type]: i.options.getChannel("salon").id } });
-      return i.reply({ content: `\`${type}\` envoyé vers ${i.options.getChannel("salon")}.`, ...EPH });
+      if (!LOG_ROUTES[type]) return i.reply({ content: "Type inconnu — utilise l'autocomplétion.", ...EPH });
+      const ch = i.options.getChannel("salon");
+      await updateConfig(i.guildId, { logOverrides: { ...config.logOverrides, [type]: ch.id } });
+      return i.reply({ content: `\`${type}\` sera envoyé dans ${ch}.`, ...EPH });
     }
 
     if (sub === "reset") {
-      await updateConfig(i.guild.id, { logOverrides: {} });
+      await updateConfig(i.guildId, { logOverrides: {} });
       return i.reply({ content: "Retour à la détection automatique par nom de salon.", ...EPH });
     }
 
     if (sub === "actif") {
       const v = i.options.getBoolean("valeur");
-      await updateConfig(i.guild.id, { logsEnabled: v });
-      return i.reply({ content: `Logs ${v ? "activés" : "coupés"}.`, ...EPH });
+      await updateConfig(i.guildId, { logsEnabled: v });
+      return i.reply({ content: `Journalisation ${v ? "activée" : "coupée"}.`, ...EPH });
     }
-
-    if (sub === "scan") {
-      const r = buildIndex(i.guild);
-      const found = Object.keys(LOG_ROUTES).filter((k) => resolveLogChannel(i.guild, k, config)).length;
-      return i.reply({ content: `Scan terminé : ${r.channels} salons, ${r.categories} catégories indexés. ${found}/${Object.keys(LOG_ROUTES).length} types de logs routés.`, ...EPH });
-    }
-  });
-
-def(new SlashCommandBuilder().setName("config").setDescription("Configuration de 0x")
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild.toString())
-  .addSubcommand((s) => s.setName("view").setDescription("Affiche la configuration"))
-  .addSubcommand((s) => s.setName("staff").setDescription("Rôle staff (accès aux tickets)")
-    .addRoleOption((o) => o.setName("role").setDescription("Le rôle").setRequired(true)))
-  .addSubcommand((s) => s.setName("alcatraz").setDescription("Rôle prison")
-    .addRoleOption((o) => o.setName("role").setDescription("Le rôle").setRequired(true)))
-  .addSubcommand((s) => s.setName("autorole").setDescription("Rôle donné à l'arrivée")
-    .addRoleOption((o) => o.setName("role").setDescription("Le rôle").setRequired(true)))
-  .addSubcommand((s) => s.setName("bienvenue").setDescription("Message d'accueil")
-    .addChannelOption((o) => o.setName("salon").setDescription("Salon").addChannelTypes(ChannelType.GuildText).setRequired(true))
-    .addStringOption((o) => o.setName("message").setDescription("Variables : {user} {tag} {server} {count}")))
-  .addSubcommand((s) => s.setName("niveaux").setDescription("Système d'XP")
-    .addBooleanOption((o) => o.setName("actif").setDescription("Activer ?").setRequired(true))
-    .addChannelOption((o) => o.setName("salon").setDescription("Salon des annonces").addChannelTypes(ChannelType.GuildText)))
-  .addSubcommand((s) => s.setName("recompense").setDescription("Rôle offert à un niveau")
-    .addIntegerOption((o) => o.setName("niveau").setDescription("Niveau requis").setRequired(true).setMinValue(1).setMaxValue(200))
-    .addRoleOption((o) => o.setName("role").setDescription("Rôle à donner").setRequired(true)))
-  .addSubcommand((s) => s.setName("economie").setDescription("Paramètres des coins")
-    .addBooleanOption((o) => o.setName("actif").setDescription("Activer ?"))
-    .addStringOption((o) => o.setName("symbole").setDescription("Emoji de la monnaie"))
-    .addIntegerOption((o) => o.setName("quotidien").setDescription("Montant du /daily").setMinValue(0).setMaxValue(100000)))
-  .addSubcommand((s) => s.setName("piege-vocal").setDescription("Salon vocal piège (JOIN=BAN)")
-    .addChannelOption((o) => o.setName("salon").setDescription("Le vocal").addChannelTypes(ChannelType.GuildVoice).setRequired(true))
-    .addStringOption((o) => o.setName("action").setDescription("Que faire").setRequired(true)
-      .addChoices({ name: "désactivé", value: "off" }, { name: "expulser", value: "kick" }, { name: "bannir", value: "ban" })))
-  .addSubcommand((s) => s.setName("reset").setDescription("Remet la configuration à zéro")),
-  async (i) => {
-    const sub = i.options.getSubcommand();
-    const g = i.guild.id;
-    const c = await getConfig(g);
-    const show = (id, kind = "channel") => (id ? (kind === "role" ? `<@&${id}>` : `<#${id}>`) : "—");
-
-    if (sub === "view") {
-      const routed = Object.keys(LOG_ROUTES).filter((k) => resolveLogChannel(i.guild, k, c)).length;
-      return i.reply({ embeds: [embed({ title: "Configuration de 0x", fields: [
-        { name: "Rôle staff", value: show(c.staffRoleId, "role"), inline: true },
-        { name: "Rôle Alcatraz", value: show(c.jailRoleId, "role"), inline: true },
-        { name: "Autorole", value: show(c.autoroleId, "role"), inline: true },
-        { name: "Bienvenue", value: show(c.welcomeChannelId), inline: true },
-        { name: "Niveaux", value: c.levelsEnabled ? "Activés" : "Coupés", inline: true },
-        { name: "Économie", value: c.economy.enabled ? `Activée (${c.economy.currency})` : "Coupée", inline: true },
-        { name: "Logs", value: c.logsEnabled ? `Actifs — ${routed}/${Object.keys(LOG_ROUTES).length} routés` : "Coupés", inline: true },
-        { name: "Piège vocal", value: c.trapVoiceId ? `${show(c.trapVoiceId)} → ${c.trapAction}` : "—", inline: true },
-        { name: "Stockage", value: usingDatabase() ? "PostgreSQL" : "Mémoire", inline: true },
-        { name: "Automod", value: c.automod.enabled
-          ? `invit ${c.automod.antiInvite ? "on" : "off"} · liens ${c.automod.antiLink ? "on" : "off"} · flood ${c.automod.antiSpam ? `${c.automod.spamThreshold}/${Math.round(c.automod.spamWindowMs / 1000)}s` : "off"} · mentions ${c.automod.maxMentions || "∞"} · majuscules ${c.automod.capsPercent || "off"} · mots ${c.automod.bannedWords.length}`
-          : "Coupé" },
-        { name: "Anti-raid", value: c.antiraid.enabled
-          ? `${c.antiraid.joinThreshold} arrivées / ${Math.round(c.antiraid.joinWindowMs / 1000)}s · comptes < ${c.antiraid.minAccountAgeDays}j signalés · réaction : ${c.antiraid.onRaid}`
-          : "Coupé" },
-        { name: "Anti-nuke", value: c.antinuke.enabled
-          ? `salons ${c.antinuke.channelDeleteMax} · rôles ${c.antinuke.roleDeleteMax} · bans ${c.antinuke.banMax} / ${Math.round(c.antinuke.windowMs / 1000)}s · sanction : ${c.antinuke.punishment} · ${c.antinuke.whitelist.length} en liste blanche`
-          : "Coupé" },
-      ] })], ...EPH });
-    }
-
-    if (sub === "staff") { const r = i.options.getRole("role"); await updateConfig(g, { staffRoleId: r.id }); return i.reply({ content: `Rôle staff : ${r}.`, ...EPH }); }
-    if (sub === "alcatraz") { const r = i.options.getRole("role"); await updateConfig(g, { jailRoleId: r.id }); return i.reply({ content: `Rôle Alcatraz : ${r}.`, ...EPH }); }
-    if (sub === "autorole") {
-      const r = i.options.getRole("role");
-      if (r.position >= i.guild.members.me.roles.highest.position) return i.reply({ content: "Ce rôle est au-dessus du mien.", ...EPH });
-      await updateConfig(g, { autoroleId: r.id });
-      return i.reply({ content: `Autorole : ${r}.`, ...EPH });
-    }
-    if (sub === "bienvenue") {
-      const ch = i.options.getChannel("salon"); const msg = i.options.getString("message");
-      await updateConfig(g, { welcomeChannelId: ch.id, ...(msg ? { welcomeMessage: msg } : {}) });
-      return i.reply({ content: `Accueil activé dans ${ch}.`, ...EPH });
-    }
-    if (sub === "niveaux") {
-      const on = i.options.getBoolean("actif"); const ch = i.options.getChannel("salon");
-      await updateConfig(g, { levelsEnabled: on, ...(ch ? { funcOverrides: { ...c.funcOverrides, levelUp: ch.id } } : {}) });
-      return i.reply({ content: `Niveaux ${on ? "activés" : "coupés"}.`, ...EPH });
-    }
-    if (sub === "recompense") {
-      const lvl = i.options.getInteger("niveau"); const r = i.options.getRole("role");
-      if (r.position >= i.guild.members.me.roles.highest.position) return i.reply({ content: "Ce rôle est au-dessus du mien.", ...EPH });
-      await updateConfig(g, { levelRewards: { ...c.levelRewards, [lvl]: r.id } });
-      return i.reply({ content: `${r} sera donné au niveau ${lvl}.`, ...EPH });
-    }
-    if (sub === "economie") {
-      const patch = {};
-      const on = i.options.getBoolean("actif"); if (on !== null) patch.enabled = on;
-      const sym = i.options.getString("symbole"); if (sym) patch.currency = sym.slice(0, 8);
-      const d = i.options.getInteger("quotidien"); if (d !== null) patch.dailyAmount = d;
-      if (!Object.keys(patch).length) return i.reply({ content: "Aucun paramètre fourni.", ...EPH });
-      await updateConfig(g, { economy: patch });
-      return i.reply({ content: "Économie mise à jour.", ...EPH });
-    }
-    if (sub === "piege-vocal") {
-      const ch = i.options.getChannel("salon"); const action = i.options.getString("action");
-      await updateConfig(g, { trapVoiceId: action === "off" ? null : ch.id, trapAction: action });
-      return i.reply({ content: action === "off" ? "Piège vocal désactivé."
-        : `⚠️ Toute personne rejoignant ${ch} sera **${action === "ban" ? "bannie" : "expulsée"}** automatiquement (le staff est exempté).`, ...EPH });
-    }
-    if (sub === "reset") { await updateConfig(g, structuredClone(DEFAULT_CONFIG)); return i.reply({ content: "Configuration remise à zéro.", ...EPH }); }
-  });
-
-def(new SlashCommandBuilder().setName("automod").setDescription("Filtres automatiques")
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild.toString())
-  .addSubcommand((s) => s.setName("parametres").setDescription("Règle les filtres")
-    .addBooleanOption((o) => o.setName("actif").setDescription("Automod global"))
-    .addBooleanOption((o) => o.setName("anti_invitation").setDescription("Bloquer les invitations Discord"))
-    .addBooleanOption((o) => o.setName("anti_lien").setDescription("Bloquer tous les liens"))
-    .addBooleanOption((o) => o.setName("anti_spam").setDescription("Bloquer le flood"))
-    .addIntegerOption((o) => o.setName("seuil_spam").setDescription("Messages avant sanction").setMinValue(3).setMaxValue(20))
-    .addIntegerOption((o) => o.setName("fenetre_spam").setDescription("Fenêtre en secondes").setMinValue(3).setMaxValue(60))
-    .addIntegerOption((o) => o.setName("max_mentions").setDescription("0 = illimité").setMinValue(0).setMaxValue(30))
-    .addIntegerOption((o) => o.setName("majuscules").setDescription("% toléré, 0 = off").setMinValue(0).setMaxValue(100))
-    .addIntegerOption((o) => o.setName("max_emojis").setDescription("0 = illimité").setMinValue(0).setMaxValue(50)))
-  .addSubcommand((s) => s.setName("mot").setDescription("Liste des mots interdits")
-    .addStringOption((o) => o.setName("action").setDescription("Action").setRequired(true)
-      .addChoices({ name: "ajouter", value: "add" }, { name: "retirer", value: "remove" }, { name: "lister", value: "list" }))
-    .addStringOption((o) => o.setName("mot").setDescription("Le mot (ou plusieurs séparés par des virgules)")))
-  .addSubcommand((s) => s.setName("exemption").setDescription("Rôle exempté d'automod")
-    .addRoleOption((o) => o.setName("role").setDescription("Le rôle").setRequired(true)))
-  .addSubcommand((s) => s.setName("ignorer").setDescription("Salon ou catégorie ignoré")
-    .addChannelOption((o) => o.setName("salon").setDescription("Salon ou catégorie").setRequired(true))),
-  async (i) => {
-    const sub = i.options.getSubcommand();
-    const g = i.guild.id;
-    const c = await getConfig(g);
-
-    if (sub === "parametres") {
-      const patch = {};
-      const bools = { actif: "enabled", anti_invitation: "antiInvite", anti_lien: "antiLink", anti_spam: "antiSpam" };
-      for (const [opt, key] of Object.entries(bools)) { const v = i.options.getBoolean(opt); if (v !== null) patch[key] = v; }
-      const ints = { seuil_spam: "spamThreshold", max_mentions: "maxMentions", majuscules: "capsPercent", max_emojis: "maxEmojis" };
-      for (const [opt, key] of Object.entries(ints)) { const v = i.options.getInteger(opt); if (v !== null) patch[key] = v; }
-      const w = i.options.getInteger("fenetre_spam"); if (w !== null) patch.spamWindowMs = w * 1000;
-      if (!Object.keys(patch).length) return i.reply({ content: "Aucun paramètre fourni. `/config view` pour voir l'état.", ...EPH });
-      await updateConfig(g, { automod: patch });
-      return i.reply({ content: "Automod mis à jour.", ...EPH });
-    }
-
-    if (sub === "mot") {
-      const action = i.options.getString("action");
-      const list = [...c.automod.bannedWords];
-      if (action === "list")
-        return i.reply({ content: list.length ? `${list.length} mot(s) :\n||${list.join(", ")}||` : "Aucun mot interdit.", ...EPH });
-      const raw = i.options.getString("mot");
-      if (!raw) return i.reply({ content: "Précise le mot avec l'option `mot`.", ...EPH });
-      const words = raw.toLowerCase().split(",").map((w) => w.trim()).filter(Boolean);
-      let n = 0;
-      for (const w of words) {
-        if (action === "add") { if (!list.includes(w)) { list.push(w); n++; } }
-        else { const idx = list.indexOf(w); if (idx !== -1) { list.splice(idx, 1); n++; } }
-      }
-      await updateConfig(g, { automod: { bannedWords: list } });
-      return i.reply({ content: `${n} mot(s) ${action === "add" ? "ajouté(s)" : "retiré(s)"}. Total : ${list.length}.`, ...EPH });
-    }
-
-    if (sub === "exemption") {
-      const r = i.options.getRole("role");
-      const list = [...c.automod.exemptRoles];
-      const idx = list.indexOf(r.id);
-      idx === -1 ? list.push(r.id) : list.splice(idx, 1);
-      await updateConfig(g, { automod: { exemptRoles: list } });
-      return i.reply({ content: `${r} ${idx === -1 ? "est exempté" : "n'est plus exempté"}.`, ...EPH });
-    }
-
-    if (sub === "ignorer") {
-      const ch = i.options.getChannel("salon");
-      const list = [...c.automod.ignoredChannels];
-      const idx = list.indexOf(ch.id);
-      idx === -1 ? list.push(ch.id) : list.splice(idx, 1);
-      await updateConfig(g, { automod: { ignoredChannels: list } });
-      return i.reply({ content: `${ch} ${idx === -1 ? "est ignoré" : "n'est plus ignoré"} par l'automod.`, ...EPH });
-    }
-  });
-
-def(new SlashCommandBuilder().setName("protection").setDescription("Anti-raid et anti-nuke")
-  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator.toString())
-  .addSubcommand((s) => s.setName("antiraid").setDescription("Paramètres anti-raid")
-    .addBooleanOption((o) => o.setName("actif").setDescription("Activer ?"))
-    .addIntegerOption((o) => o.setName("seuil").setDescription("Arrivées simultanées déclenchant l'alerte").setMinValue(3).setMaxValue(50))
-    .addIntegerOption((o) => o.setName("fenetre").setDescription("Fenêtre en secondes").setMinValue(5).setMaxValue(120))
-    .addIntegerOption((o) => o.setName("age_min").setDescription("Âge minimum du compte en jours (0 = off)").setMinValue(0).setMaxValue(90))
-    .addStringOption((o) => o.setName("reaction").setDescription("Que faire en cas de raid")
-      .addChoices({ name: "verrouiller le serveur", value: "lockdown" }, { name: "expulser les arrivants", value: "kick" }, { name: "alerter seulement", value: "off" })))
-  .addSubcommand((s) => s.setName("antinuke").setDescription("Paramètres anti-nuke")
-    .addBooleanOption((o) => o.setName("actif").setDescription("Activer ?"))
-    .addIntegerOption((o) => o.setName("suppr_salons").setDescription("Salons supprimés max").setMinValue(1).setMaxValue(20))
-    .addIntegerOption((o) => o.setName("suppr_roles").setDescription("Rôles supprimés max").setMinValue(1).setMaxValue(20))
-    .addIntegerOption((o) => o.setName("bans").setDescription("Bannissements max").setMinValue(1).setMaxValue(30))
-    .addIntegerOption((o) => o.setName("fenetre").setDescription("Fenêtre en secondes").setMinValue(5).setMaxValue(120))
-    .addStringOption((o) => o.setName("sanction").setDescription("Réaction")
-      .addChoices({ name: "retirer tous les rôles", value: "strip" }, { name: "bannir", value: "ban" }, { name: "alerter seulement", value: "alert" })))
-  .addSubcommand((s) => s.setName("whitelist").setDescription("Ajoute/retire quelqu'un de la liste blanche anti-nuke")
-    .addUserOption((o) => o.setName("membre").setDescription("Le membre").setRequired(true))),
-  async (i) => {
-    const sub = i.options.getSubcommand();
-    const g = i.guild.id;
-    const c = await getConfig(g);
-
-    if (sub === "antiraid") {
-      const patch = {};
-      const on = i.options.getBoolean("actif"); if (on !== null) patch.enabled = on;
-      const seuil = i.options.getInteger("seuil"); if (seuil !== null) patch.joinThreshold = seuil;
-      const f = i.options.getInteger("fenetre"); if (f !== null) patch.joinWindowMs = f * 1000;
-      const age = i.options.getInteger("age_min"); if (age !== null) patch.minAccountAgeDays = age;
-      const r = i.options.getString("reaction"); if (r) patch.onRaid = r;
-      if (!Object.keys(patch).length) return i.reply({ content: "Aucun paramètre fourni.", ...EPH });
-      await updateConfig(g, { antiraid: patch });
-      return i.reply({ content: "Anti-raid mis à jour.", ...EPH });
-    }
-
-    if (sub === "antinuke") {
-      const patch = {};
-      const on = i.options.getBoolean("actif"); if (on !== null) patch.enabled = on;
-      const cd = i.options.getInteger("suppr_salons"); if (cd !== null) patch.channelDeleteMax = cd;
-      const rd = i.options.getInteger("suppr_roles"); if (rd !== null) patch.roleDeleteMax = rd;
-      const b = i.options.getInteger("bans"); if (b !== null) patch.banMax = b;
-      const f = i.options.getInteger("fenetre"); if (f !== null) patch.windowMs = f * 1000;
-      const p = i.options.getString("sanction"); if (p) patch.punishment = p;
-      if (!Object.keys(patch).length) return i.reply({ content: "Aucun paramètre fourni.", ...EPH });
-      await updateConfig(g, { antinuke: patch });
-      return i.reply({ content: "Anti-nuke mis à jour.", ...EPH });
-    }
-
-    if (sub === "whitelist") {
-      const u = i.options.getUser("membre");
-      const list = [...c.antinuke.whitelist];
-      const idx = list.indexOf(u.id);
-      idx === -1 ? list.push(u.id) : list.splice(idx, 1);
-      await updateConfig(g, { antinuke: { whitelist: list } });
-      return i.reply({ content: `**${u.tag}** ${idx === -1 ? "est en liste blanche" : "n'est plus en liste blanche"} anti-nuke.`, ...EPH });
-    }
-  });
-
-def(new SlashCommandBuilder().setName("compteurs").setDescription("Force la mise à jour des compteurs vocaux")
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild.toString()),
-  async (i) => {
-    await i.deferReply(EPH);
-    await updateCounters(i.guild);
-    await i.editReply("Compteurs mis à jour. (Discord limite les renommages à 2 par 10 minutes et par salon.)");
-  });
-
-def(new SlashCommandBuilder().setName("help").setDescription("Toutes les commandes de 0x"),
-  async (i) => {
-    await i.reply({ embeds: [embed({ title: "0x — commandes", color: COLORS.primary, fields: [
-      { name: "Modération", value: "`/ban` `/unban` `/kick` `/timeout` `/untimeout` `/warn` `/historique` `/delsanction` `/clearsanctions` `/clear` `/slowmode` `/lock` `/unlock`" },
-      { name: "Protection", value: "`/lockdown` `/alcatraz` `/liberer` `/protection antiraid` `/protection antinuke` `/protection whitelist` `/automod`" },
-      { name: "Tickets", value: "`/ticket panel` `/ticket ajouter` `/ticket retirer` `/ticket renommer` `/ticket stats`" },
-      { name: "Communauté", value: "`/rank` `/top` `/coins` `/daily` `/work` `/pay` `/gw start` `/sondage` `/confession`" },
-      { name: "Staff", value: "`/absence` `/absences` `/say` `/panel roles` `/coins-admin`" },
-      { name: "Administration", value: "`/config view` `/logs map` `/logs set` `/logs scan` `/compteurs`" },
-    ], footer: "Les commandes staff ne sont visibles que par les rôles autorisés." })], ...EPH });
   });
 
 /* ------------------------------ AUTOCOMPLÉTION ---------------------------- */
@@ -2350,15 +3610,13 @@ def(new SlashCommandBuilder().setName("help").setDescription("Toutes les command
 async function handleAutocomplete(interaction) {
   if (interaction.commandName !== "logs") return;
   const focused = interaction.options.getFocused().toLowerCase();
-  const choices = Object.keys(LOG_ROUTES)
-    .filter((k) => k.toLowerCase().includes(focused))
-    .slice(0, 25)
-    .map((k) => ({ name: k, value: k }));
-  await interaction.respond(choices).catch(() => null);
+  await interaction.respond(
+    Object.keys(LOG_ROUTES).filter((k) => k.includes(focused)).slice(0, 25).map((k) => ({ name: k, value: k }))
+  ).catch(() => null);
 }
 
 /* ========================================================================== */
-/*                     6 — CLIENT, EVENEMENTS, DEMARRAGE                      */
+/*                     10 - CLIENT, EVENEMENTS, DEMARRAGE                     */
 /* ========================================================================== */
 
 // index.js — client, événements, démarrage.
@@ -2413,14 +3671,22 @@ async function deployCommands() {
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`[0x] connecté : ${c.user.tag}`);
+  console.log("[0x] configuration verrouillee sur l identifiant " + OWNER_ID);
   await deployCommands();
 
   for (const guild of c.guilds.cache.values()) {
     const r = buildIndex(guild);
     console.log(`[index] ${guild.name} : ${r.channels} salons, ${r.categories} catégories`);
-    try { await guild.members.fetch(); console.log(`[cache] ${guild.memberCount} membres en cache`); }
-    catch { console.warn("[cache] fetch des membres impossible (intent manquant ?)"); }
-    await updateCounters(guild).catch(() => null);
+    try {
+      await guild.members.fetch();
+      console.log(`[cache] ${num(guild.members.cache.size)} / ${num(guild.memberCount)} membres en cache`);
+    } catch (e) {
+      console.warn("[cache] fetch des membres impossible :", e.message, "— active Server Members Intent");
+    }
+    const counts = await computeCounts(guild);
+    console.log(`[compteurs] humains ${num(counts.members)} · connectés ${counts.online ?? "n/d"} · vocal ${counts.voice} · états vocaux suivis ${guild.voiceStates.cache.size}`);
+    if (counts.online === null) console.warn("[compteurs] Connectés indisponible → active Presence Intent dans le portail développeur");
+    await updateCounters(guild, true).catch(() => null);
     await refreshTicketCounter(guild).catch(() => null);
   }
 
@@ -2461,11 +3727,14 @@ client.on(Events.InteractionCreate, async (i) => {
       return cmd.execute(i, { client });
     }
 
+    // Panneau de contrôle et panneaux publics
+    if (i.customId?.startsWith("p:") || i.customId?.startsWith("pm:") || i.customId?.startsWith("pub:")) {
+      const handled = await handlePanel(i);
+      if (handled !== false) return;
+    }
+
     if (i.isStringSelectMenu()) {
-      if (i.customId === "ticket:pick") {
-        await i.deferReply(EPH);
-        return createTicket(i, i.values[0]);
-      }
+      if (i.customId === "ticket:pick") { await i.deferReply(EPH); return createTicket(i, i.values[0]); }
       if (i.customId === "rolemenu") return handleRoleMenu(i);
       return;
     }
@@ -2473,22 +3742,26 @@ client.on(Events.InteractionCreate, async (i) => {
     if (i.isButton()) {
       const [ns, action, arg] = i.customId.split(":");
       if (ns === "ticket") {
+        const cfg = await getConfig(i.guildId);
         if (action === "close") {
-          if (!i.channel.name.startsWith("ticket-")) return;
+          if (!i.channel.name.includes("ticket-")) return;
+          const owner = i.channel.topic?.includes(i.user.id);
+          if (!owner && permLevel(i.member, cfg) < 1)
+            return i.reply({ content: "Seuls l'auteur du ticket et le staff peuvent le fermer.", ...EPH });
           await i.reply({ content: "Fermeture dans 5 secondes…" });
           return closeTicket(i);
         }
         if (action === "claim") {
-          await i.reply({ content: `${i.user} prend ce ticket en charge.` });
+          if (permLevel(i.member, cfg) < 1) return i.reply({ content: "Réservé au staff.", ...EPH });
+          await i.reply({ embeds: [embed({ guild: i.guild, color: COLORS.success,
+            author: { name: "✋  Ticket pris en charge" }, description: `${i.user} s'occupe de cette demande.` })] });
+          if (i.channel.name.startsWith("✅")) return;
           return i.channel.setName(`✅-${i.channel.name}`.slice(0, 90)).catch(() => null);
         }
       }
       if (ns === "gw") return handleGiveawayButton(i, action, arg);
+      if (ns === "drop" && action === "claim") return claimDrop(i, arg);
       return;
-    }
-
-    if (i.isModalSubmit() && i.customId === "confession:modal") {
-      return postConfession(i, i.fields.getTextInputValue("text"));
     }
   } catch (err) {
     console.error("[interaction]", i.commandName ?? i.customId, err);
@@ -2673,6 +3946,14 @@ client.on(Events.MessageCreate, async (message) => {
     return;
   }
 
+  // Colis automatiques dans le salon dédié
+  if (config.economy.enabled && config.economy.dropChance > 0 && message.channel.id === config.economy.dropChannelId) {
+    if (Math.random() * 100 < config.economy.dropChance) {
+      const amount = config.economy.dropMin + Math.floor(Math.random() * (config.economy.dropMax - config.economy.dropMin + 1));
+      launchDrop(message.guild, message.channel, amount).catch(() => null);
+    }
+  }
+
   if (!config.levelsEnabled) return;
   const key = `${message.guild.id}:${message.author.id}`;
   const now = Date.now();
@@ -2745,7 +4026,7 @@ client.on(Events.VoiceStateUpdate, async (before, after) => {
 
   // Piège vocal (JOIN = sanction)
   if (config.trapVoiceId && config.trapAction !== "off" && after.channelId === config.trapVoiceId && before.channelId !== after.channelId) {
-    const staff = member.permissions.has(PermissionFlagsBits.ManageMessages) || member.id === guild.ownerId;
+    const staff = isOwner(member.id) || member.permissions.has(PermissionFlagsBits.ManageMessages) || member.id === guild.ownerId;
     if (!staff) {
       await member.voice.disconnect("Piège vocal").catch(() => null);
       const action = config.trapAction;
