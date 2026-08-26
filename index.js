@@ -15,6 +15,18 @@
 //     Seul le proprietaire de 0x peut passer outre.
 //     Interrupteur : Panneau > Permissions > Immunite admin.
 //
+//   ARRIERE-SALLE (activites illegales)
+//     Cinq coups a tenter. Reussi : tu gardes tout. Attrape : tu rembourses
+//     LE DOUBLE de ce que tu visais, quitte a finir en dette.
+//     La pression policiere monte a chaque coup et fait chuter tes chances.
+//     En dette, les tables du casino et la boutique se ferment.
+//
+//   CASINO
+//     Six jeux aux probabilites reelles : machine a sous, blackjack complet,
+//     roulette europeenne, demineur, des a cote reglable, pile ou face.
+//     La maison garde 3 % : l'economie ne s'emballe pas.
+//     Panneau > Economie > Casino pour les mises et l'ouverture des jeux.
+//
 //   GRADES
 //     Echelle de roles gagnee a l'heure de vocal ET au nombre de messages.
 //     Promotion automatique, ancien grade retire, annonce dans le salon des
@@ -259,6 +271,7 @@ const FUNC_CHANNELS = {
   absences: ["absences", "absences-ads"],
   partenariats: ["partenariats", "annonce"],
   boutique: ["coins"],
+  casino: ["casino", "coins"],
   drops: ["coins"],
   tempVoiceHub: ["creer-ton-vocal", "cree-ton-vocal", "creer-un-vocal", "creer-son-vocal"],
   sondages: ["sondage", "sondages"],
@@ -659,6 +672,22 @@ const DEFAULT_CONFIG = {
     ],
   },
 
+  // Quartier illégal : gros gains, risque réel de dette
+  crime: {
+    enabled: true,
+    heatDecayPerMin: 1,      // la pression retombe d'un point par minute
+    debtBlocksCasino: true,  // en dette, plus de mise au casino ni d'achat
+    maxDebt: 100_000,
+  },
+
+  // Casino
+  casino: {
+    enabled: true,
+    minBet: 50,
+    maxBet: 250_000,
+    games: { slots: true, blackjack: true, roulette: true, mines: true, dice: true, flip: true },
+  },
+
   // Rappel des tickets laissés sans réponse
   ticketReminder: { enabled: true, hours: 6 },
   ticketCategories: {},
@@ -730,6 +759,7 @@ const DEFAULT_CONFIG = {
     workMin: 40,
     workMax: 180,
     workCooldownMs: 30 * 60_000,
+    casinoChannelId: null,
     dropChannelId: null,
     dropChance: 0,      // % de chance par message dans le salon de drops
     dropMin: 100,
@@ -791,6 +821,8 @@ async function initDatabase() {
     await q(`CREATE TABLE IF NOT EXISTS economy (
       guild_id TEXT, user_id TEXT, coins BIGINT NOT NULL DEFAULT 0,
       last_daily TIMESTAMPTZ, last_work TIMESTAMPTZ, streak INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id))`);
+    await q(`ALTER TABLE economy ADD COLUMN IF NOT EXISTS heat INTEGER NOT NULL DEFAULT 0`);
+    await q(`ALTER TABLE economy ADD COLUMN IF NOT EXISTS heat_at TIMESTAMPTZ`);
     await q(`CREATE TABLE IF NOT EXISTS giveaways (
       id SERIAL PRIMARY KEY, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT,
       prize TEXT NOT NULL, winners INTEGER NOT NULL DEFAULT 1, host_id TEXT NOT NULL,
@@ -952,17 +984,52 @@ async function getWallet(guildId, userId) {
   return mem.economy.get(`${guildId}:${userId}`) ?? { coins: 0, lastDaily: null, lastWork: null, streak: 0 };
 }
 
-async function addCoins(guildId, userId, amount) {
+/**
+ * Crédite ou débite. `allowNegative` autorise la dette : c'est ce qui permet
+ * de finir en déficit après un coup illégal raté.
+ */
+async function addCoins(guildId, userId, amount, allowNegative = false) {
   if (ready) {
+    const expr = allowNegative ? "economy.coins+$3" : "GREATEST(0, economy.coins+$3)";
     const r = await q(`INSERT INTO economy (guild_id,user_id,coins) VALUES ($1,$2,$3)
-      ON CONFLICT (guild_id,user_id) DO UPDATE SET coins=GREATEST(0, economy.coins+$3) RETURNING coins`, [guildId, userId, amount]);
+      ON CONFLICT (guild_id,user_id) DO UPDATE SET coins=${expr} RETURNING coins`, [guildId, userId, amount]);
     return Number(r.rows[0]?.coins ?? 0);
   }
   const k = `${guildId}:${userId}`;
-  const w = mem.economy.get(k) ?? { coins: 0, lastDaily: null, lastWork: null, streak: 0 };
-  w.coins = Math.max(0, w.coins + amount);
+  const w = mem.economy.get(k) ?? { coins: 0, lastDaily: null, lastWork: null, streak: 0, heat: 0 };
+  w.coins = allowNegative ? w.coins + amount : Math.max(0, w.coins + amount);
   mem.economy.set(k, w);
   return w.coins;
+}
+
+/* -------------------------- PRESSION POLICIÈRE ---------------------------- */
+
+async function getHeat(guildId, userId, decayPerMin = 1) {
+  let heat = 0, at = null;
+  if (ready) {
+    const r = await q("SELECT heat, heat_at FROM economy WHERE guild_id=$1 AND user_id=$2", [guildId, userId]);
+    heat = r.rows[0]?.heat ?? 0; at = r.rows[0]?.heat_at ?? null;
+  } else {
+    const w = mem.economy.get(`${guildId}:${userId}`);
+    heat = w?.heat ?? 0; at = w?.heatAt ?? null;
+  }
+  if (!heat) return 0;
+  const minutes = at ? (Date.now() - new Date(at).getTime()) / 60000 : 0;
+  return Math.max(0, Math.round(heat - minutes * decayPerMin));
+}
+
+async function setHeat(guildId, userId, heat) {
+  const v = Math.max(0, Math.min(100, Math.round(heat)));
+  if (ready) {
+    await q(`INSERT INTO economy (guild_id,user_id,heat,heat_at) VALUES ($1,$2,$3,NOW())
+      ON CONFLICT (guild_id,user_id) DO UPDATE SET heat=$3, heat_at=NOW()`, [guildId, userId, v]);
+    return v;
+  }
+  const k = `${guildId}:${userId}`;
+  const w = mem.economy.get(k) ?? { coins: 0, lastDaily: null, lastWork: null, streak: 0 };
+  w.heat = v; w.heatAt = new Date();
+  mem.economy.set(k, w);
+  return v;
 }
 
 async function stampEconomy(guildId, userId, field, value, streak = null) {
@@ -2605,6 +2672,7 @@ function memberPanel(guild) {
       new ActionRowBuilder().addComponents(
         pbtn("pub:top:xp", "Top XP", ButtonStyle.Secondary, "🏆"),
         pbtn("pub:top:coins", "Top coins", ButtonStyle.Secondary, "💰"),
+        pbtn("cas:open", "Casino", ButtonStyle.Danger, "🎰"),
         pbtn("pub:shop", "Boutique", ButtonStyle.Secondary, "🛒"),
         pbtn("pub:pay", "Envoyer des coins", ButtonStyle.Secondary, "🤝"),
       ),
@@ -2620,7 +2688,1025 @@ function memberPanel(guild) {
 }
 
 /* ========================================================================== */
-/*                             8 - PURGE DE MASSE                             */
+/*                  8 - ARRIERE-SALLE : ACTIVITES ILLEGALES                   */
+/* ========================================================================== */
+
+// crime.js — le quartier illégal. Réussi, tu gardes tout.
+// Attrapé, tu rembourses le double de ce que tu visais — quitte à finir en dette.
+
+
+const xb = (id, label, style = ButtonStyle.Secondary, emoji, disabled = false) => {
+  const b = new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style).setDisabled(disabled);
+  if (emoji) b.setEmoji(emoji);
+  return b;
+};
+const xrow = (...c) => new ActionRowBuilder().addComponents(...c);
+
+/* ========================================================================== */
+/*                              LES COUPS                                     */
+/* ========================================================================== */
+
+/**
+ * `chance` est la probabilité de base de s'en sortir. La pression policière
+ * la fait chuter. Comme un échec coûte le double du gain visé, un coup n'est
+ * rentable en moyenne qu'au-dessus de 66 % de réussite : aucun ne l'est
+ * durablement, c'est ce qui protège l'économie.
+ */
+const JOBS = {
+  pickpocket: {
+    label: "Pickpocket", emoji: "👝", chance: 0.65, min: 200, max: 900, heat: 8,
+    flavor: ["Tu frôles un joueur à la table de roulette…", "Une poche mal fermée, une main rapide…"],
+    caught: ["Le videur t'attrape le poignet.", "Un agent en civil te repère dans le reflet du miroir."],
+  },
+  trafic: {
+    label: "Trafic de jetons", emoji: "🎫", chance: 0.60, min: 600, max: 2500, heat: 12,
+    flavor: ["Tu revends des jetons volés en coulisses…", "Un contact t'attend près des vestiaires…"],
+    caught: ["Les jetons sont marqués. La sécurité arrive.", "Ton contact était infiltré."],
+  },
+  truquer: {
+    label: "Truquer une machine", emoji: "🔧", chance: 0.47, min: 3000, max: 12_000, heat: 20,
+    flavor: ["Tu glisses un aimant derrière le rouleau…", "Un fil dénudé dans le lecteur de jetons…"],
+    caught: ["La machine se bloque et hurle. Tout le monde se retourne.", "Le technicien passait justement par là."],
+  },
+  cambriolage: {
+    label: "Cambrioler un coffre", emoji: "🧰", chance: 0.52, min: 1500, max: 6000, heat: 18,
+    flavor: ["Le coffre du bureau de l'étage…", "Tu as trouvé la combinaison sur un post-it…"],
+    caught: ["Le coffre était sous alarme silencieuse.", "Une caméra que tu n'avais pas vue."],
+  },
+  braquage: {
+    label: "Braquer la caisse", emoji: "💰", chance: 0.33, min: 10_000, max: 40_000, heat: 35,
+    flavor: ["La caisse centrale, en pleine nuit…", "Deux minutes, montre en main…"],
+    caught: ["Les portes se verrouillent. Tu es cerné.", "La police attendait dehors depuis le début."],
+  },
+};
+
+/* ========================================================================== */
+/*                              TENTATIVE                                     */
+/* ========================================================================== */
+
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+/** Chance réelle, une fois la pression policière déduite. */
+function realChance(job, heat) {
+  return Math.max(0.05, job.chance - (heat / 100) * 0.30);
+}
+
+/**
+ * Tente un coup.
+ * @returns {Promise<{ok, gain, perte, solde, heat, chance, job}>}
+ */
+async function attempt(guild, user, jobId) {
+  const config = await getConfig(guild.id);
+  const job = JOBS[jobId];
+  if (!job) return null;
+
+  const decay = config.crime?.heatDecayPerMin ?? 1;
+  const heat = await getHeat(guild.id, user.id, decay);
+  const chance = realChance(job, heat);
+
+  // Le butin est tiré AVANT le sort : c'est ce qu'on gagne, ou le double qu'on rembourse
+  const gain = job.min + Math.floor(Math.random() * (job.max - job.min + 1));
+  const reussi = Math.random() < chance;
+
+  const newHeat = await setHeat(guild.id, user.id, heat + job.heat + (reussi ? 0 : 10));
+  const delta = reussi ? gain : -gain * 2;
+  const solde = await addCoins(guild.id, user.id, delta, true);
+
+  if (!reussi) {
+    await log(guild, "coins", embed({
+      guild, color: COLORS.danger, author: { name: "🚔  Coup manqué" },
+      fields: [
+        { name: "Joueur", value: user.tag, inline: true },
+        { name: "Coup", value: `${job.emoji} ${job.label}`, inline: true },
+        { name: "Amende", value: num(gain * 2), inline: true },
+        { name: "Solde après", value: num(solde), inline: true },
+      ],
+    })).catch(() => null);
+  }
+
+  return { ok: reussi, gain, perte: gain * 2, solde, heat: newHeat, chance, job };
+}
+
+/* ========================================================================== */
+/*                              AFFICHAGE                                     */
+/* ========================================================================== */
+
+const heatBar = (h) => `${bar(h, 100, 10)} ${h}/100`;
+
+async function crimeLobby(guild, user) {
+  const config = await getConfig(guild.id);
+  const c = config.economy.currency;
+  const w = await getWallet(guild.id, user.id);
+  const heat = await getHeat(guild.id, user.id, config.crime?.heatDecayPerMin ?? 1);
+
+  const lignes = Object.entries(JOBS).map(([id, j]) => {
+    const p = Math.round(realChance(j, heat) * 100);
+    return `${j.emoji} **${j.label}** — ${num(j.min)} à ${num(j.max)} ${c}\n`
+      + `　risque : **${p} %** de s'en sortir · amende **×2**`;
+  });
+
+  return {
+    embeds: [embed({
+      guild,
+      color: w.coins < 0 ? COLORS.danger : COLORS.neutral,
+      author: { name: "🚬  L'arrière-salle" },
+      description: [
+        "```",
+        "   ╔═══════════════════════════╗",
+        "   ║  ⚠  A R R I È R E - S A L L E ⚠  ║",
+        "   ╚═══════════════════════════╝",
+        "```",
+        w.coins < 0
+          ? `### 🚨 Tu dois **${num(-w.coins)} ${c}**\nRembourse avec le quotidien et le travail avant de remiser.`
+          : `Solde : **${c} ${num(w.coins)}**`,
+        "",
+        ...lignes,
+      ].join("\n"),
+      fields: [
+        { name: "🚔 Pression policière", value: heatBar(heat), inline: false },
+        { name: "La règle", value: "Réussi, tu **gardes tout**. Attrapé, tu rembourses **le double** de ce que tu visais — même si ça te met en dette." },
+      ],
+      footer: "Chaque coup fait monter la pression · elle retombe d'un point par minute",
+    })],
+    components: [
+      xrow(...Object.entries(JOBS).slice(0, 3).map(([id, j]) =>
+        xb(`cr:go:${id}`, j.label, ButtonStyle.Danger, j.emoji))),
+      xrow(...Object.entries(JOBS).slice(3).map(([id, j]) =>
+        xb(`cr:go:${id}`, j.label, ButtonStyle.Danger, j.emoji))),
+      xrow(xb("cr:lobby", "Actualiser", ButtonStyle.Secondary, "🔄"),
+           xb("cas:open", "Retour au casino", ButtonStyle.Primary, "🎰"),
+           xb("pub:work", "Travailler (légal)", ButtonStyle.Success, "💼")),
+    ],
+  };
+}
+
+function resultView(guild, user, r, currency) {
+  const j = r.job;
+  return {
+    embeds: [embed({
+      guild,
+      color: r.ok ? COLORS.success : COLORS.danger,
+      author: { name: r.ok ? `${j.emoji}  ${j.label} — réussi` : "🚔  Attrapé" },
+      description: [
+        `_${pick(r.ok ? j.flavor : j.caught)}_`,
+        "",
+        r.ok
+          ? `### + ${currency} ${num(r.gain)}\nTu gardes tout.`
+          : `### − ${currency} ${num(r.perte)}\nLe double de ce que tu visais (${num(r.gain)}).`,
+        "",
+        r.solde < 0
+          ? `**Tu es en dette de ${currency} ${num(-r.solde)}.**`
+          : `Solde : **${currency} ${num(r.solde)}**`,
+      ].join("\n"),
+      fields: [
+        { name: "Chance qu'il te restait", value: `${Math.round(r.chance * 100)} %`, inline: true },
+        { name: "🚔 Pression", value: heatBar(r.heat), inline: true },
+      ],
+      footer: r.solde < 0 ? "Le quotidien et le travail restent accessibles pour rembourser" : undefined,
+    })],
+    components: [xrow(
+      xb(`cr:go:${Object.keys(JOBS).find((k) => JOBS[k] === j)}`, "Recommencer", ButtonStyle.Danger, "🔁"),
+      xb("cr:lobby", "L'arrière-salle", ButtonStyle.Secondary, "🚬"),
+      xb("cas:open", "Casino", ButtonStyle.Primary, "🎰"),
+    )],
+  };
+}
+
+/* ========================================================================== */
+/*                                ROUTEUR                                     */
+/* ========================================================================== */
+
+async function handleCrime(i) {
+  const [, action, jobId] = i.customId.split(":");
+  const config = await getConfig(i.guildId);
+  if (!config.economy.enabled || config.crime?.enabled === false) {
+    return i.reply({ content: "L'arrière-salle est fermée.", ...EPH });
+  }
+
+  const reply = async (payload) => {
+    if (i.replied || i.deferred) return i.editReply(payload);
+    return i.update(payload).catch(() => i.reply({ ...payload, ...EPH }));
+  };
+
+  if (action === "lobby") return reply(await crimeLobby(i.guild, i.user));
+  if (action === "open") return i.reply({ ...(await crimeLobby(i.guild, i.user)), ...EPH });
+
+  if (action === "go") {
+    const w = await getWallet(i.guildId, i.user.id);
+    const maxDebt = config.crime?.maxDebt ?? 100_000;
+    if (w.coins <= -maxDebt) {
+      return reply({ embeds: [embed({ guild: i.guild, color: COLORS.danger,
+        author: { name: "🚨  Dette maximale atteinte" },
+        description: `Tu dois déjà **${num(-w.coins)}**. Rembourse avant de replonger.` })],
+        components: [xrow(xb("pub:work", "Travailler", ButtonStyle.Success, "💼"),
+          xb("pub:daily", "Quotidien", ButtonStyle.Success, "🎁"))] });
+    }
+    const r = await attempt(i.guild, i.user, jobId);
+    if (!r) return reply({ content: "Ce coup n'existe pas.", embeds: [], components: [] });
+    return reply(resultView(i.guild, i.user, r, config.economy.currency));
+  }
+}
+
+/** Le casino et la boutique refusent les joueurs endettés. */
+async function blockedByDebt(guildId, userId) {
+  const config = await getConfig(guildId);
+  if (config.crime?.debtBlocksCasino === false) return null;
+  const w = await getWallet(guildId, userId);
+  if (w.coins >= 0) return null;
+  return `Tu es en dette de **${config.economy.currency} ${num(-w.coins)}**. `
+    + "Rembourse avec le quotidien et le travail avant de remiser.";
+}
+
+/* ========================================================================== */
+/*                                 9 - CASINO                                 */
+/* ========================================================================== */
+
+// casino.js — le casino : jeux réels, probabilités et gains calculés.
+
+
+const cb = (id, label, style = ButtonStyle.Secondary, emoji, disabled = false) => {
+  const b = new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style).setDisabled(disabled);
+  if (emoji) b.setEmoji(emoji);
+  return b;
+};
+const crow = (...c) => new ActionRowBuilder().addComponents(...c);
+
+/* ========================================================================== */
+/*                              CATALOGUE                                     */
+/* ========================================================================== */
+
+const GAMES = {
+  slots:     { label: "Machine à sous", emoji: "🎰", desc: "3 rouleaux, jusqu'à ×1500" },
+  blackjack: { label: "Blackjack",      emoji: "🃏", desc: "Battre le croupier sans dépasser 21" },
+  roulette:  { label: "Roulette",       emoji: "🔴", desc: "Européenne, un seul zéro" },
+  mines:     { label: "Démineur",       emoji: "💣", desc: "Encaisse avant la mine" },
+  dice:      { label: "Dés",            emoji: "🎲", desc: "Plus haut ou plus bas, cote au choix" },
+  flip:      { label: "Pile ou face",   emoji: "🪙", desc: "Le plus simple, ×1,96" },
+};
+
+/** Avantage de la maison, appliqué à tous les gains calculés. */
+const EDGE = 0.03;
+
+/* ========================================================================== */
+/*                              SESSIONS                                      */
+/* ========================================================================== */
+
+const sessions = new Map();   // "guild:user" -> { game, bet, state, at }
+const key = (i) => `${i.guildId}:${i.user.id}`;
+
+function setSession(i, data) { sessions.set(key(i), { ...data, at: Date.now() }); }
+function getSession(i) {
+  const s = sessions.get(key(i));
+  if (!s || Date.now() - s.at > 15 * 60_000) { sessions.delete(key(i)); return null; }
+  return s;
+}
+function endSession(i) { sessions.delete(key(i)); }
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of sessions) if (now - v.at > 15 * 60_000) sessions.delete(k);
+}, 5 * 60_000).unref();
+
+/* ========================================================================== */
+/*                          MISE ET RÈGLEMENT                                 */
+/* ========================================================================== */
+
+async function limits(guildId) {
+  const c = await getConfig(guildId);
+  const cas = c.casino ?? {};
+  return { config: c, min: cas.minBet ?? 50, max: cas.maxBet ?? 250_000, enabled: cas.enabled !== false, games: cas.games ?? {} };
+}
+
+/** Retire la mise. @returns {Promise<{ok:boolean, reason?:string, solde?:number}>} */
+async function takeBet(i, bet) {
+  const dette = await blockedByDebt(i.guildId, i.user.id);
+  if (dette) return { ok: false, reason: dette };
+  const { min, max } = await limits(i.guildId);
+  if (!Number.isFinite(bet) || bet < min) return { ok: false, reason: `Mise minimum : **${num(min)}**.` };
+  if (bet > max) return { ok: false, reason: `Mise maximum : **${num(max)}**.` };
+  const w = await getWallet(i.guildId, i.user.id);
+  if (w.coins < bet) return { ok: false, reason: `Tu n'as que **${num(w.coins)}**.` };
+  const solde = await addCoins(i.guildId, i.user.id, -bet);
+  return { ok: true, solde };
+}
+
+/** Crédite le gain et journalise les gros coups. */
+async function payout(i, bet, amount, gameLabel) {
+  const solde = amount > 0 ? await addCoins(i.guildId, i.user.id, amount) : (await getWallet(i.guildId, i.user.id)).coins;
+  if (amount >= bet * 20 && amount > 0) {
+    await log(i.guild, "coins", embed({
+      guild: i.guild, color: COLORS.gold, author: { name: "🎰  Gros gain au casino" },
+      fields: [
+        { name: "Joueur", value: i.user.tag, inline: true },
+        { name: "Jeu", value: gameLabel, inline: true },
+        { name: "Mise", value: num(bet), inline: true },
+        { name: "Gain", value: num(amount), inline: true },
+        { name: "Multiplicateur", value: `×${(amount / bet).toFixed(2)}`, inline: true },
+      ],
+    })).catch(() => null);
+  }
+  return solde;
+}
+
+const money = (c, n) => `${c} ${num(n)}`;
+
+/* ========================================================================== */
+/*                                 HALL                                       */
+/* ========================================================================== */
+
+async function casinoLobby(guild, config, wallet) {
+  const c = config.economy.currency;
+  const cas = config.casino ?? {};
+  const actifs = Object.entries(GAMES).filter(([id]) => cas.games?.[id] !== false);
+
+  return {
+    embeds: [embed({
+      guild,
+      color: COLORS.gold,
+      author: { name: "🎰  Casino" },
+      description: [
+        "```",
+        "   ╔═════════════════════════════╗",
+        "   ║  ♠  ♥   C A S I N O   ♦  ♣  ║",
+        "   ╚═════════════════════════════╝",
+        "```",
+        wallet.coins < 0
+          ? `🚨 **Dette de ${money(c, -wallet.coins)}** — les tables te sont fermées.`
+          : `Jetons : **${money(c, wallet.coins)}**`,
+        `Mises de **${num(cas.minBet ?? 50)}** à **${num(cas.maxBet ?? 250_000)}**`,
+        "",
+        ...actifs.map(([, g]) => `${g.emoji} **${g.label}** — ${g.desc}`),
+      ].join("\n"),
+      footer: "Les gains sont calculés comme dans un vrai casino : la maison garde 3 %",
+    })],
+    components: [
+      crow(...actifs.slice(0, 3).map(([id, g]) => cb(`cas:pick:${id}`, g.label, ButtonStyle.Primary, g.emoji))),
+      crow(...actifs.slice(3, 6).map(([id, g]) => cb(`cas:pick:${id}`, g.label, ButtonStyle.Primary, g.emoji))),
+      crow(cb("pub:coins", "Mes jetons", ButtonStyle.Secondary, "🪙"),
+           cb("pub:top:coins", "Les plus riches", ButtonStyle.Secondary, "🏆"),
+           cb("cr:open", "Arrière-salle", ButtonStyle.Danger, "🚬")),
+    ],
+  };
+}
+
+/** Choix de la mise, commun à tous les jeux. */
+function betView(guild, game, wallet, currency) {
+  const g = GAMES[game];
+  const presets = [100, 500, 1000, 5000].filter((v) => v <= wallet.coins);
+  return {
+    embeds: [embed({
+      guild, color: COLORS.gold, author: { name: `${g.emoji}  ${g.label}` },
+      description: `${g.desc}\n\nSolde : **${money(currency, wallet.coins)}**\n\nCombien tu mises ?`,
+    })],
+    components: [
+      crow(
+        ...presets.map((v) => cb(`cas:bet:${game}:${v}`, num(v), ButtonStyle.Secondary)),
+        cb(`cas:betmodal:${game}`, "Autre", ButtonStyle.Primary, "✏️"),
+      ),
+      crow(
+        cb(`cas:bet:${game}:${Math.floor(wallet.coins / 2)}`, "Moitié", ButtonStyle.Secondary, "½", wallet.coins < 2),
+        cb(`cas:bet:${game}:${wallet.coins}`, "Tout", ButtonStyle.Danger, "🔥", wallet.coins < 1),
+        cb("cas:lobby", "Retour", ButtonStyle.Secondary, "◀️"),
+      ),
+    ],
+  };
+}
+
+/* ========================================================================== */
+/*                          MACHINE À SOUS                                    */
+/* ========================================================================== */
+
+// Table calibrée par simulation : retour au joueur ≈ 95 %.
+// Les paires ne rendent que la mise, et seulement sur les symboles rares —
+// sinon elles font exploser le retour bien au-dessus de 100 %.
+const REELS = [
+  { s: "🍒", w: 22, x3: 10,   pair: 0 },
+  { s: "🍋", w: 20, x3: 16,   pair: 0 },
+  { s: "🍊", w: 16, x3: 27,   pair: 0 },
+  { s: "🔔", w: 12, x3: 40,   pair: 1 },
+  { s: "💎", w: 7,  x3: 125,  pair: 1 },
+  { s: "7️⃣", w: 4,  x3: 300,  pair: 1 },
+  { s: "🌟", w: 1,  x3: 1500, pair: 1 },
+];
+const TOTAL_W = REELS.reduce((a, r) => a + r.w, 0);
+
+function spinReel() {
+  let r = Math.random() * TOTAL_W;
+  for (const sym of REELS) { r -= sym.w; if (r <= 0) return sym; }
+  return REELS[0];
+}
+
+/** @returns {{reels:Array, mult:number, label:string}} */
+function playSlots() {
+  const reels = [spinReel(), spinReel(), spinReel()];
+  const [a, b, c] = reels;
+  if (a.s === b.s && b.s === c.s) return { reels, mult: a.x3, label: `Trois ${a.s} !` };
+  if (a.s === b.s || b.s === c.s || a.s === c.s) {
+    const pair = a.s === b.s ? a : (b.s === c.s ? b : a);
+    if (pair.pair) return { reels, mult: pair.pair, label: `Paire de ${pair.s} — mise rendue` };
+    return { reels, mult: 0, label: `Paire de ${pair.s}, trop commune` };
+  }
+  return { reels, mult: 0, label: "Rien" };
+}
+
+/* ========================================================================== */
+/*                              BLACKJACK                                     */
+/* ========================================================================== */
+
+const SUITS = ["♠️", "♥️", "♦️", "♣️"];
+const RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
+
+function newDeck() {
+  const d = [];
+  for (const s of SUITS) for (const r of RANKS) d.push({ r, s });
+  for (let n = d.length - 1; n > 0; n--) { const j = Math.floor(Math.random() * (n + 1)); [d[n], d[j]] = [d[j], d[n]]; }
+  return d;
+}
+
+function handValue(hand) {
+  let total = 0, aces = 0;
+  for (const c of hand) {
+    if (c.r === "A") { aces++; total += 11; }
+    else if (["J", "Q", "K"].includes(c.r)) total += 10;
+    else total += Number(c.r);
+  }
+  while (total > 21 && aces > 0) { total -= 10; aces--; }
+  return total;
+}
+
+const showHand = (hand, hideSecond = false) =>
+  hand.map((c, n) => (hideSecond && n === 1 ? "`??`" : `\`${c.r}${c.s}\``)).join(" ");
+
+function blackjackView(guild, st, currency, done = false, verdict = null) {
+  const pv = handValue(st.player), dv = handValue(st.dealer);
+  return {
+    embeds: [embed({
+      guild, color: done ? (verdict?.win > 0 ? COLORS.success : verdict?.win === 0 ? COLORS.warning : COLORS.danger) : COLORS.gold,
+      author: { name: "🃏  Blackjack" },
+      description: [
+        `**Croupier** — ${done ? dv : "?"}`,
+        showHand(st.dealer, !done),
+        "",
+        `**Toi** — ${pv}`,
+        showHand(st.player),
+        "",
+        done ? `### ${verdict.text}` : "",
+        done && verdict.win > 0 ? `Tu remportes **${money(currency, verdict.win)}**` : "",
+        done && verdict.win === 0 ? "Mise remboursée" : "",
+        done && verdict.win < 0 ? `Tu perds ta mise de **${money(currency, st.bet)}**` : "",
+      ].filter(Boolean).join("\n"),
+      footer: done ? undefined : "Le croupier tire jusqu'à 17",
+    })],
+    components: done
+      ? [crow(cb("cas:pick:blackjack", "Rejouer", ButtonStyle.Success, "🔁"), cb("cas:lobby", "Casino", ButtonStyle.Secondary, "🎰"))]
+      : [crow(
+          cb("cas:bj:hit", "Tirer", ButtonStyle.Primary, "➕"),
+          cb("cas:bj:stand", "Rester", ButtonStyle.Success, "✋"),
+          cb("cas:bj:double", "Doubler", ButtonStyle.Danger, "✖️", st.player.length !== 2 || !st.canDouble),
+        )],
+  };
+}
+
+/* ========================================================================== */
+/*                              ROULETTE                                      */
+/* ========================================================================== */
+
+const RED = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
+
+const ROULETTE_BETS = {
+  rouge:    { label: "Rouge", emoji: "🔴", pays: 2, test: (n) => RED.has(n) },
+  noir:     { label: "Noir", emoji: "⚫", pays: 2, test: (n) => n !== 0 && !RED.has(n) },
+  pair:     { label: "Pair", emoji: "2️⃣", pays: 2, test: (n) => n !== 0 && n % 2 === 0 },
+  impair:   { label: "Impair", emoji: "1️⃣", pays: 2, test: (n) => n % 2 === 1 },
+  manque:   { label: "1 à 18", emoji: "🔻", pays: 2, test: (n) => n >= 1 && n <= 18 },
+  passe:    { label: "19 à 36", emoji: "🔺", pays: 2, test: (n) => n >= 19 },
+  douzaine1:{ label: "1ʳᵉ douzaine", emoji: "🥇", pays: 3, test: (n) => n >= 1 && n <= 12 },
+  douzaine2:{ label: "2ᵉ douzaine", emoji: "🥈", pays: 3, test: (n) => n >= 13 && n <= 24 },
+  douzaine3:{ label: "3ᵉ douzaine", emoji: "🥉", pays: 3, test: (n) => n >= 25 },
+};
+
+const spinRoulette = () => Math.floor(Math.random() * 37);
+const numColor = (n) => (n === 0 ? "🟢" : RED.has(n) ? "🔴" : "⚫");
+
+/* ========================================================================== */
+/*                              DÉMINEUR                                      */
+/* ========================================================================== */
+
+const GRID = 25;
+const comb = (n, k) => { if (k > n) return 0; let r = 1; for (let x = 0; x < k; x++) r = (r * (n - x)) / (x + 1); return r; };
+
+/** Multiplicateur après `k` cases sûres, avec `m` mines. */
+function minesMultiplier(m, k) {
+  if (k === 0) return 1;
+  return (1 - EDGE) * (comb(GRID, k) / comb(GRID - m, k));
+}
+
+function minesView(guild, st, currency, done = false, blown = false) {
+  const mult = minesMultiplier(st.mines, st.found.length);
+  const grid = [];
+  for (let n = 0; n < GRID; n++) {
+    if (st.found.includes(n)) grid.push("💚");
+    else if (done && st.bombs.includes(n)) grid.push(blown && n === st.last ? "💥" : "💣");
+    else grid.push(done ? "⬛" : "🟦");
+  }
+  const lines = [];
+  for (let r = 0; r < 5; r++) lines.push(grid.slice(r * 5, r * 5 + 5).join(""));
+
+  const rows = [];
+  if (!done) {
+    for (let r = 0; r < 5; r++) {
+      rows.push(crow(...Array.from({ length: 5 }, (_, cIdx) => {
+        const n = r * 5 + cIdx;
+        const opened = st.found.includes(n);
+        return cb(`cas:mn:${n}`, "\u200b", opened ? ButtonStyle.Success : ButtonStyle.Secondary,
+          opened ? "💚" : "🟦", opened);
+      })));
+    }
+  }
+
+  return {
+    embeds: [embed({
+      guild, color: done ? (blown ? COLORS.danger : COLORS.success) : COLORS.gold,
+      author: { name: "💣  Démineur" },
+      description: [
+        lines.join("\n"),
+        "",
+        `**${st.mines}** mines · **${st.found.length}** case(s) ouverte(s)`,
+        `Multiplicateur **×${mult.toFixed(2)}** → **${money(currency, Math.floor(st.bet * mult))}**`,
+        done ? (blown ? "\n### 💥 Mine ! Mise perdue." : `\n### ✅ Encaissé`) : "",
+      ].join("\n"),
+      footer: done ? undefined : "Ouvre une case, ou encaisse tant que tu es en vie",
+    })],
+    components: done
+      ? [crow(cb("cas:pick:mines", "Rejouer", ButtonStyle.Success, "🔁"), cb("cas:lobby", "Casino", ButtonStyle.Secondary, "🎰"))]
+      : [...rows.slice(0, 4), crow(
+          cb("cas:mn:cash", `Encaisser ${num(Math.floor(st.bet * mult))}`, ButtonStyle.Success, "💰", st.found.length === 0),
+          cb("cas:lobby", "Abandonner", ButtonStyle.Danger, "🏳️"))],
+  };
+}
+
+/* ========================================================================== */
+/*                                  DÉS                                       */
+/* ========================================================================== */
+
+/** Cote et gain pour un seuil donné. */
+function diceOdds(target, over) {
+  const chance = over ? (100 - target) / 100 : (target - 1) / 100;
+  return { chance, mult: chance > 0 ? (1 - EDGE) / chance : 0 };
+}
+
+/* ========================================================================== */
+/*                                ROUTEUR                                     */
+/* ========================================================================== */
+
+async function handleCasino(i) {
+  const parts = i.customId.split(":");
+  const action = parts[1];
+  const config = await getConfig(i.guildId);
+  const currency = config.economy.currency;
+  const { enabled, min, max } = await limits(i.guildId);
+
+  if (!config.economy.enabled || !enabled) {
+    return i.reply({ content: "Le casino est fermé.", ...EPH });
+  }
+
+  const reply = async (payload) => {
+    if (i.replied || i.deferred) return i.editReply(payload);
+    return i.update(payload).catch(() => i.reply({ ...payload, ...EPH }));
+  };
+
+  /* ------------------------------- hall -------------------------------- */
+  if (action === "lobby") {
+    endSession(i);
+    const w = await getWallet(i.guildId, i.user.id);
+    return reply(await casinoLobby(i.guild, config, w));
+  }
+
+  if (action === "open") {
+    const w = await getWallet(i.guildId, i.user.id);
+    return i.reply({ ...(await casinoLobby(i.guild, config, w)), ...EPH });
+  }
+
+  /* ---------------------------- choix du jeu --------------------------- */
+  if (action === "pick") {
+    const game = parts[2];
+    if (!GAMES[game] || config.casino?.games?.[game] === false)
+      return reply({ content: "Ce jeu est indisponible.", embeds: [], components: [] });
+    const w = await getWallet(i.guildId, i.user.id);
+    if (w.coins < min) return reply({ embeds: [embed({ guild: i.guild, color: COLORS.danger,
+      author: { name: `${ICONS.no}  Solde insuffisant` },
+      description: `Il te faut au moins **${money(currency, min)}** pour jouer.` })],
+      components: [crow(cb("cas:lobby", "Retour", ButtonStyle.Secondary, "◀️"))] });
+    return reply(betView(i.guild, game, w, currency));
+  }
+
+  if (action === "betmodal") {
+    const game = parts[2];
+    return i.showModal(new ModalBuilder().setCustomId(`casm:bet:${game}`).setTitle(`${GAMES[game].label} — mise`)
+      .addComponents(new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId("bet").setLabel(`Entre ta mise (${num(min)} à ${num(max)})`)
+          .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(9))));
+  }
+
+  if (action === "bet") return startGame(i, parts[2], Number(parts[3]), reply);
+  if (action === "mnstart") return startMines(i, Number(parts[2]));
+
+  /* -------------------------- machine à sous --------------------------- */
+  if (action === "sl") {
+    const st = getSession(i);
+    if (!st) return reply({ content: "Partie expirée.", embeds: [], components: [] });
+    return startGame(i, "slots", st.bet, reply);
+  }
+
+  /* ----------------------------- blackjack ----------------------------- */
+  if (action === "bj") {
+    const st = getSession(i);
+    if (!st || st.game !== "blackjack") return reply({ content: "Partie expirée.", embeds: [], components: [] });
+    const sub = parts[2];
+
+    if (sub === "double") {
+      const take = await takeBet(i, st.bet);
+      if (!take.ok) return reply({ content: take.reason, embeds: [], components: [] });
+      st.bet *= 2; st.canDouble = false;
+      st.player.push(st.deck.pop());
+      if (handValue(st.player) > 21) return finishBlackjack(i, st, currency, reply);
+      return finishBlackjack(i, st, currency, reply);
+    }
+    if (sub === "hit") {
+      st.player.push(st.deck.pop());
+      st.canDouble = false;
+      if (handValue(st.player) >= 21) return finishBlackjack(i, st, currency, reply);
+      setSession(i, st);
+      return reply(blackjackView(i.guild, st, currency));
+    }
+    if (sub === "stand") return finishBlackjack(i, st, currency, reply);
+  }
+
+  /* ----------------------------- roulette ------------------------------ */
+  if (action === "rl") {
+    const st = getSession(i);
+    if (!st || st.game !== "roulette") return reply({ content: "Partie expirée.", embeds: [], components: [] });
+    const choix = parts[2];
+
+    let win = 0, label = "";
+    const n = spinRoulette();
+    if (choix === "plein") {
+      const cible = st.number;
+      if (n === cible) win = Math.floor(st.bet * 36);
+      label = `Numéro plein **${cible}**`;
+    } else {
+      const b = ROULETTE_BETS[choix];
+      if (b.test(n)) win = Math.floor(st.bet * b.pays);
+      label = b.label;
+    }
+    const solde = await payout(i, st.bet, win, "Roulette");
+    endSession(i);
+    return reply({
+      embeds: [embed({ guild: i.guild, color: win ? COLORS.success : COLORS.danger,
+        author: { name: "🔴  Roulette" },
+        description: [
+          `## ${numColor(n)} ${n}`,
+          `Pari : **${label}**`,
+          "",
+          win ? `### Gagné — **${money(currency, win)}**` : "### Perdu",
+          `Solde : **${money(currency, solde)}**`,
+        ].join("\n") })],
+      components: [crow(cb("cas:pick:roulette", "Rejouer", ButtonStyle.Success, "🔁"), cb("cas:lobby", "Casino", ButtonStyle.Secondary, "🎰"))],
+    });
+  }
+
+  if (action === "rlnum") {
+    const st = getSession(i);
+    if (!st) return reply({ content: "Partie expirée.", embeds: [], components: [] });
+    return i.showModal(new ModalBuilder().setCustomId("casm:rlnum").setTitle("Numéro plein — ×36")
+      .addComponents(new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId("n").setLabel("Un numéro de 0 à 36")
+          .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(2))));
+  }
+
+  /* ----------------------------- démineur ------------------------------ */
+  if (action === "mn") {
+    const st = getSession(i);
+    if (!st || st.game !== "mines") return reply({ content: "Partie expirée.", embeds: [], components: [] });
+    const sub = parts[2];
+
+    if (sub === "cash") {
+      const mult = minesMultiplier(st.mines, st.found.length);
+      const gain = Math.floor(st.bet * mult);
+      const solde = await payout(i, st.bet, gain, "Démineur");
+      endSession(i);
+      const view = minesView(i.guild, st, currency, true, false);
+      view.embeds[0].data.description += `\nGain : **${money(currency, gain)}** · solde **${money(currency, solde)}**`;
+      return reply(view);
+    }
+
+    const n = Number(sub);
+    if (st.found.includes(n)) return reply(minesView(i.guild, st, currency));
+    if (st.bombs.includes(n)) {
+      st.last = n;
+      endSession(i);
+      await payout(i, st.bet, 0, "Démineur");
+      return reply(minesView(i.guild, st, currency, true, true));
+    }
+    st.found.push(n);
+    if (st.found.length >= GRID - st.mines) {
+      const gain = Math.floor(st.bet * minesMultiplier(st.mines, st.found.length));
+      await payout(i, st.bet, gain, "Démineur");
+      endSession(i);
+      const view = minesView(i.guild, st, currency, true, false);
+      view.embeds[0].data.description += `\n### Grille entière ! **${money(currency, gain)}**`;
+      return reply(view);
+    }
+    setSession(i, st);
+    return reply(minesView(i.guild, st, currency));
+  }
+
+  /* ------------------------------- dés --------------------------------- */
+  if (action === "dc") {
+    const st = getSession(i);
+    if (!st || st.game !== "dice") return reply({ content: "Partie expirée.", embeds: [], components: [] });
+    const over = parts[2] === "over";
+    const { chance, mult } = diceOdds(st.target, over);
+    const roll = Math.floor(Math.random() * 100) + 1;
+    const gagne = over ? roll > st.target : roll < st.target;
+    const gain = gagne ? Math.floor(st.bet * mult) : 0;
+    const solde = await payout(i, st.bet, gain, "Dés");
+    endSession(i);
+    return reply({
+      embeds: [embed({ guild: i.guild, color: gagne ? COLORS.success : COLORS.danger,
+        author: { name: "🎲  Dés" },
+        description: [
+          `## ${roll}`,
+          `Pari : **${over ? "plus haut que" : "plus bas que"} ${st.target}** · ${(chance * 100).toFixed(0)} % de chance · ×${mult.toFixed(2)}`,
+          "",
+          gagne ? `### Gagné — **${money(currency, gain)}**` : "### Perdu",
+          `Solde : **${money(currency, solde)}**`,
+        ].join("\n") })],
+      components: [crow(cb("cas:pick:dice", "Rejouer", ButtonStyle.Success, "🔁"), cb("cas:lobby", "Casino", ButtonStyle.Secondary, "🎰"))],
+    });
+  }
+
+  if (action === "dctarget") {
+    return i.showModal(new ModalBuilder().setCustomId("casm:dctarget").setTitle("Dés — seuil")
+      .addComponents(new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId("t").setLabel("Seuil entre 2 et 98")
+          .setStyle(TextInputStyle.Short).setRequired(true).setValue("50").setMaxLength(2))));
+  }
+
+  /* -------------------------- pile ou face ----------------------------- */
+  if (action === "fl") {
+    const st = getSession(i);
+    if (!st || st.game !== "flip") return reply({ content: "Partie expirée.", embeds: [], components: [] });
+    const choix = parts[2];
+    const sortie = Math.random() < 0.5 ? "pile" : "face";
+    const gagne = choix === sortie;
+    const gain = gagne ? Math.floor(st.bet * 1.96) : 0;
+    const solde = await payout(i, st.bet, gain, "Pile ou face");
+    endSession(i);
+    return reply({
+      embeds: [embed({ guild: i.guild, color: gagne ? COLORS.success : COLORS.danger,
+        author: { name: "🪙  Pile ou face" },
+        description: [
+          `## ${sortie === "pile" ? "🪙 Pile" : "👑 Face"}`,
+          `Ton choix : **${choix}**`,
+          "",
+          gagne ? `### Gagné — **${money(currency, gain)}**` : "### Perdu",
+          `Solde : **${money(currency, solde)}**`,
+        ].join("\n") })],
+      components: [crow(cb("cas:pick:flip", "Rejouer", ButtonStyle.Success, "🔁"), cb("cas:lobby", "Casino", ButtonStyle.Secondary, "🎰"))],
+    });
+  }
+}
+
+/* ========================================================================== */
+/*                          LANCEMENT DES PARTIES                             */
+/* ========================================================================== */
+
+async function startGame(i, game, bet, reply) {
+  const config = await getConfig(i.guildId);
+  const currency = config.economy.currency;
+  bet = Math.floor(bet);
+
+  const take = await takeBet(i, bet);
+  if (!take.ok) {
+    const w = await getWallet(i.guildId, i.user.id);
+    return reply({ embeds: [embed({ guild: i.guild, color: COLORS.danger,
+      author: { name: `${ICONS.no}  Mise refusée` }, description: take.reason })],
+      components: [crow(cb(`cas:pick:${game}`, "Changer de mise", ButtonStyle.Primary, "✏️"),
+        cb("cas:lobby", "Casino", ButtonStyle.Secondary, "🎰"))] });
+  }
+
+  /* ---------------------------- slots ---------------------------------- */
+  if (game === "slots") {
+    const r = playSlots();
+    const gain = Math.floor(bet * r.mult);
+
+    // Les rouleaux s'arrêtent un par un : c'est ce qui fait la tension
+    const roue = ["🍒", "🍋", "🍊", "🔔", "💎", "7️⃣", "🌟"];
+    const alea = () => roue[Math.floor(Math.random() * roue.length)];
+    const cadre = (a, b2, c2) => [
+      "```",
+      "  ╔═══╤═══╤═══╗",
+      `  ║ ${a} │ ${b2} │ ${c2} ║`,
+      "  ╚═══╧═══╧═══╝",
+      "```",
+    ].join("\n");
+
+    const etape = (desc, couleur) => ({
+      embeds: [embed({ guild: i.guild, color: couleur, author: { name: "🎰  Machine à sous" }, description: desc })],
+      components: [],
+    });
+
+    await reply(etape(cadre(alea(), alea(), alea()) + "\n*Les rouleaux tournent…*", COLORS.gold));
+    await new Promise((res) => setTimeout(res, 800));
+    await reply(etape(cadre(r.reels[0].s, alea(), alea()) + "\n*Premier rouleau…*", COLORS.gold));
+    await new Promise((res) => setTimeout(res, 800));
+    await reply(etape(cadre(r.reels[0].s, r.reels[1].s, alea()) + "\n*Deuxième rouleau…*", COLORS.gold));
+    await new Promise((res) => setTimeout(res, 900));
+
+    const solde = await payout(i, bet, gain, "Machine à sous");
+    setSession(i, { game: "slots", bet });
+    return reply({
+      embeds: [embed({ guild: i.guild, color: gain ? COLORS.success : COLORS.danger,
+        author: { name: "🎰  Machine à sous" },
+        description: [
+          "```",
+          "  ╔═══╤═══╤═══╗",
+          `  ║ ${r.reels[0].s} │ ${r.reels[1].s} │ ${r.reels[2].s} ║`,
+          "  ╚═══╧═══╧═══╝",
+          "```",
+          `**${r.label}**`,
+          "",
+          gain ? `### Gagné — **${money(currency, gain)}** (×${r.mult})` : "### Perdu",
+          `Solde : **${money(currency, solde)}**`,
+        ].join("\n"),
+        footer: "🌟🌟🌟 ×1500 · 7️⃣7️⃣7️⃣ ×300 · 💎💎💎 ×125 · 🔔🔔🔔 ×40 · 🍊🍊🍊 ×27" })],
+      components: [crow(cb("cas:sl", `Relancer (${num(bet)})`, ButtonStyle.Success, "🔁"),
+        cb("cas:pick:slots", "Changer de mise", ButtonStyle.Secondary, "✏️"),
+        cb("cas:lobby", "Casino", ButtonStyle.Secondary, "🎰"))],
+    });
+  }
+
+  /* -------------------------- blackjack -------------------------------- */
+  if (game === "blackjack") {
+    const deck = newDeck();
+    const st = { game: "blackjack", bet, deck, canDouble: true,
+      player: [deck.pop(), deck.pop()], dealer: [deck.pop(), deck.pop()] };
+    if (handValue(st.player) === 21) { setSession(i, st); return finishBlackjack(i, st, currency, reply, true); }
+    setSession(i, st);
+    return reply(blackjackView(i.guild, st, currency));
+  }
+
+  /* --------------------------- roulette -------------------------------- */
+  if (game === "roulette") {
+    setSession(i, { game: "roulette", bet });
+    return reply({
+      embeds: [embed({ guild: i.guild, color: COLORS.gold, author: { name: "🔴  Roulette européenne" },
+        description: [
+          `Mise : **${money(currency, bet)}**`,
+          "",
+          "**×2** — Rouge, Noir, Pair, Impair, 1-18, 19-36",
+          "**×3** — les douzaines",
+          "**×36** — un numéro plein",
+          "",
+          "_Un seul zéro : la maison garde 2,7 %, comme au casino._",
+        ].join("\n") })],
+      components: [
+        crow(cb("cas:rl:rouge", "Rouge", ButtonStyle.Danger, "🔴"), cb("cas:rl:noir", "Noir", ButtonStyle.Secondary, "⚫"),
+             cb("cas:rl:pair", "Pair", ButtonStyle.Primary), cb("cas:rl:impair", "Impair", ButtonStyle.Primary)),
+        crow(cb("cas:rl:manque", "1 à 18", ButtonStyle.Secondary), cb("cas:rl:passe", "19 à 36", ButtonStyle.Secondary),
+             cb("cas:rl:douzaine1", "1-12", ButtonStyle.Secondary), cb("cas:rl:douzaine2", "13-24", ButtonStyle.Secondary),
+             cb("cas:rl:douzaine3", "25-36", ButtonStyle.Secondary)),
+        crow(cb("cas:rlnum", "Numéro plein ×36", ButtonStyle.Success, "🎯"), cb("cas:lobby", "Annuler", ButtonStyle.Secondary, "◀️")),
+      ],
+    });
+  }
+
+  /* ---------------------------- démineur ------------------------------- */
+  if (game === "mines") {
+    setSession(i, { game: "minesSetup", bet });
+    return reply({
+      embeds: [embed({ guild: i.guild, color: COLORS.gold, author: { name: "💣  Démineur" },
+        description: [`Mise : **${money(currency, bet)}**`, "", "Combien de mines dans la grille de 25 ?",
+          "Plus il y en a, plus chaque case rapporte."].join("\n"),
+        fields: [1, 3, 5, 10].map((m) => ({ name: `${m} mine${m > 1 ? "s" : ""}`,
+          value: `1 case : ×${minesMultiplier(m, 1).toFixed(2)}\n5 cases : ×${minesMultiplier(m, 5).toFixed(2)}`, inline: true })) })],
+      components: [crow(...[1, 3, 5, 10, 15].map((m) => cb(`cas:mnstart:${m}`, `${m}`, ButtonStyle.Primary, "💣"))),
+        crow(cb("cas:lobby", "Annuler", ButtonStyle.Secondary, "◀️"))],
+    });
+  }
+
+  /* ------------------------------- dés --------------------------------- */
+  if (game === "dice") {
+    setSession(i, { game: "dice", bet, target: 50 });
+    return diceView(i, 50, bet, currency, reply);
+  }
+
+  /* -------------------------- pile ou face ----------------------------- */
+  if (game === "flip") {
+    setSession(i, { game: "flip", bet });
+    return reply({
+      embeds: [embed({ guild: i.guild, color: COLORS.gold, author: { name: "🪙  Pile ou face" },
+        description: `Mise : **${money(currency, bet)}**\nGain : **×1,96**\n\nPile ou face ?` })],
+      components: [crow(cb("cas:fl:pile", "Pile", ButtonStyle.Primary, "🪙"),
+        cb("cas:fl:face", "Face", ButtonStyle.Primary, "👑"),
+        cb("cas:lobby", "Annuler", ButtonStyle.Secondary, "◀️"))],
+    });
+  }
+}
+
+function diceView(i, target, bet, currency, reply) {
+  const o = diceOdds(target, true), u = diceOdds(target, false);
+  return reply({
+    embeds: [embed({ guild: i.guild, color: COLORS.gold, author: { name: "🎲  Dés" },
+      description: [
+        `Mise : **${money(currency, bet)}** · seuil **${target}**`,
+        "",
+        `🔺 **Plus haut que ${target}** — ${(o.chance * 100).toFixed(0)} % · ×${o.mult.toFixed(2)}`,
+        `🔻 **Plus bas que ${target}** — ${(u.chance * 100).toFixed(0)} % · ×${u.mult.toFixed(2)}`,
+        "",
+        "_Un dé de 1 à 100. Change le seuil pour ajuster le risque._",
+      ].join("\n") })],
+    components: [
+      crow(cb("cas:dc:over", `Plus haut (×${o.mult.toFixed(2)})`, ButtonStyle.Success, "🔺"),
+           cb("cas:dc:under", `Plus bas (×${u.mult.toFixed(2)})`, ButtonStyle.Danger, "🔻")),
+      crow(cb("cas:dctarget", "Changer le seuil", ButtonStyle.Primary, "🎚️"),
+           cb("cas:lobby", "Annuler", ButtonStyle.Secondary, "◀️")),
+    ],
+  });
+}
+
+async function finishBlackjack(i, st, currency, reply, natural = false) {
+  while (handValue(st.dealer) < 17) st.dealer.push(st.deck.pop());
+  const pv = handValue(st.player), dv = handValue(st.dealer);
+
+  let win = 0, text;
+  if (pv > 21) { win = 0; text = "💥 Tu dépasses 21"; }
+  else if (natural && pv === 21) { win = Math.floor(st.bet * 2.5); text = "🃏 Blackjack ! Payé 3 pour 2"; }
+  else if (dv > 21) { win = st.bet * 2; text = "Le croupier dépasse — gagné"; }
+  else if (pv > dv) { win = st.bet * 2; text = `${pv} contre ${dv} — gagné`; }
+  else if (pv === dv) { win = st.bet; text = "Égalité — mise rendue"; }
+  else { win = 0; text = `${pv} contre ${dv} — perdu`; }
+
+  const solde = await payout(i, st.bet, win, "Blackjack");
+  endSession(i);
+  const view = blackjackView(i.guild, st, currency, true, { win: win - st.bet, text });
+  view.embeds[0].data.description += `\nSolde : **${money(currency, solde)}**`;
+  return reply(view);
+}
+
+/* ========================================================================== */
+/*                          FENÊTRES DE SAISIE                                */
+/* ========================================================================== */
+
+async function handleCasinoModal(i) {
+  const parts = i.customId.split(":");
+  const config = await getConfig(i.guildId);
+  const currency = config.economy.currency;
+  const reply = async (payload) => (i.replied || i.deferred ? i.editReply(payload) : i.update(payload).catch(() => i.reply({ ...payload, ...EPH })));
+
+  if (parts[1] === "bet") {
+    const bet = parseInt(i.fields.getTextInputValue("bet").replace(/\D/g, ""), 10);
+    return startGame(i, parts[2], bet, reply);
+  }
+
+  if (parts[1] === "rlnum") {
+    const st = getSession(i);
+    if (!st) return i.reply({ content: "Partie expirée.", ...EPH });
+    const n = parseInt(i.fields.getTextInputValue("n"), 10);
+    if (!Number.isFinite(n) || n < 0 || n > 36) return i.reply({ content: "Un numéro entre 0 et 36.", ...EPH });
+    st.number = n; setSession(i, st);
+    i.customId = "cas:rl:plein";
+    return handleCasino(i);
+  }
+
+  if (parts[1] === "dctarget") {
+    const st = getSession(i);
+    if (!st) return i.reply({ content: "Partie expirée.", ...EPH });
+    const t = parseInt(i.fields.getTextInputValue("t"), 10);
+    if (!Number.isFinite(t) || t < 2 || t > 98) return i.reply({ content: "Un seuil entre 2 et 98.", ...EPH });
+    st.target = t; setSession(i, st);
+    return diceView(i, t, st.bet, currency, reply);
+  }
+}
+
+/** Démarrage du démineur, une fois le nombre de mines choisi. */
+async function startMines(i, mines) {
+  const st = getSession(i);
+  if (!st) return i.update({ content: "Partie expirée.", embeds: [], components: [] }).catch(() => null);
+  const config = await getConfig(i.guildId);
+  const bombs = [];
+  while (bombs.length < mines) {
+    const n = Math.floor(Math.random() * GRID);
+    if (!bombs.includes(n)) bombs.push(n);
+  }
+  const state = { game: "mines", bet: st.bet, mines, bombs, found: [] };
+  setSession(i, state);
+  return i.update(minesView(i.guild, state, config.economy.currency)).catch(() => null);
+}
+
+/* ========================================================================== */
+/*                            10 - PURGE DE MASSE                             */
 /* ========================================================================== */
 
 // masspurge.js — purge de masse : plusieurs salons d'un coup, sans les supprimer.
@@ -2778,7 +3864,7 @@ function previewEmbed(guild, plan, label) {
 }
 
 /* ========================================================================== */
-/*                           9 - VOCAUX TEMPORAIRES                           */
+/*                          11 - VOCAUX TEMPORAIRES                           */
 /* ========================================================================== */
 
 // tempvoice.js — « Créer ton vocal » : salons vocaux temporaires.
@@ -3107,7 +4193,7 @@ async function handleTempVoiceModal(i) {
 }
 
 /* ========================================================================== */
-/*                          10 - RECOMPENSES VOCALES                          */
+/*                          12 - RECOMPENSES VOCALES                          */
 /* ========================================================================== */
 
 // voice.js — récompenses vocales : XP et coins gagnés en restant en vocal.
@@ -3201,7 +4287,7 @@ function voiceSummary(config) {
 }
 
 /* ========================================================================== */
-/*                                11 - GRADES                                 */
+/*                                13 - GRADES                                 */
 /* ========================================================================== */
 
 // ranks.js — grades gagnés à l'heure de vocal et au message.
@@ -3345,7 +4431,7 @@ function ladderEmbed(guild, config, stats = null) {
 }
 
 /* ========================================================================== */
-/*                   12 - INVITATIONS ET ROLE DE CONFIANCE                    */
+/*                   14 - INVITATIONS ET ROLE DE CONFIANCE                    */
 /* ========================================================================== */
 
 // invites.js — suivi des invitations et rôle de confiance « Like ».
@@ -3575,7 +4661,7 @@ function isTrusted(member, config) {
 }
 
 /* ========================================================================== */
-/*                      13 - ACTIONS, ARTICLES, ESCALADE                      */
+/*                      15 - ACTIONS, ARTICLES, ESCALADE                      */
 /* ========================================================================== */
 
 // actions.js — la logique métier, appelable depuis n'importe quelle interface.
@@ -3837,7 +4923,7 @@ async function actionDaily(guild, user) {
     COLORS.gold);
 }
 
-const JOBS = ["as modéré le chat", "as rangé les vocaux", "as animé un event", "as aidé un nouveau", "as trié les tickets", "as tenu la boutique"];
+const WORK_FLAVOR = ["as modéré le chat", "as rangé les vocaux", "as animé un event", "as aidé un nouveau", "as trié les tickets", "as tenu la boutique"];
 
 async function actionWork(guild, user) {
   const config = await getConfig(guild.id);
@@ -3850,7 +4936,7 @@ async function actionWork(guild, user) {
   const total = await addCoins(guild.id, user.id, gain);
   await stampEconomy(guild.id, user.id, "work", new Date());
   return ok("Travail terminé",
-    `Tu ${JOBS[Math.floor(Math.random() * JOBS.length)]} et gagnes **${config.economy.currency} ${num(gain)}**.\nSolde : **${num(total)}**.`,
+    `Tu ${WORK_FLAVOR[Math.floor(Math.random() * WORK_FLAVOR.length)]} et gagnes **${config.economy.currency} ${num(gain)}**.\nSolde : **${num(total)}**.`,
     COLORS.success);
 }
 
@@ -3864,6 +4950,8 @@ const ITEM_TYPES = {
 };
 
 async function actionBuy(guild, member, itemId, extra = {}) {
+  const dette = await blockedByDebt(guild.id, member.id);
+  if (dette) return no(dette);
   const config = await getConfig(guild.id);
   if (!config.economy.enabled) return no("L'économie est désactivée.");
   const item = config.economy.shop.find((x) => x.id === itemId);
@@ -3987,7 +5075,7 @@ async function actionGrantCoins(guild, target, amount, moderator, reason) {
 }
 
 /* ========================================================================== */
-/*                 14 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
+/*                 16 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
 /* ========================================================================== */
 
 // coinsspace.js — remplissage complet de la catégorie ESPACE COINS.
@@ -4003,19 +5091,53 @@ const b = (id, label, style = ButtonStyle.Secondary, emoji) => {
 /*                          PANNEAUX DE L'ESPACE COINS                        */
 /* ========================================================================== */
 
+/** Devanture du casino, publiée dans l'espace coins. */
+function casinoPanel(guild, config) {
+  const cas = config.casino ?? {};
+  const actifs = Object.entries(GAMES).filter(([id]) => cas.games?.[id] !== false);
+  return {
+    embeds: [embed({
+      guild, color: COLORS.gold, author: { name: "🎰  Casino de Naoya" },
+      description: [
+        "```",
+        "  ╔═══════════════════════════╗",
+        "  ║   🎰   C A S I N O   🎰   ║",
+        "  ╚═══════════════════════════╝",
+        "```",
+        `Mise de **${num(cas.minBet ?? 50)}** à **${num(cas.maxBet ?? 250000)}** ${config.economy.currency}`,
+      ].join("\n"),
+      fields: actifs.map(([, g]) => ({ name: `${g.emoji} ${g.label}`, value: g.desc, inline: true })),
+      footer: "Gains calculés comme dans un vrai casino · la maison garde 3 %",
+    })],
+    components: [new ActionRowBuilder().addComponents(
+      b("cas:open", "Entrer au casino", ButtonStyle.Danger, "🎰"),
+      b("cr:open", "Arrière-salle", ButtonStyle.Secondary, "🚬"),
+      b("pub:coins", "Mes jetons", ButtonStyle.Secondary, "🪙"),
+      b("pub:top:coins", "Les plus riches", ButtonStyle.Secondary, "🏆"),
+    )],
+  };
+}
+
 function shopPanel(guild, config) {
   return {
     embeds: [embed({
       guild, color: COLORS.gold, author: { name: `${ICONS.coin}  Boutique` },
       description: [
+        "```",
+        "  ┌───────────────────────────┐",
+        "  │   🛒   B O U T I Q U E    │",
+        "  └───────────────────────────┘",
+        "```",
         `Dépense tes ${config.economy.currency} contre du concret.`,
-        "",
-        "**🕊️ Pardon** — efface ton dernier avertissement",
-        "**📈 XP** — crédité immédiatement sur ton niveau",
-        "**🚀 Boost** — multiplie l'XP gagné pendant plusieurs heures",
-        "**✨ Rôle personnalisé** — ton nom, ta couleur, à toi seul",
-        "**🎭 Rôles du serveur** — les rôles mis en vente par le staff",
       ].join("\n"),
+      fields: [
+        { name: "🕊️ Pardon", value: "Efface ton dernier avertissement", inline: true },
+        { name: "📈 XP", value: "Crédité sur ton niveau", inline: true },
+        { name: "🚀 Boost", value: "XP multiplié pendant des heures", inline: true },
+        { name: "✨ Rôle personnalisé", value: "Ton nom, ta couleur", inline: true },
+        { name: "🎭 Rôles du serveur", value: "Mis en vente par le staff", inline: true },
+        { name: "\u200b", value: "\u200b", inline: true },
+      ],
       footer: "Le stock et les prix évoluent — reviens régulièrement",
     })],
     components: [new ActionRowBuilder().addComponents(
@@ -4030,7 +5152,14 @@ function rewardPanel(guild, config) {
   return {
     embeds: [embed({
       guild, color: COLORS.success, author: { name: "🎁  Tes récompenses" },
-      description: "Récupère ce que tu as gagné. Tout est gratuit, il suffit de revenir.",
+      description: [
+        "```",
+        "  ┌───────────────────────────┐",
+        "  │  🎁  R É C O M P E N S E S │",
+        "  └───────────────────────────┘",
+        "```",
+        "Tout est gratuit. Il suffit de revenir.",
+      ].join("\n"),
       fields: [
         { name: "🎁 Quotidien", value: `${e.currency} ${num(e.dailyAmount)} par jour\n+25 par jour de série, jusqu'à +250`, inline: true },
         { name: "💼 Travail", value: `${e.currency} ${num(e.workMin)}–${num(e.workMax)}\ntoutes les ${Math.round(e.workCooldownMs / 60000)} min`, inline: true },
@@ -4115,6 +5244,10 @@ function howToPlayEmbed(guild, config) {
       {
         name: "📦 Les colis",
         value: "Des colis tombent au hasard dans le salon dédié. Le premier à appuyer sur le bouton rafle tout.",
+      },
+      {
+        name: "🎰 Les faire fructifier",
+        value: `Machine à sous, blackjack, roulette, démineur, dés, pile ou face. La maison garde 3 % : sur la durée, le casino gagne. Joue ce que tu acceptes de perdre.`,
       },
       {
         name: "🛒 Et après ?",
@@ -4208,7 +5341,7 @@ async function setupCoinsSpace(guild, memberPanelFactory) {
 }
 
 /* ========================================================================== */
-/*                15 - AFFECTATION ET VERIFICATION DES SALONS                 */
+/*                17 - AFFECTATION ET VERIFICATION DES SALONS                 */
 /* ========================================================================== */
 
 // destinations.js — la table d'affectation : quel panneau, quelle fonction, quel salon.
@@ -4258,6 +5391,10 @@ const DESTINATIONS = [
   { id: "boutique", label: "Panneau boutique", emoji: "🛒", kind: "panel",
     path: "funcOverrides.boutique", auto: ["boutique-coins", "boutique"],
     signature: `${ICONS.coin}  Boutique`, build: (g, c) => shopPanel(g, c) },
+
+  { id: "casino", label: "Panneau casino", emoji: "🎰", kind: "panel",
+    path: "funcOverrides.casino", auto: ["casino", "coins"],
+    signature: "🎰  Casino de Naoya", build: (g, c) => casinoPanel(g, c) },
 
   { id: "recompense", label: "Panneau récompenses", emoji: "🎁", kind: "panel",
     path: "funcOverrides.recompense", auto: ["recompense", "recompenses"],
@@ -4512,7 +5649,7 @@ function summarizeIssues(results) {
 }
 
 /* ========================================================================== */
-/*                       16 - INSTALLATION AUTOMATIQUE                        */
+/*                       18 - INSTALLATION AUTOMATIQUE                        */
 /* ========================================================================== */
 
 // setup.js — installation automatique. Un bouton, tout est branché.
@@ -4783,7 +5920,7 @@ function setupReport(guild, result) {
 }
 
 /* ========================================================================== */
-/*             17 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
+/*             19 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
 /* ========================================================================== */
 
 // panel.js — l'interface complète. Tout réglage du bot est atteignable ici.
@@ -4980,7 +6117,7 @@ async function homeView(i, config) {
   if (owner) {
     components.push(row(
       btn("p:setup:run", "Tout installer", ButtonStyle.Success, "⚡"),
-      btn("p:setup:publish", "Publier les panneaux", ButtonStyle.Primary, "📢"),
+      btn("p:setup:publish", "Mettre à jour les panneaux", ButtonStyle.Primary, "🔄"),
       btn("p:setup:defaults", "Réglages recommandés", ButtonStyle.Secondary, "🎚️"),
       btn("p:home", "Rafraîchir", ButtonStyle.Secondary, "🔄"),
     ));
@@ -5626,23 +6763,64 @@ async function buildSection(id, i, config, page = null) {
     };
   }
 
+  /* --------------------------------- CASINO ------------------------------ */
+  if (id === "eco" && page === "casino") {
+    const cas = config.casino ?? {};
+    const actifs = Object.entries(GAMES).filter(([id2]) => cas.games?.[id2] !== false);
+    return {
+      embeds: [embed({ guild, author: { name: "🎰  Casino" }, color: cas.enabled === false ? COLORS.neutral : COLORS.gold,
+        description: `État : **${onOff(cas.enabled !== false)}** · mises de **${num(cas.minBet ?? 50)}** à **${num(cas.maxBet ?? 250000)}**`,
+        fields: [
+          { name: `Jeux ouverts (${actifs.length}/${Object.keys(GAMES).length})`,
+            value: Object.entries(GAMES).map(([id2, g]) =>
+              `${cas.games?.[id2] === false ? "🔴" : "🟢"} ${g.emoji} ${g.label}`).join("\n") },
+          { name: "Avantage de la maison", value: "3 % sur les dés et le démineur · 2,7 % à la roulette (zéro unique) · ×1,96 au pile ou face", inline: false },
+          { name: "🚬 Arrière-salle", value: config.crime?.enabled === false ? "🔴 fermée" :
+            [`🟢 ouverte · dette max **${num(config.crime?.maxDebt ?? 100000)}**`,
+             ...Object.values(JOBS).map((j) =>
+               `${j.emoji} ${j.label} — ${Math.round(j.chance * 100)} % · ${num(j.min)}–${num(j.max)}`)].join("\n") },
+          { name: "Exemples de gains", value: [
+            `Démineur 3 mines, 5 cases : **×${minesMultiplier(3, 5).toFixed(2)}**`,
+            `Dés seuil 50 : **×${diceOdds(50, true).mult.toFixed(2)}**`,
+            "Machine à sous 🌟🌟🌟 : **×1500**",
+          ].join("\n") },
+        ],
+        footer: "Sur la durée la maison gagne : c'est ce qui empêche l'économie de s'emballer" })],
+      components: [
+        row(btn("p:eco:cast", cas.enabled === false ? "Ouvrir le casino" : "Fermer le casino",
+              cas.enabled === false ? ButtonStyle.Success : ButtonStyle.Danger, "🎰"),
+            btn("p:eco:caslim", "Mises min et max", ButtonStyle.Primary, "🎚️"),
+            btn("p:eco:crimet", config.crime?.enabled === false ? "Ouvrir l'arrière-salle" : "Fermer l'arrière-salle",
+              config.crime?.enabled === false ? ButtonStyle.Success : ButtonStyle.Danger, "🚬"),
+            btn("p:eco:debtt", config.crime?.debtBlocksCasino === false ? "Dette : jeu autorisé" : "Dette : jeu bloqué",
+              ButtonStyle.Secondary, "🚨")),
+        row(new StringSelectMenuBuilder().setCustomId("p:eco:casgame").setPlaceholder("Ouvrir / fermer un jeu…")
+          .addOptions(Object.entries(GAMES).map(([id2, g]) => ({ label: g.label, value: id2, emoji: g.emoji,
+            description: (cas.games?.[id2] === false ? "fermé" : "ouvert") })))),
+        backRow("p:eco"),
+      ],
+    };
+  }
+
   /* -------------------------------- ÉCONOMIE ----------------------------- */
   if (id === "eco") {
     const e = config.economy;
     const comps = [
       row(btn("p:eco:t", e.enabled ? "Couper l'économie" : "Activer l'économie", e.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
         btn("p:eco:montants", "Montants", ButtonStyle.Primary, "🎚️"),
-        btn("p:eco:drop", "Lâcher un colis", ButtonStyle.Primary, "📦"),
-        btn("p:eco:space", "Remplir l'espace coins", ButtonStyle.Success, "🏛️")),
+        btn("p:eco:page:casino", "Casino et arrière-salle", ButtonStyle.Danger, "🎰")),
+      row(btn("p:eco:drop", "Lâcher un colis", ButtonStyle.Primary, "📦"),
+        btn("p:eco:space", "Remplir l'espace coins", ButtonStyle.Success, "🏛️"),
+        btn("p:setup:publish", "Mettre à jour les panneaux", ButtonStyle.Primary, "🔄")),
       row(new StringSelectMenuBuilder().setCustomId("p:eco:addtype").setPlaceholder("Ajouter un article : quel type ?")
         .addOptions(Object.entries(ITEM_TYPES).map(([k, v]) => ({ label: v.label, value: k, emoji: v.emoji, description: v.desc.slice(0, 100) })))),
       row(new ChannelSelectMenuBuilder().setCustomId("p:eco:dropch").setChannelTypes(ChannelType.GuildText).setPlaceholder("Salon des colis automatiques")),
     ];
-    if (e.shop.length) comps.push(row(new StringSelectMenuBuilder().setCustomId("p:eco:del")
+    if (e.shop.length && comps.length < 4) comps.push(row(new StringSelectMenuBuilder().setCustomId("p:eco:del")
       .setPlaceholder("Retirer un article…")
       .addOptions(e.shop.slice(0, 25).map((x) => ({ label: x.name.slice(0, 100), value: x.id,
         emoji: ITEM_TYPES[x.type ?? "role"]?.emoji, description: `${num(x.price)} coins` })))));
-    comps.push(backRow());
+    if (comps.length < 5) comps.push(backRow());
     return {
       embeds: [embed({ guild, author: { name: `${ICONS.coin}  Économie` }, color: COLORS.gold,
         description: `État : **${onOff(e.enabled)}** · monnaie ${e.currency}`,
@@ -5853,7 +7031,7 @@ async function buildSection(id, i, config, page = null) {
               description: (channel ? `→ ${channel.name}` : "aucun salon").slice(0, 100) };
           }))),
         row(btn("p:dest:page:__check", "Vérifier les emplacements", ButtonStyle.Primary, "🔎"),
-            btn("p:dest:puball", "Publier tous les panneaux", ButtonStyle.Success, "📤"),
+            btn("p:dest:puball", "Mettre à jour les panneaux", ButtonStyle.Success, "🔄"),
             btn("p:dest:autoall", "Tout remettre en automatique", ButtonStyle.Secondary, "🪄"),
             btn("p:dest", "Actualiser", ButtonStyle.Secondary, "🔄")),
         backRow(),
@@ -5869,7 +7047,7 @@ async function buildSection(id, i, config, page = null) {
           "**Tickets** — menu des types d'aide",
           "**Menu de rôles** — rôles à cocher", "", "Chaque publication demande ensuite le salon cible."].join("\n") })],
       components: [
-        row(btn("p:setup:publish", "Tout publier automatiquement", ButtonStyle.Success, "⚡"),
+        row(btn("p:setup:publish", "Mettre à jour tous les panneaux", ButtonStyle.Success, "🔄"),
             btn("p:dest", "Choisir où va chaque panneau", ButtonStyle.Primary, "📍")),
         row(btn("p:publish:pick:member", "Espace membre", ButtonStyle.Primary, "🧭"),
             btn("p:publish:pick:ticket", "Tickets", ButtonStyle.Primary, "🎫"),
@@ -6809,6 +7987,23 @@ async function handlePanel(i) {
         footer: `${r.ok} réussite(s) · ${r.ko} à corriger — relançable sans créer de doublon` })],
         components: (await buildSection("eco", i, await getConfig(i.guildId))).components });
     }
+    if (action === "cast") { await updateConfig(i.guildId, { casino: { enabled: config.casino?.enabled === false } });
+      return respond(i, await buildSection("eco", i, await getConfig(i.guildId), "casino")); }
+    if (action === "casgame") {
+      const g = i.values[0];
+      const games = { ...(config.casino?.games ?? {}) };
+      games[g] = games[g] === false;
+      await updateConfig(i.guildId, { casino: { games } });
+      return respond(i, await buildSection("eco", i, await getConfig(i.guildId), "casino"));
+    }
+    if (action === "crimet") { await updateConfig(i.guildId, { crime: { enabled: config.crime?.enabled === false } });
+      return respond(i, await buildSection("eco", i, await getConfig(i.guildId), "casino")); }
+    if (action === "debtt") { await updateConfig(i.guildId, { crime: { debtBlocksCasino: config.crime?.debtBlocksCasino === false } });
+      return respond(i, await buildSection("eco", i, await getConfig(i.guildId), "casino")); }
+    if (action === "caslim") return i.showModal(modal("pm:eco:caslim", "Limites de mise", [
+      { id: "min", label: "Mise minimum", required: true, value: `${config.casino?.minBet ?? 50}`, max: 9 },
+      { id: "max", label: "Mise maximum", required: true, value: `${config.casino?.maxBet ?? 250000}`, max: 9 },
+    ]));
     if (action === "dropch") { await updateConfig(i.guildId, { economy: { dropChannelId: i.values[0] } });
       return feedback(i, { ok: true, title: "Salon des colis", text: `Les colis tomberont dans <#${i.values[0]}>.` }, "eco"); }
     if (action === "drop") {
@@ -7373,6 +8568,15 @@ async function handleModal(i, parts, config, level) {
       await updateConfig(i.guildId, { economy: patch });
       return feedback(i, { ok: true, title: "Montants enregistrés", text: "L'économie utilise déjà les nouvelles valeurs.", color: COLORS.gold }, "eco");
     }
+    if (action === "caslim") {
+      const mn = int("min"), mx = int("max");
+      if (mn === null || mx === null || mn < 1 || mx <= mn)
+        return feedback(i, { ok: false, title: "Valeurs invalides", text: "Le maximum doit dépasser le minimum.", color: COLORS.danger }, "eco", "casino");
+      await updateConfig(i.guildId, { casino: { minBet: mn, maxBet: mx } });
+      return feedback(i, { ok: true, title: "Limites enregistrées",
+        text: `Mises de **${num(mn)}** à **${num(mx)}**.`, color: COLORS.gold }, "eco", "casino");
+    }
+
     if (action === "additem") {
       const [type, roleId] = arg.split("_");
       const name = f("name"); const price = int("price");
@@ -7752,7 +8956,7 @@ async function handlePublic(i, parts, config) {
 }
 
 /* ========================================================================== */
-/*                    18 - COMMANDES ET MENUS CONTEXTUELS                     */
+/*                    20 - COMMANDES ET MENUS CONTEXTUELS                     */
 /* ========================================================================== */
 
 // commands.js — trois commandes seulement. Tout le reste passe par /panel.
@@ -7959,7 +9163,7 @@ const contextMenus = [
 ];
 
 /* ========================================================================== */
-/*                     19 - CLIENT, EVENEMENTS, DEMARRAGE                     */
+/*                     21 - CLIENT, EVENEMENTS, DEMARRAGE                     */
 /* ========================================================================== */
 
 // index.js — client, événements, démarrage.
@@ -8172,6 +9376,7 @@ client.on(Events.InteractionCreate, async (i) => {
     }
 
     if (i.isModalSubmit() && i.customId?.startsWith("tvm:")) return handleTempVoiceModal(i);
+    if (i.isModalSubmit() && i.customId?.startsWith("casm:")) return handleCasinoModal(i);
 
     if (i.isStringSelectMenu()) {
       if (i.customId === "ticket:pick") { await i.deferReply(EPH); return createTicket(i, i.values[0]); }
@@ -8202,6 +9407,8 @@ client.on(Events.InteractionCreate, async (i) => {
       if (ns === "gw") return handleGiveawayButton(i, action, arg);
       if (ns === "drop" && action === "claim") return claimDrop(i, arg);
       if (ns === "tv") return handleTempVoice(i);
+      if (ns === "cas") return handleCasino(i);
+      if (ns === "cr") return handleCrime(i);
       return;
     }
   } catch (err) {
