@@ -2638,10 +2638,13 @@ async function releaseFromJail(guild, member, by = "Automatique") {
 }
 
 
-const pbtn = (id, label, style = ButtonStyle.Secondary, emoji) => {
-  const b = new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style);
-  if (emoji) b.setEmoji(emoji);
-  return b;
+const pbtn = (id, label, style = ButtonStyle.Secondary, emoji, disabled = false) => {
+  const btnB = new ButtonBuilder().setCustomId(id).setStyle(style).setDisabled(disabled);
+  const clean = (label ?? "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+  if (clean) btnB.setLabel(clean.slice(0, 80));
+  if (emoji) btnB.setEmoji(emoji);
+  if (!clean && !emoji) btnB.setLabel("·");
+  return btnB;
 };
 
 /* ========================================================================== */
@@ -2696,9 +2699,12 @@ function memberPanel(guild) {
 
 
 const xb = (id, label, style = ButtonStyle.Secondary, emoji, disabled = false) => {
-  const b = new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style).setDisabled(disabled);
-  if (emoji) b.setEmoji(emoji);
-  return b;
+  const btnB = new ButtonBuilder().setCustomId(id).setStyle(style).setDisabled(disabled);
+  const clean = (label ?? "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+  if (clean) btnB.setLabel(clean.slice(0, 80));
+  if (emoji) btnB.setEmoji(emoji);
+  if (!clean && !emoji) btnB.setLabel("·");
+  return btnB;
 };
 const xrow = (...c) => new ActionRowBuilder().addComponents(...c);
 
@@ -2925,8 +2931,12 @@ async function blockedByDebt(guildId, userId) {
 
 
 const cb = (id, label, style = ButtonStyle.Secondary, emoji, disabled = false) => {
-  const b = new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style).setDisabled(disabled);
+  const b = new ButtonBuilder().setCustomId(id).setStyle(style).setDisabled(disabled);
+  // Un bouton doit avoir un libellé OU un emoji ; un libellé vide est refusé.
+  const clean = (label ?? "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+  if (clean) b.setLabel(clean.slice(0, 80));
   if (emoji) b.setEmoji(emoji);
+  if (!clean && !emoji) b.setLabel("·");
   return b;
 };
 const crow = (...c) => new ActionRowBuilder().addComponents(...c);
@@ -3040,8 +3050,14 @@ async function casinoLobby(guild, config, wallet) {
       footer: "Les gains sont calculés comme dans un vrai casino : la maison garde 3 %",
     })],
     components: [
-      crow(...actifs.slice(0, 3).map(([id, g]) => cb(`cas:pick:${id}`, g.label, ButtonStyle.Primary, g.emoji))),
-      crow(...actifs.slice(3, 6).map(([id, g]) => cb(`cas:pick:${id}`, g.label, ButtonStyle.Primary, g.emoji))),
+      // Une rangée vide fait refuser le message par Discord : on n'en crée
+      // que pour les jeux réellement ouverts.
+      ...(actifs.length
+        ? [crow(...actifs.slice(0, 3).map(([id, g]) => cb(`cas:pick:${id}`, g.label, ButtonStyle.Primary, g.emoji)))]
+        : []),
+      ...(actifs.length > 3
+        ? [crow(...actifs.slice(3, 6).map(([id, g]) => cb(`cas:pick:${id}`, g.label, ButtonStyle.Primary, g.emoji)))]
+        : []),
       crow(cb("pub:coins", "Mes jetons", ButtonStyle.Secondary, "🪙"),
            cb("pub:top:coins", "Les plus riches", ButtonStyle.Secondary, "🏆"),
            cb("cr:open", "Arrière-salle", ButtonStyle.Danger, "🚬")),
@@ -3052,6 +3068,15 @@ async function casinoLobby(guild, config, wallet) {
 /** Choix de la mise, commun à tous les jeux. */
 function betView(guild, game, wallet, currency) {
   const g = GAMES[game];
+  if (wallet.coins < 0) {
+    return {
+      embeds: [embed({ guild, color: COLORS.danger, author: { name: "🚨  Tables fermées" },
+        description: `Tu dois **${money(currency, -wallet.coins)}**.\nRembourse avec le quotidien et le travail avant de remiser.` })],
+      components: [crow(cb("pub:work", "Travailler", ButtonStyle.Success, "💼"),
+        cb("pub:daily", "Quotidien", ButtonStyle.Success, "🎁"),
+        cb("cas:lobby", "Retour", ButtonStyle.Secondary, "◀️"))],
+    };
+  }
   const presets = [100, 500, 1000, 5000].filter((v) => v <= wallet.coins);
   return {
     embeds: [embed({
@@ -3064,8 +3089,8 @@ function betView(guild, game, wallet, currency) {
         cb(`cas:betmodal:${game}`, "Autre", ButtonStyle.Primary, "✏️"),
       ),
       crow(
-        cb(`cas:bet:${game}:${Math.floor(wallet.coins / 2)}`, "Moitié", ButtonStyle.Secondary, "½", wallet.coins < 2),
-        cb(`cas:bet:${game}:${wallet.coins}`, "Tout", ButtonStyle.Danger, "🔥", wallet.coins < 1),
+        cb(`cas:bet:${game}:${Math.max(0, Math.floor(wallet.coins / 2))}`, "Moitié", ButtonStyle.Secondary, "🪙", wallet.coins < 2),
+        cb(`cas:bet:${game}:${Math.max(0, wallet.coins)}`, "Tout miser", ButtonStyle.Danger, "🔥", wallet.coins < 1),
         cb("cas:lobby", "Retour", ButtonStyle.Secondary, "◀️"),
       ),
     ],
@@ -3870,10 +3895,13 @@ function previewEmbed(guild, plan, label) {
 // tempvoice.js — « Créer ton vocal » : salons vocaux temporaires.
 
 
-const tvBtn = (id, label, style = ButtonStyle.Secondary, emoji) => {
-  const b = new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style);
-  if (emoji) b.setEmoji(emoji);
-  return b;
+const tvBtn = (id, label, style = ButtonStyle.Secondary, emoji, disabled = false) => {
+  const btnB = new ButtonBuilder().setCustomId(id).setStyle(style).setDisabled(disabled);
+  const clean = (label ?? "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+  if (clean) btnB.setLabel(clean.slice(0, 80));
+  if (emoji) btnB.setEmoji(emoji);
+  if (!clean && !emoji) btnB.setLabel("·");
+  return btnB;
 };
 
 /* ========================================================================== */
@@ -5082,8 +5110,11 @@ async function actionGrantCoins(guild, target, amount, moderator, reason) {
 
 
 const b = (id, label, style = ButtonStyle.Secondary, emoji) => {
-  const x = new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style);
+  const x = new ButtonBuilder().setCustomId(id).setStyle(style);
+  const clean = (label ?? "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+  if (clean) x.setLabel(clean.slice(0, 80));
   if (emoji) x.setEmoji(emoji);
+  if (!clean && !emoji) x.setLabel("·");
   return x;
 };
 
@@ -5976,10 +6007,13 @@ function denyView(guild, section, config) {
   };
 }
 
-const btn = (id, label, style = ButtonStyle.Secondary, emoji) => {
-  const b = new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style);
-  if (emoji) b.setEmoji(emoji);
-  return b;
+const btn = (id, label, style = ButtonStyle.Secondary, emoji, disabled = false) => {
+  const btnB = new ButtonBuilder().setCustomId(id).setStyle(style).setDisabled(disabled);
+  const clean = (label ?? "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+  if (clean) btnB.setLabel(clean.slice(0, 80));
+  if (emoji) btnB.setEmoji(emoji);
+  if (!clean && !emoji) btnB.setLabel("·");
+  return btnB;
 };
 const row = (...c) => new ActionRowBuilder().addComponents(...c);
 const backRow = (to = "p:home") => row(btn(to, "Retour", ButtonStyle.Secondary, "◀️"));
