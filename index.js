@@ -21,6 +21,15 @@
 //     La pression policiere monte a chaque coup et fait chuter tes chances.
 //     En dette, les tables du casino et la boutique se ferment.
 //
+//   COMMANDES A PREFIXE
+//     !ban, ?kick, *mute… Le caractere se choisit dans Panneau > Prefixe,
+//     chaque commande s'ouvre, se ferme et change de niveau requis.
+//     Les niveaux de perm s'appliquent comme au panneau.
+//
+//   TRESORERIE
+//     Panneau > Tresorerie : crediter ou retirer a une personne, a tout un
+//     role, ou a l'ensemble du serveur. Masse monetaire visible en direct.
+//
 //   CASINO
 //     Six jeux aux probabilites reelles : machine a sous, blackjack complet,
 //     roulette europeenne, demineur, des a cote reglable, pile ou face.
@@ -680,6 +689,15 @@ const DEFAULT_CONFIG = {
     maxDebt: 100_000,
   },
 
+  // Commandes à préfixe : !ban, ?kick, *mute…
+  prefix: {
+    enabled: true,
+    char: "!",
+    deleteInvocation: false,
+    disabled: [],   // noms de commandes coupées
+    levels: {},     // surcharges de niveau requis
+  },
+
   // Casino
   casino: {
     enabled: true,
@@ -985,10 +1003,13 @@ async function getWallet(guildId, userId) {
 }
 
 /**
- * Crédite ou débite. `allowNegative` autorise la dette : c'est ce qui permet
- * de finir en déficit après un coup illégal raté.
+ * Crédite ou débite.
+ * Le solde peut descendre sous zéro : c'est la dette. Elle ne doit JAMAIS
+ * être effacée par un simple gain — un crédit la RÉDUIT, il ne la remet pas
+ * à zéro. Chaque débit vérifie déjà le solde avant de retirer, donc le
+ * plancher n'a plus lieu d'être.
  */
-async function addCoins(guildId, userId, amount, allowNegative = false) {
+async function addCoins(guildId, userId, amount, allowNegative = true) {
   if (ready) {
     const expr = allowNegative ? "economy.coins+$3" : "GREATEST(0, economy.coins+$3)";
     const r = await q(`INSERT INTO economy (guild_id,user_id,coins) VALUES ($1,$2,$3)
@@ -1044,10 +1065,36 @@ async function stampEconomy(guildId, userId, field, value, streak = null) {
   }
 }
 
+/** Masse monétaire en circulation, et nombre de porteurs. */
+async function coinsSummary(guildId) {
+  if (ready) {
+    const r = await q(`SELECT COALESCE(SUM(coins),0)::bigint total, COUNT(*)::int porteurs,
+      COUNT(*) FILTER (WHERE coins < 0)::int endettes FROM economy WHERE guild_id=$1`, [guildId]);
+    const x = r.rows[0] ?? {};
+    return { total: Number(x.total ?? 0), porteurs: x.porteurs ?? 0, endettes: x.endettes ?? 0 };
+  }
+  const list = [...mem.economy.entries()].filter(([k]) => k.startsWith(`${guildId}:`)).map(([, v]) => v.coins);
+  return { total: list.reduce((a, b) => a + b, 0), porteurs: list.length, endettes: list.filter((c) => c < 0).length };
+}
+
+/** Crédite plusieurs personnes d'un coup. @returns {Promise<number>} */
+async function addCoinsBulk(guildId, userIds, amount, allowNegative = true) {
+  let n = 0;
+  for (const id of userIds) { await addCoins(guildId, id, amount, allowNegative); n++; }
+  return n;
+}
+
+/** Remet un solde à la valeur voulue. */
+async function setCoins(guildId, userId, value) {
+  const w = await getWallet(guildId, userId);
+  return addCoins(guildId, userId, value - w.coins, true);
+}
+
 async function topCoins(guildId, limit = 10) {
-  if (ready) return (await q("SELECT user_id,coins FROM economy WHERE guild_id=$1 ORDER BY coins DESC LIMIT $2", [guildId, limit]))
+  if (ready) return (await q("SELECT user_id,coins FROM economy WHERE guild_id=$1 AND coins > 0 ORDER BY coins DESC LIMIT $2", [guildId, limit]))
     .rows.map((r) => ({ userId: r.user_id, coins: Number(r.coins) }));
-  return [...mem.economy.entries()].filter(([k]) => k.startsWith(`${guildId}:`)).sort((a, b) => b[1].coins - a[1].coins)
+  return [...mem.economy.entries()].filter(([k, w]) => k.startsWith(`${guildId}:`) && w.coins > 0)
+    .sort((a, b) => b[1].coins - a[1].coins)
     .slice(0, limit).map(([k, w]) => ({ userId: k.split(":")[1], coins: w.coins }));
 }
 
@@ -4947,8 +4994,9 @@ async function actionDaily(guild, user) {
   const total = await addCoins(guild.id, user.id, gain);
   await stampEconomy(guild.id, user.id, "daily", new Date(), streak);
   return ok("Récompense quotidienne",
-    `Tu reçois **${config.economy.currency} ${num(gain)}**${bonus ? ` (dont ${num(bonus)} de série)` : ""}.\nSolde : **${num(total)}** · série de ${streak} jour(s).`,
-    COLORS.gold);
+    `Tu reçois **${config.economy.currency} ${num(gain)}**${bonus ? ` (dont ${num(bonus)} de série)` : ""}.\n`
+    + (total < 0 ? `🚨 Il te reste **${num(-total)}** de dette.` : `Solde : **${num(total)}** · série de ${streak} jour(s).`),
+    total < 0 ? COLORS.warning : COLORS.gold);
 }
 
 const WORK_FLAVOR = ["as modéré le chat", "as rangé les vocaux", "as animé un event", "as aidé un nouveau", "as trié les tickets", "as tenu la boutique"];
@@ -4964,8 +5012,9 @@ async function actionWork(guild, user) {
   const total = await addCoins(guild.id, user.id, gain);
   await stampEconomy(guild.id, user.id, "work", new Date());
   return ok("Travail terminé",
-    `Tu ${WORK_FLAVOR[Math.floor(Math.random() * WORK_FLAVOR.length)]} et gagnes **${config.economy.currency} ${num(gain)}**.\nSolde : **${num(total)}**.`,
-    COLORS.success);
+    `Tu ${WORK_FLAVOR[Math.floor(Math.random() * WORK_FLAVOR.length)]} et gagnes **${config.economy.currency} ${num(gain)}**.\n`
+    + (total < 0 ? `🚨 Il te reste **${num(-total)}** de dette.` : `Solde : **${num(total)}**.`),
+    total < 0 ? COLORS.warning : COLORS.success);
 }
 
 /** Catalogue des types d'articles vendables. */
@@ -5088,8 +5137,13 @@ async function actionPay(guild, from, toUser, amount) {
   return ok("Transfert effectué", `**${config.economy.currency} ${num(amount)}** envoyés à ${toUser}.`, COLORS.gold);
 }
 
+/**
+ * Crédite ou retire à n'importe qui : propriétaire du serveur, du bot,
+ * administrateur immunisé, tout le monde. Ce n'est pas une sanction, donc
+ * la hiérarchie ne s'applique pas. Le solde peut passer sous zéro.
+ */
 async function actionGrantCoins(guild, target, amount, moderator, reason) {
-  const total = await addCoins(guild.id, target.id, amount);
+  const total = await addCoins(guild.id, target.id, amount, true);
   await log(guild, "coins", embed({
     guild, color: COLORS.gold, author: { name: `${ICONS.coin}  Ajustement` },
     fields: [
@@ -5099,11 +5153,320 @@ async function actionGrantCoins(guild, target, amount, moderator, reason) {
       { name: "Raison", value: reason || "Non précisée" },
     ],
   }));
-  return ok("Solde ajusté", `${amount >= 0 ? "+" : ""}${num(amount)} — nouveau solde : **${num(total)}**.`, COLORS.gold);
+  return ok("Solde ajusté",
+    `${amount >= 0 ? "+" : ""}${num(amount)} pour **${target.user?.tag ?? target.tag}**\n`
+    + (total < 0 ? `🚨 Il est maintenant **en dette de ${num(-total)}**.` : `Nouveau solde : **${num(total)}**.`),
+    total < 0 ? COLORS.danger : COLORS.gold);
 }
 
 /* ========================================================================== */
-/*                 16 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
+/*                          16 - COMMANDES A PREFIXE                          */
+/* ========================================================================== */
+
+// prefix.js — commandes à préfixe. Le caractère et la liste se règlent au panneau.
+
+
+/** Préfixes proposés dans le panneau. */
+const PREFIX_CHOICES = ["!", "?", "*", ".", "-", "+", "$", "%", ">", "&"];
+
+/* ========================================================================== */
+/*                              LES COMMANDES                                 */
+/* ========================================================================== */
+
+const pOk = (title, text, color = COLORS.success) => ({ title, text, color });
+const pNo = (text) => ({ ok: false, title: "Impossible", text, color: COLORS.danger });
+
+/**
+ * Chaque commande déclare son niveau, son usage et si elle vise un membre.
+ * `run` reçoit ({ message, args, rest, target, config, level }).
+ */
+const PREFIX_COMMANDS = {
+  ban: {
+    aliases: ["bannir"], level: 3, target: true, usage: "<@membre> [raison]",
+    desc: "Bannit un membre",
+    run: ({ message, target, rest }) => actionBan(message.guild, target, message.author, rest || "Non précisée"),
+  },
+  unban: {
+    aliases: ["debannir", "déban"], level: 3, usage: "<identifiant> [raison]",
+    desc: "Révoque un bannissement",
+    run: ({ message, args, rest }) => actionUnban(message.guild, (args[0] ?? "").replace(/\D/g, ""), message.author, rest.split(" ").slice(1).join(" ") || "Non précisée"),
+  },
+  kick: {
+    aliases: ["expulser"], level: 2, target: true, usage: "<@membre> [raison]",
+    desc: "Expulse un membre",
+    run: ({ message, target, rest }) => actionKick(message.guild, target, message.author, rest || "Non précisée"),
+  },
+  mute: {
+    aliases: ["timeout", "muet"], level: 2, target: true, usage: "<@membre> <durée> [raison]",
+    desc: "Réduit au silence (10m, 2h, 7d)",
+    run: ({ message, target, args, rest }) => {
+      const ms = parseDuration(args[1]);
+      if (!ms) return pNo("Durée manquante ou invalide. Exemples : `10m`, `2h`, `7d`.");
+      return actionTimeout(message.guild, target, message.author, ms, rest.split(" ").slice(1).join(" ") || "Non précisée");
+    },
+  },
+  unmute: {
+    aliases: ["untimeout"], level: 2, target: true, usage: "<@membre>",
+    desc: "Rend la parole",
+    run: ({ message, target }) => actionUntimeout(message.guild, target, message.author),
+  },
+  warn: {
+    aliases: ["avertir"], level: 1, target: true, usage: "<@membre> <raison>",
+    desc: "Donne un avertissement",
+    run: ({ message, target, rest }) => {
+      if (!rest) return pNo("Il faut une raison.");
+      return actionWarn(message.guild, target, message.author, rest);
+    },
+  },
+  casier: {
+    aliases: ["historique", "warns"], level: 1, target: true, usage: "<@membre>",
+    desc: "Historique des sanctions",
+    run: ({ message, target }) => actionHistory(message.guild, target),
+  },
+  clearwarns: {
+    aliases: ["effacer"], level: 4, target: true, usage: "<@membre>",
+    desc: "Efface le casier",
+    run: ({ message, target }) => actionClearSanctions(message.guild, target),
+  },
+  clear: {
+    aliases: ["purge", "clean"], level: 1, usage: "<nombre> [@membre]",
+    desc: "Supprime des messages récents",
+    run: ({ message, args }) => {
+      const n = Math.min(100, Math.max(1, parseInt(args[0], 10) || 0));
+      if (!n) return pNo("Indique un nombre entre 1 et 100.");
+      const cible = message.mentions.users.first()?.id ?? null;
+      return actionPurge(message.channel, n, cible, message.author);
+    },
+  },
+  jail: {
+    aliases: ["alcatraz"], level: 2, target: true, usage: "<@membre> <raison> [durée]",
+    desc: "Envoie en Alcatraz",
+    run: ({ message, target, rest, args }) => {
+      const last = args[args.length - 1];
+      const ms = parseDuration(last);
+      const raison = ms ? rest.split(" ").slice(0, -1).join(" ") : rest;
+      if (!raison) return pNo("Il faut une raison.");
+      return actionJail(message.guild, target, message.author, raison, ms);
+    },
+  },
+  unjail: {
+    aliases: ["liberer", "libérer"], level: 2, target: true, usage: "<@membre>",
+    desc: "Libère d'Alcatraz",
+    run: ({ message, target }) => actionFree(message.guild, target, message.author),
+  },
+  slowmode: {
+    aliases: ["lent"], level: 2, usage: "<secondes>",
+    desc: "Règle le mode lent",
+    run: async ({ message, args }) => {
+      const s = Math.max(0, Math.min(21600, parseInt(args[0], 10) || 0));
+      await message.channel.setRateLimitPerUser(s, message.author.tag).catch(() => null);
+      return pOk("Mode lent", s ? `${s} seconde(s) entre chaque message.` : "Mode lent coupé.");
+    },
+  },
+  lock: {
+    level: 2, usage: "",
+    desc: "Verrouille le salon",
+    run: async ({ message }) => {
+      await message.channel.permissionOverwrites.edit(message.guild.roles.everyone, { SendMessages: false }).catch(() => null);
+      return pOk("Salon verrouillé", "Plus personne ne peut écrire ici.", COLORS.danger);
+    },
+  },
+  unlock: {
+    level: 2, usage: "",
+    desc: "Déverrouille le salon",
+    run: async ({ message }) => {
+      await message.channel.permissionOverwrites.edit(message.guild.roles.everyone, { SendMessages: null }).catch(() => null);
+      return pOk("Salon déverrouillé", "Les membres peuvent réécrire.");
+    },
+  },
+  give: {
+    aliases: ["donner", "addcoins"], level: 4, target: true, noHierarchy: true, usage: "<@membre> <montant>",
+    desc: "Crédite des coins",
+    run: ({ message, target, args }) => {
+      const n = parseInt((args[1] ?? "").replace(/\D/g, ""), 10);
+      if (!Number.isFinite(n) || n < 1) return pNo("Indique un montant.");
+      return actionGrantCoins(message.guild, target, n, message.author, "Commande give");
+    },
+  },
+  take: {
+    aliases: ["retirer", "removecoins"], level: 4, target: true, noHierarchy: true, usage: "<@membre> <montant>",
+    desc: "Retire des coins",
+    run: ({ message, target, args }) => {
+      const n = parseInt((args[1] ?? "").replace(/\D/g, ""), 10);
+      if (!Number.isFinite(n) || n < 1) return pNo("Indique un montant.");
+      return actionGrantCoins(message.guild, target, -n, message.author, "Commande take");
+    },
+  },
+  solde: {
+    aliases: ["coins", "balance"], level: 0, usage: "[@membre]",
+    desc: "Affiche un solde",
+    run: async ({ message, config }) => {
+      const u = message.mentions.users.first() ?? message.author;
+      const w = await getWallet(message.guild.id, u.id);
+      return pOk(w.coins < 0 ? `${u.username} est en dette` : `Solde de ${u.username}`,
+        w.coins < 0
+          ? `## − ${config.economy.currency} ${num(-w.coins)}\nTables et boutique fermées jusqu'au remboursement.`
+          : `## ${config.economy.currency} ${num(w.coins)}`,
+        w.coins < 0 ? COLORS.danger : COLORS.gold);
+    },
+  },
+  daily: {
+    aliases: ["quotidien"], level: 0, usage: "",
+    desc: "Récompense quotidienne",
+    run: ({ message }) => actionDaily(message.guild, message.author),
+  },
+  work: {
+    aliases: ["travail", "travailler"], level: 0, usage: "",
+    desc: "Travailler pour des coins",
+    run: ({ message }) => actionWork(message.guild, message.author),
+  },
+  grade: {
+    aliases: ["rank", "niveau"], level: 0, usage: "[@membre]",
+    desc: "Ton grade et ta progression",
+    embedOnly: true,
+    run: async ({ message, config }) => {
+      const u = message.mentions.users.first() ?? message.author;
+      const stats = await memberStats(message.guild.id, u.id);
+      return { embed: progressEmbed(message.guild, u, config, stats) };
+    },
+  },
+  grades: {
+    aliases: ["echelle", "échelle"], level: 0, usage: "",
+    desc: "L'échelle complète des grades",
+    embedOnly: true,
+    run: async ({ message, config }) => ({ embed: ladderEmbed(message.guild, config) }),
+  },
+  stats: {
+    aliases: ["profil"], level: 0, usage: "[@membre]",
+    desc: "Temps vocal et messages",
+    run: async ({ message }) => {
+      const u = message.mentions.users.first() ?? message.author;
+      const min = await getVoiceMinutes(message.guild.id, u.id);
+      const msg = await getMessageCount(message.guild.id, u.id);
+      return pOk(`Statistiques de ${u.username}`,
+        `🎙️ **${Math.floor(min / 60)} h ${min % 60} min** de vocal\n💬 **${num(msg)}** messages`, COLORS.primary);
+    },
+  },
+  help: {
+    aliases: ["aide", "commandes"], level: 0, usage: "",
+    desc: "Liste des commandes disponibles",
+    embedOnly: true,
+    run: async ({ message, config, level }) => {
+      const p = config.prefix?.char ?? "!";
+      const dispo = Object.entries(PREFIX_COMMANDS)
+        .filter(([n]) => !(config.prefix?.disabled ?? []).includes(n))
+        .filter(([n, c]) => level >= prefixRequiredLevel(n, c, config));
+      const parNiveau = {};
+      for (const [n, c] of dispo) (parNiveau[prefixRequiredLevel(n, c, config)] ??= []).push(`\`${p}${n}\``);
+      return {
+        embed: embed({
+          guild: message.guild, color: COLORS.primary,
+          author: { name: `⌨️  Commandes en ${p}` },
+          description: `Ton niveau : **${PERM_LABELS[level]}** · ${dispo.length} commande(s) accessibles`,
+          fields: Object.keys(parNiveau).sort((a, b) => a - b).map((lv) => ({
+            name: PERM_LABELS[lv], value: parNiveau[lv].join(" "),
+          })),
+          footer: `${p}aide <commande> pour le détail · tout est aussi dans /panel`,
+        }),
+      };
+    },
+  },
+};
+
+/** Niveau requis, surcharge du panneau comprise. */
+function prefixRequiredLevel(name, cmd, config) {
+  const custom = config.prefix?.levels?.[name];
+  return custom !== undefined ? Number(custom) : (cmd?.level ?? 0);
+}
+
+/** Retrouve une commande par son nom ou un alias. */
+function findCommand(word) {
+  const w = word.toLowerCase();
+  if (PREFIX_COMMANDS[w]) return [w, PREFIX_COMMANDS[w]];
+  for (const [name, c] of Object.entries(PREFIX_COMMANDS)) {
+    if (c.aliases?.some((a) => a.toLowerCase() === w)) return [name, c];
+  }
+  return [null, null];
+}
+
+/* ========================================================================== */
+/*                              EXÉCUTION                                     */
+/* ========================================================================== */
+
+/**
+ * Traite un message susceptible d'être une commande.
+ * @returns {Promise<boolean>} true si la commande a été prise en charge
+ */
+async function handlePrefix(message, config) {
+  const conf = config.prefix ?? {};
+  if (!conf.enabled) return false;
+  const p = conf.char || "!";
+  if (!message.content.startsWith(p)) return false;
+
+  const parts = message.content.slice(p.length).trim().split(/\s+/);
+  const word = parts.shift() ?? "";
+  if (!word) return false;
+
+  const [name, cmd] = findCommand(word);
+  if (!cmd) return false;
+  if ((conf.disabled ?? []).includes(name)) return false;
+
+  const level = permLevel(message.member, config);
+  const need = prefixRequiredLevel(name, cmd, config);
+  const envoyer = async (payload) => {
+    if (!canSend(message.channel)) return;
+    const m = await message.channel.send(payload).catch(() => null);
+    if (conf.deleteInvocation) await message.delete().catch(() => null);
+    return m;
+  };
+
+  if (level < need) {
+    await envoyer({ embeds: [embed({ guild: message.guild, color: COLORS.danger,
+      author: { name: `${ICONS.no}  Accès refusé` },
+      description: `\`${p}${name}\` demande **${PERM_LABELS[need]}**.\nTon niveau : **${PERM_LABELS[level]}**.` })] });
+    return true;
+  }
+
+  // Résolution de la cible pour les commandes qui en attendent une
+  let target = null;
+  if (cmd.target) {
+    const id = message.mentions.users.first()?.id ?? (parts[0] ?? "").replace(/\D/g, "");
+    target = id ? await message.guild.members.fetch(id).catch(() => null) : null;
+    if (!target) {
+      await envoyer({ embeds: [embed({ guild: message.guild, color: COLORS.warning,
+        author: { name: "Membre introuvable" },
+        description: `Usage : \`${p}${name} ${cmd.usage}\`` })] });
+      return true;
+    }
+    const problem = cmd.noHierarchy ? null : checkTarget(message.guild, message.member, target, config);
+    if (problem) {
+      await envoyer({ embeds: [embed({ guild: message.guild, color: COLORS.danger,
+        author: { name: "Action refusée" }, description: problem })] });
+      return true;
+    }
+  }
+
+  const rest = parts.slice(cmd.target ? 1 : 0).join(" ").trim();
+
+  try {
+    const r = await cmd.run({ message, args: parts, rest, target, config, level });
+    if (!r) { await envoyer({ embeds: [embed({ guild: message.guild, color: COLORS.success,
+      author: { name: `${ICONS.ok}  Fait` } })] }); return true; }
+    if (r.embed) { await envoyer({ embeds: [r.embed] }); return true; }
+    await envoyer({ embeds: [embed({ guild: message.guild, color: r.color ?? COLORS.success,
+      author: { name: `${r.ok === false ? ICONS.no : ICONS.ok}  ${r.title ?? "Fait"}` },
+      description: r.text })] });
+  } catch (e) {
+    console.error("[prefixe]", name, e.message);
+    await envoyer({ embeds: [embed({ guild: message.guild, color: COLORS.danger,
+      author: { name: `${ICONS.no}  Erreur` },
+      description: `\`${p}${name}\` a échoué. Vérifie mes permissions et l'usage : \`${p}${name} ${cmd.usage}\`` })] });
+  }
+  return true;
+}
+
+/* ========================================================================== */
+/*                 17 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
 /* ========================================================================== */
 
 // coinsspace.js — remplissage complet de la catégorie ESPACE COINS.
@@ -5372,7 +5735,7 @@ async function setupCoinsSpace(guild, memberPanelFactory) {
 }
 
 /* ========================================================================== */
-/*                17 - AFFECTATION ET VERIFICATION DES SALONS                 */
+/*                18 - AFFECTATION ET VERIFICATION DES SALONS                 */
 /* ========================================================================== */
 
 // destinations.js — la table d'affectation : quel panneau, quelle fonction, quel salon.
@@ -5680,7 +6043,7 @@ function summarizeIssues(results) {
 }
 
 /* ========================================================================== */
-/*                       18 - INSTALLATION AUTOMATIQUE                        */
+/*                       19 - INSTALLATION AUTOMATIQUE                        */
 /* ========================================================================== */
 
 // setup.js — installation automatique. Un bouton, tout est branché.
@@ -5951,7 +6314,7 @@ function setupReport(guild, result) {
 }
 
 /* ========================================================================== */
-/*             19 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
+/*             20 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
 /* ========================================================================== */
 
 // panel.js — l'interface complète. Tout réglage du bot est atteignable ici.
@@ -5973,6 +6336,8 @@ const SECTIONS = [
   { id: "gw", label: "Giveaways", emoji: "🎁", level: 4, desc: "Lancer, terminer, retirer au sort" },
   { id: "counters", label: "Compteurs", emoji: "📊", level: 4, desc: "Membres, connectés, vocal", trusted: true },
   { id: "eco", label: "Économie", emoji: "🪙", level: 4, desc: "Coins, boutique, colis", trusted: true },
+  { id: "money", label: "Trésorerie", emoji: "💸", level: 4, desc: "Donner et retirer des coins", trusted: true },
+  { id: "prefix", label: "Préfixe", emoji: "⌨️", level: 5, desc: "Commandes texte : !ban, ?kick…", trusted: true },
   { id: "levels", label: "Niveaux", emoji: "📈", level: 4, desc: "XP, récompenses, annonces", trusted: true },
   { id: "ranks", label: "Grades", emoji: "🎖️", level: 4, desc: "Montée au temps de vocal et au message", trusted: true },
   { id: "voice", label: "Vocal", emoji: "🔊", level: 4, desc: "XP et coins gagnés en vocal", trusted: true },
@@ -6797,6 +7162,86 @@ async function buildSection(id, i, config, page = null) {
     };
   }
 
+  /* ------------------------------- TRÉSORERIE ---------------------------- */
+  if (id === "money") {
+    const c = config.economy.currency;
+    const s2 = await coinsSummary(guild.id);
+    const top = await topCoins(guild.id, 5);
+    return {
+      embeds: [embed({ guild, author: { name: "💸  Trésorerie" }, color: COLORS.gold,
+        description: "Crédite ou retire des coins, à une personne, à un rôle entier ou à tout le serveur.",
+        fields: [
+          { name: "En circulation", value: `${c} **${num(s2.total)}**`, inline: true },
+          { name: "Porteurs", value: `${s2.porteurs}`, inline: true },
+          { name: "Endettés", value: s2.endettes ? `🚨 ${s2.endettes}` : "aucun", inline: true },
+          { name: "Les plus riches", value: top.length
+            ? top.map((x, n) => `**${n + 1}.** <@${x.userId}> — ${c} ${num(x.coins)}`).join("\n") : "_personne_" },
+        ],
+        footer: "Chaque mouvement part dans tes journaux" })],
+      components: [
+        row(new UserSelectMenuBuilder().setCustomId("p:money:user").setPlaceholder("Créditer ou retirer à une personne…")),
+        row(new RoleSelectMenuBuilder().setCustomId("p:money:role").setPlaceholder("Créditer tout un rôle…")),
+        row(btn("p:money:all", "Créditer tout le serveur", ButtonStyle.Success, "🌍"),
+            btn("p:money:reset", "Remettre un solde à zéro", ButtonStyle.Danger, "🧹"),
+            btn("p:money", "Actualiser", ButtonStyle.Secondary, "🔄")),
+        backRow(),
+      ],
+    };
+  }
+
+  /* --------------------------------- PRÉFIXE ----------------------------- */
+  if (id === "prefix") {
+    const pc = config.prefix ?? {};
+    const p2 = pc.char || "!";
+    const coupees = pc.disabled ?? [];
+    const noms = Object.keys(PREFIX_COMMANDS);
+    const actives = noms.filter((n) => !coupees.includes(n));
+
+    if (page === "cmds") {
+      return {
+        embeds: [embed({ guild, author: { name: `⌨️  Les ${noms.length} commandes` }, color: COLORS.primary,
+          description: noms.map((n) => {
+            const cmd = PREFIX_COMMANDS[n];
+            return `${coupees.includes(n) ? "🔴" : "🟢"} \`${p2}${n}\` — ${cmd.desc} · _${PERM_LABELS[prefixRequiredLevel(n, cmd, config)]}_`;
+          }).join("\n").slice(0, 4000),
+          footer: "Choisis-en une pour l'ouvrir, la fermer ou changer son niveau" })],
+        components: [
+          row(new StringSelectMenuBuilder().setCustomId("p:prefix:pick").setPlaceholder("Régler une commande…")
+            .addOptions(noms.slice(0, 25).map((n) => ({ label: `${p2}${n}`, value: n,
+              description: PREFIX_COMMANDS[n].desc.slice(0, 100) })))),
+          backRow("p:prefix"),
+        ],
+      };
+    }
+
+    return {
+      embeds: [embed({ guild, author: { name: "⌨️  Commandes à préfixe" }, color: pc.enabled ? COLORS.success : COLORS.neutral,
+        description: [
+          `État : **${onOff(pc.enabled)}** · préfixe actuel : **\`${p2}\`**`,
+          "",
+          `Exemples : \`${p2}ban @membre spam\` · \`${p2}mute @membre 10m\` · \`${p2}clear 50\``,
+        ].join("\n"),
+        fields: [
+          { name: `Ouvertes (${actives.length}/${noms.length})`,
+            value: actives.map((n) => `\`${p2}${n}\``).join(" ").slice(0, 1000) || "_aucune_" },
+          ...(coupees.length ? [{ name: "Fermées", value: coupees.map((n) => `\`${p2}${n}\``).join(" ").slice(0, 1000) }] : []),
+          { name: "Message de commande", value: pc.deleteInvocation ? "supprimé après exécution" : "conservé", inline: true },
+        ],
+        footer: "Le niveau de perm s'applique aussi aux commandes texte" })],
+      components: [
+        row(new StringSelectMenuBuilder().setCustomId("p:prefix:char").setPlaceholder(`Changer le préfixe (actuel : ${p2})`)
+          .addOptions(PREFIX_CHOICES.map((ch) => ({ label: `${ch}ban  ${ch}kick  ${ch}mute`, value: ch,
+            default: ch === p2 })))),
+        row(btn("p:prefix:t", pc.enabled ? "Couper les commandes texte" : "Activer les commandes texte",
+              pc.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
+            btn("p:prefix:page:cmds", "Régler chaque commande", ButtonStyle.Primary, "📋"),
+            btn("p:prefix:del", pc.deleteInvocation ? "Garder le message" : "Supprimer le message",
+              ButtonStyle.Secondary, "🧹")),
+        backRow(),
+      ],
+    };
+  }
+
   /* --------------------------------- CASINO ------------------------------ */
   if (id === "eco" && page === "casino") {
     const cas = config.casino ?? {};
@@ -7145,7 +7590,7 @@ async function showMemberCard(i, userId, config) {
       { name: "Compte créé", value: ts(member.user.createdAt), inline: true },
       { name: "A rejoint", value: member.joinedAt ? ts(member.joinedAt) : "—", inline: true },
       { name: "Niveau", value: `${lvl.level} · ${num(lvl.xp)} XP`, inline: true },
-      { name: "Coins", value: num(wallet.coins), inline: true },
+      { name: "Coins", value: wallet.coins < 0 ? `🚨 − ${num(-wallet.coins)}` : num(wallet.coins), inline: true },
       { name: "Rôles", value: member.roles.cache.filter((r) => r.id !== i.guild.id).sort((a, b) => b.position - a.position).map((r) => r.toString()).slice(0, 10).join(" ") || "_aucun_" },
     ],
   }).thumb(member.user.displayAvatarURL({ size: 256 }));
@@ -7355,7 +7800,9 @@ async function handlePanel(i) {
       return feedback(i, { ok: false, title: "Niveau insuffisant", text: `Cette action demande **${PERM_LABELS[gate[action]]}**.`, color: COLORS.danger }, "mod");
 
     const target = await i.guild.members.fetch(arg).catch(() => null);
-    if (["warn", "timeout", "kick", "ban", "jail", "coins", "clear"].includes(action)) {
+    // « coins » est retiré volontairement : donner ou retirer de l'argent
+    // n'est pas une sanction et doit fonctionner sur n'importe qui.
+    if (["warn", "timeout", "kick", "ban", "jail", "clear"].includes(action)) {
       if (!target) return feedback(i, { ok: false, title: "Introuvable", text: "Ce membre a quitté le serveur.", color: COLORS.danger }, "mod");
       const problem = checkTarget(i.guild, i.member, target, config);
       if (problem) return feedback(i, { ok: false, title: "Action refusée", text: problem, color: COLORS.danger }, "mod");
@@ -7991,6 +8438,77 @@ async function handlePanel(i) {
     }
   }
 
+  /* ------------------------------- TRÉSORERIE ---------------------------- */
+  if (section === "money") {
+    if (action === "user") return i.showModal(modal(`pm:money:one:${i.values[0]}`, "Créditer ou retirer", [
+      { id: "montant", label: "Montant (négatif pour retirer)", required: true, max: 12 },
+      { id: "raison", label: "Raison", max: 200 },
+    ]));
+    if (action === "role") return i.showModal(modal(`pm:money:role:${i.values[0]}`, "Créditer un rôle entier", [
+      { id: "montant", label: "Montant par personne", required: true, max: 12 },
+    ]));
+    if (action === "all") return i.showModal(modal("pm:money:all", "Créditer tout le serveur", [
+      { id: "montant", label: "Montant par personne", required: true, max: 12 },
+    ]));
+    if (action === "reset") return respond(i, { embeds: [embed({ guild: i.guild, color: COLORS.danger,
+      author: { name: "🧹  Remettre un solde à zéro" }, description: "Choisis la personne dont le solde sera remis à 0." })],
+      components: [row(new UserSelectMenuBuilder().setCustomId("p:money:resetpick").setPlaceholder("Choisis un membre…")),
+        backRow("p:money")] });
+    if (action === "resetpick") {
+      const solde = await setCoins(i.guildId, i.values[0], 0);
+      await log(i.guild, "coins", embed({ guild: i.guild, color: COLORS.warning,
+        author: { name: `${ICONS.coin}  Solde remis à zéro` },
+        fields: [{ name: "Membre", value: `<@${i.values[0]}>`, inline: true }, { name: "Par", value: i.user.tag, inline: true }] }));
+      return feedback(i, { ok: true, title: "Solde remis à zéro", text: `<@${i.values[0]}> repart de **${num(solde)}**.` }, "money");
+    }
+  }
+
+  /* --------------------------------- PRÉFIXE ----------------------------- */
+  if (section === "prefix") {
+    const pc = config.prefix ?? {};
+    if (action === "t") { await updateConfig(i.guildId, { prefix: { enabled: !pc.enabled } });
+      return respond(i, await buildSection("prefix", i, await getConfig(i.guildId))); }
+    if (action === "del") { await updateConfig(i.guildId, { prefix: { deleteInvocation: !pc.deleteInvocation } });
+      return respond(i, await buildSection("prefix", i, await getConfig(i.guildId))); }
+    if (action === "char") {
+      await updateConfig(i.guildId, { prefix: { char: i.values[0], enabled: true } });
+      return feedback(i, { ok: true, title: "Préfixe enregistré",
+        text: `Les commandes s'écrivent maintenant \`${i.values[0]}ban\`, \`${i.values[0]}kick\`, \`${i.values[0]}mute\`…` }, "prefix");
+    }
+    if (action === "pick") {
+      const n = i.values[0];
+      const cmd = PREFIX_COMMANDS[n];
+      const coupee = (pc.disabled ?? []).includes(n);
+      return respond(i, { embeds: [embed({ guild: i.guild, color: coupee ? COLORS.neutral : COLORS.success,
+        author: { name: `⌨️  ${pc.char || "!"}${n}` },
+        description: `${cmd.desc}\n\nUsage : \`${pc.char || "!"}${n} ${cmd.usage}\``,
+        fields: [
+          { name: "État", value: coupee ? "🔴 fermée" : "🟢 ouverte", inline: true },
+          { name: "Niveau requis", value: PERM_LABELS[prefixRequiredLevel(n, cmd, config)], inline: true },
+          ...(cmd.aliases?.length ? [{ name: "Autres écritures", value: cmd.aliases.map((a) => `\`${pc.char || "!"}${a}\``).join(" "), inline: true }] : []),
+        ] })],
+        components: [
+          row(btn(`p:prefix:toggle:${n}`, coupee ? "Ouvrir" : "Fermer", coupee ? ButtonStyle.Success : ButtonStyle.Danger),
+              btn("p:prefix:page:cmds", "Retour", ButtonStyle.Secondary, "◀️")),
+          row(new StringSelectMenuBuilder().setCustomId(`p:prefix:lvl:${n}`).setPlaceholder("Changer le niveau requis…")
+            .addOptions([0, 1, 2, 3, 4, 5, 6].map((l) => ({ label: PERM_LABELS[l], value: String(l) })))),
+        ] });
+    }
+    if (action === "toggle") {
+      const list = [...(pc.disabled ?? [])];
+      const idx = list.indexOf(arg);
+      idx === -1 ? list.push(arg) : list.splice(idx, 1);
+      await updateConfig(i.guildId, { prefix: { disabled: list } });
+      return feedback(i, { ok: true, title: idx === -1 ? "Commande fermée" : "Commande ouverte",
+        text: `\`${pc.char || "!"}${arg}\` est ${idx === -1 ? "désormais indisponible" : "de nouveau utilisable"}.` }, "prefix", "cmds");
+    }
+    if (action === "lvl") {
+      await updateConfig(i.guildId, { prefix: { levels: { ...(pc.levels ?? {}), [arg]: Number(i.values[0]) } } });
+      return feedback(i, { ok: true, title: "Niveau enregistré",
+        text: `\`${pc.char || "!"}${arg}\` demande maintenant **${PERM_LABELS[i.values[0]]}**.` }, "prefix", "cmds");
+    }
+  }
+
   /* -------------------------------- ÉCONOMIE ----------------------------- */
   if (section === "eco") {
     if (action === "t") { await updateConfig(i.guildId, { economy: { enabled: !config.economy.enabled } }); return respond(i, await buildSection("eco", i, await getConfig(i.guildId))); }
@@ -8269,9 +8787,11 @@ async function handleModal(i, parts, config, level) {
 
     const target = await i.guild.members.fetch(arg).catch(() => null);
     if (!target) return feedback(i, { ok: false, title: "Introuvable", text: "Ce membre a quitté le serveur.", color: COLORS.danger }, "mod");
-    const problem = checkTarget(i.guild, i.member, target, config);
-    if (problem) return feedback(i, { ok: false, title: "Action refusée", text: problem, color: COLORS.danger }, "mod");
     const reason = f("reason") || "Non précisée";
+    if (action !== "coins") {
+      const problem = checkTarget(i.guild, i.member, target, config);
+      if (problem) return feedback(i, { ok: false, title: "Action refusée", text: problem, color: COLORS.danger }, "mod");
+    }
 
     if (action === "warn") return feedback(i, await actionWarn(i.guild, target, i.user, reason), "mod");
     if (action === "timeout") return feedback(i, await actionTimeout(i.guild, target, i.user, parseDuration(f("duration")), reason), "mod");
@@ -8563,6 +9083,49 @@ async function handleModal(i, parts, config, level) {
       await updateConfig(i.guildId, { escalation: { expireDays: Math.min(3650, days) } });
       return feedback(i, { ok: true, title: "Péremption enregistrée",
         text: days ? `Un avertissement cesse de compter après **${days} jours**.` : "Les avertissements comptent **à vie**." }, "escalation");
+    }
+  }
+
+  if (section === "money") {
+    const montant = int("montant");
+    if (montant === null || montant === 0)
+      return feedback(i, { ok: false, title: "Montant invalide", text: "Entre un nombre différent de zéro.", color: COLORS.danger }, "money");
+    const c = config.economy.currency;
+
+    if (action === "one") {
+      const membre = await i.guild.members.fetch(arg).catch(() => null);
+      if (!membre) return feedback(i, { ok: false, title: "Introuvable", text: "Ce membre a quitté le serveur.", color: COLORS.danger }, "money");
+      const r = await actionGrantCoins(i.guild, membre, montant, i.user, f("raison") || "Trésorerie");
+      return feedback(i, r, "money");
+    }
+
+    if (action === "role") {
+      const role = i.guild.roles.cache.get(arg);
+      if (!role) return feedback(i, { ok: false, title: "Rôle introuvable", text: "Il a peut-être été supprimé.", color: COLORS.danger }, "money");
+      const ids = [...i.guild.members.cache.values()].filter((m) => !m.user.bot && m.roles.cache.has(role.id)).map((m) => m.id);
+      if (!ids.length) return feedback(i, { ok: false, title: "Personne", text: `Aucun membre ne porte ${role}.`, color: COLORS.warning }, "money");
+      await addCoinsBulk(i.guildId, ids, montant, true);
+      await log(i.guild, "coins", embed({ guild: i.guild, color: COLORS.gold,
+        author: { name: `${ICONS.coin}  Distribution à un rôle` },
+        fields: [{ name: "Rôle", value: `${role}`, inline: true }, { name: "Par personne", value: num(montant), inline: true },
+          { name: "Bénéficiaires", value: `${ids.length}`, inline: true }, { name: "Par", value: i.user.tag, inline: true }] }));
+      return feedback(i, { ok: true, title: "Distribution effectuée",
+        text: `${c} **${num(montant)}** × **${ids.length}** membre(s) de ${role}.`, color: COLORS.gold }, "money");
+    }
+
+    if (action === "all") {
+      const ids = [...i.guild.members.cache.values()].filter((m) => !m.user.bot).map((m) => m.id);
+      if (!ids.length) return feedback(i, { ok: false, title: "Cache vide",
+        text: "Je n'ai pas la liste des membres. Active Server Members Intent.", color: COLORS.danger }, "money");
+      await i.deferReply(EPH);
+      await addCoinsBulk(i.guildId, ids, montant, true);
+      await log(i.guild, "coins", embed({ guild: i.guild, color: COLORS.gold,
+        author: { name: `${ICONS.coin}  Distribution générale` },
+        fields: [{ name: "Par personne", value: num(montant), inline: true },
+          { name: "Bénéficiaires", value: `${ids.length}`, inline: true }, { name: "Par", value: i.user.tag, inline: true }] }));
+      return i.editReply({ embeds: [embed({ guild: i.guild, color: COLORS.gold,
+        author: { name: `${ICONS.ok}  Distribution générale` },
+        description: `${c} **${num(montant)}** versés à **${num(ids.length)}** membre(s).` })] });
     }
   }
 
@@ -8909,8 +9472,13 @@ async function handlePublic(i, parts, config) {
   }
   if (action === "coins") {
     const w = await getWallet(i.guildId, i.user.id);
-    return reply({ embeds: [embed({ guild: i.guild, color: COLORS.gold, author: { name: `${ICONS.coin}  Ton solde` },
-      description: `## ${config.economy.currency} ${num(w.coins)}`, footer: w.streak ? `Série quotidienne : ${w.streak} jour(s)` : undefined })] });
+    const dette = w.coins < 0;
+    return reply({ embeds: [embed({ guild: i.guild, color: dette ? COLORS.danger : COLORS.gold,
+      author: { name: dette ? "🚨  Tu es en dette" : `${ICONS.coin}  Ton solde` },
+      description: dette
+        ? `## − ${config.economy.currency} ${num(-w.coins)}\nTables et boutique fermées jusqu'au remboursement.\nLe quotidien et le travail réduisent la dette.`
+        : `## ${config.economy.currency} ${num(w.coins)}`,
+      footer: w.streak ? `Série quotidienne : ${w.streak} jour(s)` : undefined })] });
   }
   if (action === "daily") return card(await actionDaily(i.guild, i.user));
   if (action === "work") return card(await actionWork(i.guild, i.user));
@@ -8969,7 +9537,7 @@ async function handlePublic(i, parts, config) {
           : "Ton propre rôle, nom et couleur au choix";
         return `${w.coins >= x.price ? "🟢" : "🔴"} ${ty?.emoji ?? ""} **${x.name}** — ${config.economy.currency} ${num(x.price)}\n${what}`;
       }).join("\n\n"),
-      footer: `Ton solde : ${num(w.coins)}` })],
+      footer: w.coins < 0 ? `Tu dois ${num(-w.coins)} — achats bloqués` : `Ton solde : ${num(w.coins)}` })],
       components: [row(new StringSelectMenuBuilder().setCustomId("pub:buy").setPlaceholder("Acheter un article…")
         .addOptions(shop.slice(0, 25).map((x) => ({ label: x.name.slice(0, 100), value: x.id,
           emoji: ITEM_TYPES[x.type ?? "role"]?.emoji,
@@ -8990,7 +9558,7 @@ async function handlePublic(i, parts, config) {
 }
 
 /* ========================================================================== */
-/*                    20 - COMMANDES ET MENUS CONTEXTUELS                     */
+/*                    21 - COMMANDES ET MENUS CONTEXTUELS                     */
 /* ========================================================================== */
 
 // commands.js — trois commandes seulement. Tout le reste passe par /panel.
@@ -9197,7 +9765,7 @@ const contextMenus = [
 ];
 
 /* ========================================================================== */
-/*                     21 - CLIENT, EVENEMENTS, DEMARRAGE                     */
+/*                     22 - CLIENT, EVENEMENTS, DEMARRAGE                     */
 /* ========================================================================== */
 
 // index.js — client, événements, démarrage.
@@ -9685,6 +10253,12 @@ client.on(Events.MessageCreate, async (message) => {
       const amount = config.economy.dropMin + Math.floor(Math.random() * (config.economy.dropMax - config.economy.dropMin + 1));
       launchDrop(message.guild, message.channel, amount).catch(() => null);
     }
+  }
+
+  // Commandes à préfixe : !ban, ?kick, *mute…
+  if (config.prefix?.enabled && message.content.startsWith(config.prefix.char || "!")) {
+    const pris = await handlePrefix(message, config).catch((e) => { console.error("[prefixe]", e.message); return false; });
+    if (pris) return;
   }
 
   // Compteur de messages : il sert aux grades, sans temporisation
