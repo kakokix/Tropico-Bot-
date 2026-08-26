@@ -15,6 +15,12 @@
 //     Seul le proprietaire de 0x peut passer outre.
 //     Interrupteur : Panneau > Permissions > Immunite admin.
 //
+//   CREER TON VOCAL
+//     Rejoindre le salon d'accueil cree un vocal personnel juste en dessous,
+//     dans la meme categorie, sans limite de places. Le proprietaire le
+//     renomme, le limite, le verrouille, le masque, autorise ou expulse
+//     quelqu'un, transfere ou supprime. Il disparait quand il se vide.
+//
 //   VEILLE AUTOMATIQUE
 //     Si l'identifiant proprietaire quitte le serveur ou en est expulse,
 //     0x se met en veille TOTALE : plus aucune commande, aucun automod,
@@ -128,7 +134,7 @@ import pg from "pg";
 
 
 /* ========================================================================== */
-/*              1 - CONSTANTES, PROPRIETAIRE, ROLE DE CONFIANCE               */
+/*             1 - CONSTANTES, PROPRIETAIRE, DETECTION DES SALONS             */
 /* ========================================================================== */
 
 // core.js — constantes, résolution automatique des salons, helpers.
@@ -182,94 +188,111 @@ function norm(name = "") {
 // par ordre de préférence. Le premier trouvé sur le serveur est utilisé.
 
 const LOG_ROUTES = {
-  messageDelete: ["logs-msgs", "poubelle", "logs-moderation"],
-  messageEdit: ["logs-msgs", "logs-moderation"],
-  messageLink: ["messages-avec-liens", "logs-antipub", "automod"],
-  messagePurge: ["logs-msgs", "logs-moderation"],
-  embedDelete: ["supp-msg-embed", "logs-msgs"],
+  messageDelete: ["logs-messages", "logs-mod"],
+  messageEdit: ["logs-messages", "logs-mod"],
+  messageLink: ["auto-mod", "logs-messages"],
+  messagePurge: ["logs-messages", "logs-mod"],
+  embedDelete: ["logs-messages"],
 
-  automod: ["automod", "logs-moderation"],
-  antipub: ["logs-antipub", "automod"],
-  spam: ["spam", "sapm", "automod"],
-  toxic: ["toxic-messages", "automod"],
+  automod: ["auto-mod", "logs-mod"],
+  antipub: ["auto-mod", "logs-mod"],
+  spam: ["auto-mod", "logs-mod"],
+  toxic: ["auto-mod", "logs-mod"],
 
-  sanction: ["logs-sanctions", "sanctions", "logs-moderation"],
-  ban: ["bannissements", "logs-sanctions", "sanctions"],
-  kick: ["expulsions", "logs-sanctions", "sanctions"],
-  timeout: ["timeout-membres", "mutes", "logs-sanctions"],
-  warn: ["avertissements", "infos-averts", "logs-sanctions"],
-  jail: ["chat-alcatraz", "logs-sanctions"],
+  sanction: ["logs-mod", "sanctions"],
+  ban: ["logs-mod", "sanctions"],
+  kick: ["logs-mod", "sanctions"],
+  timeout: ["logs-mod", "sanctions"],
+  warn: ["avertissements", "sanctions", "logs-mod"],
+  jail: ["logs-mod", "jugement"],
 
-  memberJoin: ["logs-raid", "logs-leave", "logs-msgs"],
-  memberLeave: ["logs-leave"],
-  memberUpdate: ["logs-stalk", "maj-roles"],
-  memberRoles: ["add-remove-roles", "logs-roles", "maj-roles"],
-  rolesRemoved: ["suppr-de-roles-membres", "add-remove-roles", "logs-roles"],
+  memberJoin: ["arriver", "logs-mod"],
+  memberLeave: ["logs-mod"],
+  memberUpdate: ["logs-edit-role", "logs-role"],
+  memberRoles: ["logs-role", "logs-edit-role"],
+  rolesRemoved: ["logs-role", "logs-edit-role"],
 
-  voice: ["logs-vocaux", "logs-voice", "vocal"],
-  voiceDisconnect: ["deconnexions-voc", "logs-vocaux", "logs-voice"],
-  voiceMove: ["deplacement-membres", "logs-vocaux", "logs-voice"],
-  voiceMute: ["mise-en-sourdine", "logs-vocaux", "logs-voice"],
+  voice: ["voice-log"],
+  voiceDisconnect: ["voice-log"],
+  voiceMove: ["voice-log"],
+  voiceMute: ["voice-log"],
 
-  roleCreate: ["creation-de-roles", "roles", "logs-roles"],
-  roleDelete: ["suppr-roles", "roles", "logs-roles"],
-  roleUpdate: ["maj-roles", "roles", "logs-roles"],
+  roleCreate: ["logs-role", "logs-edit-role"],
+  roleDelete: ["logs-role", "logs-edit-role"],
+  roleUpdate: ["logs-edit-role", "logs-role"],
 
-  channelCreate: ["creation-de-salons", "salons"],
-  channelDelete: ["suppr-salons", "salons"],
-  channelUpdate: ["maj-salons", "salons"],
-  permissions: ["logs-ajout-permissions", "maj-salons"],
+  channelCreate: ["logs-mod"],
+  channelDelete: ["ne-jamais-delete", "a-ne-jamais-supr", "logs-mod"],
+  channelUpdate: ["logs-mod"],
+  permissions: ["logs-edit-role", "logs-mod"],
 
-  guildUpdate: ["maj-serveur"],
-  webhook: ["webhooks"],
-  botAdd: ["ajout-de-bots"],
-  thread: ["fils"],
-  invite: ["invitations"],
+  guildUpdate: ["logs-mod"],
+  webhook: ["logs-mod"],
+  botAdd: ["logs-mod"],
+  thread: ["logs-messages"],
+  invite: ["invitations", "logs-mod"],
 
-  ticket: ["logs-tickets"],
-  raid: ["logs-raid"],
-  antinuke: ["logs-anti-down", "logs-anti-ban", "logs-raid"],
-  coins: ["logs-coins"],
-  confession: ["confessions-logs"],
-  giveaway: ["preuves", "logs-tickets"],
+  ticket: ["tickets", "logs-mod"],
+  raid: ["logs-mod", "ne-jamais-delete"],
+  antinuke: ["ne-jamais-delete", "a-ne-jamais-supr", "logs-mod"],
+  coins: ["logs-coins", "logs-db-coins-save"],
+  giveaway: ["proof", "logs-mod"],
 };
 
 /** Salons fonctionnels (le bot y publie ou y écoute). */
 const FUNC_CHANNELS = {
-  ticketPanel: ["tickets"],
-  ticketCounter: ["compteur-tickets"],
-  confessionPost: ["se-confesser"],
-  levelUp: ["niveaux"],
-  absences: ["absences"],
-  partenariats: ["partenariats"],
-  boutique: ["boutique-coins"],
-  drops: ["drop-colis"],
-  sondages: ["sondages"],
-  staffChat: ["chat-staff", "chat-gestion", "chat-admin"],
-  invites: ["invitations", "bienvenue", "welcome"],
-  memberPanel: ["commandes", "cmds-coins", "bot"],
+  ticketPanel: ["ticket"],
+  ticketCounter: ["compteur-tickets", "tickets"],
+  levelUp: ["niveaux", "coins", "commandes"],
+  absences: ["absences", "absences-ads"],
+  partenariats: ["partenariats", "annonce"],
+  boutique: ["coins"],
+  drops: ["coins"],
+  tempVoiceHub: ["creer-ton-vocal", "cree-ton-vocal", "creer-un-vocal", "creer-son-vocal"],
+  sondages: ["sondage", "sondages"],
+  staffChat: ["chat-staff", "chat-gestions", "cmds-staff"],
+  invites: ["invitations", "arriver"],
+  memberPanel: ["commandes", "cmds-staff"],
   recompense: ["recompense", "recompenses"],
-  coinsRules: ["reglement-coins", "regles-coins"],
-  coinsHowTo: ["comment-jouer"],
-  coinsAccess: ["acces-coins"],
+  coinsRules: ["coins"],
+  coinsHowTo: ["coins"],
+  coinsAccess: ["acces-coins", "roles"],
 };
 
 /** Types de tickets → catégories existantes du serveur. */
 const TICKET_TYPES = [
-  { id: "staff", label: "Question / aide staff", emoji: "🛡️", categories: ["tickets-staff"] },
-  { id: "abus", label: "Signaler un abus", emoji: "🚨", categories: ["tickets-abus"] },
-  { id: "animation", label: "Animation / événement", emoji: "🎉", categories: ["tickets-animation"] },
-  { id: "coins", label: "Espace coins", emoji: "🪙", categories: ["tickets-coins"] },
-  { id: "partenariat", label: "Partenariat", emoji: "🤝", categories: ["tickets-partenariats"] },
-  { id: "couronne", label: "Owners (couronne)", emoji: "👑", categories: ["tickets-couronne"] },
+  { id: "support", label: "Aide générale", emoji: "🆘",
+    categories: ["tickets-aide", "support-24h-24h-7j-7", "support"], createName: "🆘 Tickets Aide" },
+  { id: "abus", label: "Signaler un abus", emoji: "🚨",
+    categories: ["tickets-abus"], createName: "🚨 Tickets Abus" },
+  { id: "recrutement", label: "Candidature staff", emoji: "⭐",
+    categories: ["tickets-recrutement", "recrutement"], createName: "⭐ Tickets Recrutement" },
+  { id: "coins", label: "Espace coins", emoji: "🪙",
+    categories: ["tickets-coins"], createName: "🪙 Tickets Coins" },
+  { id: "partenariat", label: "Partenariat", emoji: "🤝",
+    categories: ["tickets-partenariats"], createName: "🤝 Tickets Partenariats" },
 ];
 
 /** Compteurs vocaux : détectés sur le motif "Nom : nombre". */
 const COUNTERS = [
   { key: "members", test: /membres\s*:/i, template: "💎 • Membres : {n}" },
-  { key: "online", test: /connect[eé]s\s*:/i, template: "🍋 • Connectés : {n}" },
-  { key: "voice", test: /vocal\s*:/i, template: "🎧 • Vocal : {n}" },
+  { key: "online", test: /(en\s*ligne|connect[eé]s)\s*:/i, template: "💎 • En ligne: {n}" },
+  { key: "voice", test: /(^|[^a-z])vocal\s*:/i, template: "🎧 • Vocal : {n}" },
 ];
+
+/**
+ * Renomme un compteur en ne touchant QU'AU NOMBRE.
+ * « 💎 • En ligne: 12 » et « 💎 • Membres : 15 » gardent leur mise en forme,
+ * quels que soient les emojis, les séparateurs et les espaces choisis.
+ * @returns {string|null} le nouveau nom, ou null si le motat est introuvable
+ */
+function renameWithCount(name, value) {
+  const formatted = new Intl.NumberFormat("fr-FR").format(value);
+  if (/:[^:]*$/.test(name)) {
+    return name.replace(/:(\s*)[\d\s.,\u202f']*$/, (_, sp) => `:${sp || " "}${formatted}`);
+  }
+  return null;
+}
 
 /* ========================================================================== */
 /*                          RÉSOLUTION DES SALONS                             */
@@ -467,7 +490,7 @@ const PERM_LABELS = {
 const DEFAULT_COMMAND_LEVELS = {
   // Niveau 0 — tout le monde
   ping: 0, help: 0, rank: 0, top: 0, coins: 0, daily: 0, work: 0, pay: 0,
-  userinfo: 0, serverinfo: 0, avatar: 0, confession: 0, boutique: 0, acheter: 0,
+  userinfo: 0, serverinfo: 0, avatar: 0, boutique: 0, acheter: 0,
 
   // Niveau 1 — helpers, animateurs
   sondage: 1, clear: 1, warn: 1, historique: 1,
@@ -615,6 +638,17 @@ const DEFAULT_CONFIG = {
 
   // Rappel des tickets laissés sans réponse
   ticketReminder: { enabled: true, hours: 6 },
+  ticketCategories: {},  // type de ticket -> identifiant de la catégorie créée
+
+  // Vocaux temporaires : « Créer ton vocal »
+  tempVoice: {
+    enabled: true,
+    hubId: null,          // salon d'accueil ; détecté par son nom si vide
+    categoryId: null,     // vide = même catégorie que le salon d'accueil
+    nameTemplate: "🔊 {user}",
+    defaultLimit: 0,      // 0 = illimité
+    keepEmptySeconds: 5,
+  },
 
   // Récompenses vocales : monter en niveau et gagner des coins en restant en vocal
   voice: {
@@ -698,6 +732,7 @@ const mem = {
   boosts: new Map(),
   voiceTime: new Map(),
   backups: [],
+  tempVoice: new Map(),
 };
 let seq = 1;
 
@@ -747,6 +782,9 @@ async function initDatabase() {
       data JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     await q(`CREATE TABLE IF NOT EXISTS jail (guild_id TEXT, user_id TEXT, roles JSONB NOT NULL DEFAULT '[]'::jsonb,
       until TIMESTAMPTZ, reason TEXT, PRIMARY KEY (guild_id, user_id))`);
+    await q(`CREATE TABLE IF NOT EXISTS temp_voice (
+      guild_id TEXT NOT NULL, channel_id TEXT PRIMARY KEY,
+      owner_id TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     await q(`CREATE TABLE IF NOT EXISTS voice_time (
       guild_id TEXT NOT NULL, user_id TEXT NOT NULL, minutes INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (guild_id, user_id))`);
@@ -1125,6 +1163,34 @@ async function dueJail() {
   if (ready) return (await q("SELECT * FROM jail WHERE until IS NOT NULL AND until<=NOW()")).rows;
   return [...mem.jail.entries()].filter(([, v]) => v.until && new Date(v.until) <= new Date())
     .map(([k, v]) => ({ guild_id: k.split(":")[0], user_id: k.split(":")[1], ...v }));
+}
+
+/* --------------------------- VOCAUX TEMPORAIRES --------------------------- */
+
+async function registerTempVoice(guildId, channelId, ownerId) {
+  if (ready) await q(`INSERT INTO temp_voice (guild_id,channel_id,owner_id) VALUES ($1,$2,$3)
+    ON CONFLICT (channel_id) DO UPDATE SET owner_id=$3`, [guildId, channelId, ownerId]);
+  else mem.tempVoice.set(channelId, { guild_id: guildId, channel_id: channelId, owner_id: ownerId, created_at: new Date() });
+}
+
+async function getTempVoice(channelId) {
+  if (ready) return (await q("SELECT * FROM temp_voice WHERE channel_id=$1", [channelId])).rows[0] ?? null;
+  return mem.tempVoice.get(channelId) ?? null;
+}
+
+async function setTempVoiceOwner(channelId, ownerId) {
+  if (ready) await q("UPDATE temp_voice SET owner_id=$2 WHERE channel_id=$1", [channelId, ownerId]);
+  else { const r = mem.tempVoice.get(channelId); if (r) r.owner_id = ownerId; }
+}
+
+async function dropTempVoice(channelId) {
+  if (ready) await q("DELETE FROM temp_voice WHERE channel_id=$1", [channelId]);
+  else mem.tempVoice.delete(channelId);
+}
+
+async function listTempVoice(guildId) {
+  if (ready) return (await q("SELECT * FROM temp_voice WHERE guild_id=$1", [guildId])).rows;
+  return [...mem.tempVoice.values()].filter((r) => r.guild_id === guildId);
 }
 
 /* ------------------------------- TEMPS VOCAL ------------------------------ */
@@ -1817,7 +1883,7 @@ function auditChannels(guild) {
 /*            7 - TICKETS, GIVEAWAYS, COMPTEURS, PANNEAUX PUBLICS             */
 /* ========================================================================== */
 
-// features.js — tickets, giveaways, compteurs vocaux, confessions, alcatraz.
+// features.js — tickets, giveaways, compteurs vocaux, panneaux publics.
 
 
 /* ========================================================================== */
@@ -1902,7 +1968,8 @@ async function updateCounters(guild, force = false) {
     if (!channel) { report.push({ key: counter.key, value, status: "salon introuvable" }); continue; }
     if (!channel.manageable) { report.push({ key: counter.key, value, status: "permission manquante" }); continue; }
 
-    const next = counter.template.replace("{n}", num(value));
+    // On ne remplace que le nombre : emojis, séparateurs et espaces restent intacts.
+    const next = renameWithCount(channel.name, value) ?? counter.template.replace("{n}", num(value));
     if (channel.name === next) { report.push({ key: counter.key, value, status: "à jour" }); continue; }
 
     const memoKey = `${guild.id}:${counter.key}`;
@@ -2017,10 +2084,10 @@ async function createTicket(interaction, kindId) {
     return interaction.editReply(`Tu as déjà un ticket **${kind.label}** ouvert : <#${existing}>`);
   }
 
-  const category = findCategory(guild, kind.categories);
+  const category = await ensureTicketCategory(guild, kind, config);
   if (!category) {
     return interaction.editReply(
-      `Je ne trouve pas la catégorie pour ce type de ticket. Elle doit s'appeler **${kind.categories[0].replace(/-/g, " ")}**.`
+      "Impossible de préparer la catégorie de ce ticket. Donne-moi la permission « Gérer les salons »."
     );
   }
 
@@ -2086,6 +2153,48 @@ async function createTicket(interaction, kindId) {
   }));
 
   await refreshTicketCounter(guild);
+}
+
+/**
+ * Trouve la catégorie du type de ticket, ou la crée.
+ * Elle est masquée à @everyone : seul le rôle staff y voit les tickets.
+ */
+async function ensureTicketCategory(guild, kind, config) {
+  const known = config.ticketCategories?.[kind.id];
+  if (known) {
+    const existing = guild.channels.cache.get(known);
+    if (existing) return existing;
+  }
+
+  const found = findCategory(guild, kind.categories);
+  if (found) {
+    await updateConfig(guild.id, { ticketCategories: { ...(config.ticketCategories ?? {}), [kind.id]: found.id } });
+    return found;
+  }
+
+  if (!guild.members.me.permissions.has(PermissionFlagsBits.ManageChannels)) return null;
+
+  const overwrites = [
+    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: guild.members.me.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+  ];
+  if (config.staffRoleId && guild.roles.cache.has(config.staffRoleId)) {
+    overwrites.push({ id: config.staffRoleId, allow: [
+      PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] });
+  }
+
+  const created = await guild.channels.create({
+    name: kind.createName ?? `Tickets ${kind.label}`,
+    type: ChannelType.GuildCategory,
+    permissionOverwrites: overwrites,
+    reason: "Catégorie de tickets créée par 0x",
+  }).catch((e) => { console.error("[tickets] création de catégorie :", e.message); return null; });
+
+  if (created) {
+    await updateConfig(guild.id, { ticketCategories: { ...(config.ticketCategories ?? {}), [kind.id]: created.id } });
+  }
+  return created;
 }
 
 async function refreshTicketCounter(guild) {
@@ -2313,37 +2422,6 @@ async function postGiveaway(client, id, channel) {
 /*                                CONFESSIONS                                 */
 /* ========================================================================== */
 
-let confessionCount = 0;
-
-async function postConfession(interaction, text) {
-  const config = await getConfig(interaction.guild.id);
-  const channel = resolveFuncChannel(interaction.guild, "confessionPost", config);
-  if (!channel || !canSend(channel)) {
-    return interaction.reply({ content: "Le salon de confessions est introuvable ou je n'y ai pas accès.", ...EPH });
-  }
-
-  confessionCount++;
-  await channel.send({
-    embeds: [embed({
-      title: `Confession #${confessionCount}`,
-      description: text,
-      color: COLORS.purple,
-      footer: "Anonyme — /confession pour envoyer la tienne",
-    })],
-  });
-
-  await log(interaction.guild, "confession", embed({
-    title: `Confession #${confessionCount}`,
-    color: COLORS.purple,
-    fields: [
-      { name: "Auteur", value: `${interaction.user.tag} (\`${interaction.user.id}\`)`, inline: true },
-      { name: "Salon", value: `${channel}`, inline: true },
-      { name: "Contenu", value: text },
-    ],
-  }));
-
-  return interaction.reply({ content: "Confession publiée anonymement.", ...EPH });
-}
 
 /* ========================================================================== */
 /*                                 ALCATRAZ                                   */
@@ -2454,16 +2532,337 @@ function memberPanel(guild) {
   };
 }
 
-function confessionPanel(guild) {
+/* ========================================================================== */
+/*                           8 - VOCAUX TEMPORAIRES                           */
+/* ========================================================================== */
+
+// tempvoice.js — « Créer ton vocal » : salons vocaux temporaires.
+
+
+const tvBtn = (id, label, style = ButtonStyle.Secondary, emoji) => {
+  const b = new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style);
+  if (emoji) b.setEmoji(emoji);
+  return b;
+};
+
+/* ========================================================================== */
+/*                         REPÉRAGE DU SALON D'ACCUEIL                        */
+/* ========================================================================== */
+
+function resolveHub(guild, config) {
+  const forced = config.tempVoice?.hubId;
+  if (forced) {
+    const ch = guild.channels.cache.get(forced);
+    if (ch) return ch;
+  }
+  const byName = findChannel(guild, FUNC_CHANNELS.tempVoiceHub);
+  if (byName && (byName.type === ChannelType.GuildVoice || byName.type === ChannelType.GuildStageVoice)) return byName;
+  // Repli : un vocal dont le nom évoque la création
+  return guild.channels.cache.find(
+    (c) => c.type === ChannelType.GuildVoice && /cr[ée]e|create|\+/i.test(c.name)) ?? null;
+}
+
+/* ========================================================================== */
+/*                              CRÉATION                                      */
+/* ========================================================================== */
+
+/**
+ * Crée le vocal du membre et l'y déplace.
+ * Le salon apparaît juste sous le salon d'accueil, dans la même catégorie.
+ */
+async function createTempVoice(member, hub, config) {
+  const guild = member.guild;
+  const tv = config.tempVoice ?? {};
+
+  const parentId = tv.categoryId ?? hub.parentId ?? null;
+  const name = (tv.nameTemplate || "🔊 {user}")
+    .replaceAll("{user}", member.displayName ?? member.user.username)
+    .slice(0, 100);
+
+  const channel = await guild.channels.create({
+    name,
+    type: ChannelType.GuildVoice,
+    parent: parentId,
+    position: hub.position + 1,
+    userLimit: Math.max(0, Math.min(99, Number(tv.defaultLimit ?? 0))),
+    reason: `Vocal temporaire de ${member.user.tag}`,
+    permissionOverwrites: [
+      {
+        id: member.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect,
+          PermissionFlagsBits.Speak, PermissionFlagsBits.Stream,
+          PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory,
+        ],
+      },
+      {
+        id: guild.members.me.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect,
+          PermissionFlagsBits.ManageChannels, PermissionFlagsBits.MoveMembers,
+          PermissionFlagsBits.SendMessages,
+        ],
+      },
+    ],
+  }).catch((e) => { console.error("[vocal] création impossible :", e.message); return null; });
+
+  if (!channel) return null;
+
+  await member.voice.setChannel(channel).catch(() => null);
+  await registerTempVoice(guild.id, channel.id, member.id);
+
+  await channel.send(controlPanel(member, channel)).catch(() => null);
+  return channel;
+}
+
+/** Panneau de commande envoyé dans le salon vocal lui-même. */
+function controlPanel(member, channel) {
   return {
-    embeds: [embed({ guild, author: { name: "🕵️  Confessions anonymes" }, color: COLORS.purple,
-      description: "Ton message est publié sans ton nom. Les modérateurs conservent une trace pour éviter les abus." })],
-    components: [new ActionRowBuilder().addComponents(pbtn("pub:confess", "Écrire une confession", ButtonStyle.Primary, "✍️"))],
+    content: `${member}`,
+    embeds: [embed({
+      guild: channel.guild,
+      color: COLORS.primary,
+      author: { name: "🔊  Ton salon vocal" },
+      description: [
+        `Tu es le propriétaire de **${channel.name}**. Il disparaîtra quand il sera vide.`,
+        "",
+        "Utilise les boutons ci-dessous pour le régler. Personne d'autre n'y a accès.",
+      ].join("\n"),
+      footer: "Si tu pars et que quelqu'un reste, il pourra le récupérer",
+    })],
+    components: [
+      new ActionRowBuilder().addComponents(
+        tvBtn("tv:rename", "Renommer", ButtonStyle.Primary, "✏️"),
+        tvBtn("tv:limit", "Limite", ButtonStyle.Primary, "👥"),
+        tvBtn("tv:lock", "Verrouiller", ButtonStyle.Secondary, "🔒"),
+        tvBtn("tv:hide", "Masquer", ButtonStyle.Secondary, "🙈"),
+        tvBtn("tv:bitrate", "Qualité", ButtonStyle.Secondary, "🎚️"),
+      ),
+      new ActionRowBuilder().addComponents(
+        tvBtn("tv:invite", "Autoriser quelqu'un", ButtonStyle.Success, "➕"),
+        tvBtn("tv:kick", "Expulser", ButtonStyle.Danger, "👢"),
+        tvBtn("tv:transfer", "Transférer", ButtonStyle.Secondary, "👑"),
+        tvBtn("tv:claim", "Récupérer", ButtonStyle.Secondary, "🙋"),
+        tvBtn("tv:delete", "Supprimer", ButtonStyle.Danger, "🗑️"),
+      ),
+    ],
   };
 }
 
 /* ========================================================================== */
-/*                          8 - RECOMPENSES VOCALES                           */
+/*                              SUPPRESSION                                   */
+/* ========================================================================== */
+
+/** Compte les personnes réellement présentes, sans dépendre du cache membres. */
+function occupants(guild, channelId) {
+  let n = 0;
+  for (const vs of guild.voiceStates.cache.values()) if (vs.channelId === channelId) n++;
+  return n;
+}
+
+/** Supprime le salon s'il est vide. */
+async function cleanupIfEmpty(guild, channelId, config) {
+  const record = await getTempVoice(channelId);
+  if (!record) return false;
+  if (occupants(guild, channelId) > 0) return false;
+
+  const wait = Math.max(0, Number(config?.tempVoice?.keepEmptySeconds ?? 5)) * 1000;
+  setTimeout(async () => {
+    if (occupants(guild, channelId) > 0) return;
+    const ch = guild.channels.cache.get(channelId);
+    if (ch) await ch.delete("Vocal temporaire vide").catch(() => null);
+    await dropTempVoice(channelId);
+  }, wait);
+  return true;
+}
+
+/** Au démarrage : efface les salons temporaires restés vides après une coupure. */
+async function purgeOrphans(guild) {
+  const rows = await listTempVoice(guild.id);
+  let removed = 0;
+  for (const row of rows) {
+    const ch = guild.channels.cache.get(row.channel_id);
+    if (!ch) { await dropTempVoice(row.channel_id); removed++; continue; }
+    if (occupants(guild, row.channel_id) === 0) {
+      await ch.delete("Vocal temporaire orphelin").catch(() => null);
+      await dropTempVoice(row.channel_id);
+      removed++;
+    }
+  }
+  return removed;
+}
+
+/* ========================================================================== */
+/*                          BOUTONS DU PROPRIÉTAIRE                           */
+/* ========================================================================== */
+
+async function guard(i) {
+  const record = await getTempVoice(i.channelId);
+  if (!record) {
+    await i.reply({ content: "Ce salon n'est pas un vocal temporaire.", ...EPH }).catch(() => null);
+    return null;
+  }
+  const config = await getConfig(i.guildId);
+  const isOwnerOfChannel = record.owner_id === i.user.id;
+  const isStaff = permLevel(i.member, config) >= 2;
+  if (!isOwnerOfChannel && !isStaff) {
+    await i.reply({ content: `Seul <@${record.owner_id}> peut régler ce salon.`, ...EPH }).catch(() => null);
+    return null;
+  }
+  return { record, config, channel: i.channel };
+}
+
+async function handleTempVoice(i) {
+  const [, action] = i.customId.split(":");
+
+  /* --- Récupération : ouverte à tous si le propriétaire est parti --- */
+  if (action === "claim") {
+    const record = await getTempVoice(i.channelId);
+    if (!record) return i.reply({ content: "Ce salon n'est pas un vocal temporaire.", ...EPH });
+    const stillHere = [...i.guild.voiceStates.cache.values()]
+      .some((vs) => vs.channelId === i.channelId && vs.id === record.owner_id);
+    if (stillHere) return i.reply({ content: `<@${record.owner_id}> est toujours là : le salon reste à lui.`, ...EPH });
+    if (!i.member.voice?.channelId || i.member.voice.channelId !== i.channelId)
+      return i.reply({ content: "Il faut être connecté dans ce salon pour le récupérer.", ...EPH });
+    await setTempVoiceOwner(i.channelId, i.user.id);
+    await i.channel.permissionOverwrites.edit(i.user.id, {
+      ViewChannel: true, Connect: true, Speak: true, SendMessages: true,
+    }).catch(() => null);
+    return i.reply({ embeds: [embed({ guild: i.guild, color: COLORS.success,
+      author: { name: "👑  Salon récupéré" }, description: `${i.user} est le nouveau propriétaire.` })] });
+  }
+
+  const ctx = await guard(i);
+  if (!ctx) return;
+  const { channel } = ctx;
+  const everyone = i.guild.roles.everyone.id;
+
+  if (action === "rename") {
+    return i.showModal(new ModalBuilder().setCustomId("tvm:rename").setTitle("Renommer le salon")
+      .addComponents(new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId("name").setLabel("Nouveau nom")
+          .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(90).setValue(channel.name))));
+  }
+
+  if (action === "limit") {
+    return i.showModal(new ModalBuilder().setCustomId("tvm:limit").setTitle("Limite de places")
+      .addComponents(new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId("limit").setLabel("Nombre de places (0 = illimité)")
+          .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(2)
+          .setValue(String(channel.userLimit ?? 0)))));
+  }
+
+  if (action === "bitrate") {
+    return i.showModal(new ModalBuilder().setCustomId("tvm:bitrate").setTitle("Qualité audio")
+      .addComponents(new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId("kbps").setLabel("Débit en kbps (8 à 96)")
+          .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(3)
+          .setValue(String(Math.round((channel.bitrate ?? 64000) / 1000))))));
+  }
+
+  if (action === "lock") {
+    const locked = channel.permissionOverwrites.cache.get(everyone)?.deny.has(PermissionFlagsBits.Connect);
+    await channel.permissionOverwrites.edit(everyone, { Connect: locked ? null : false }).catch(() => null);
+    return i.reply({ embeds: [embed({ guild: i.guild, color: locked ? COLORS.success : COLORS.warning,
+      author: { name: locked ? "🔓  Salon ouvert" : "🔒  Salon verrouillé" },
+      description: locked ? "N'importe qui peut de nouveau rejoindre." : "Seules les personnes déjà présentes ou autorisées peuvent rejoindre." })] });
+  }
+
+  if (action === "hide") {
+    const hidden = channel.permissionOverwrites.cache.get(everyone)?.deny.has(PermissionFlagsBits.ViewChannel);
+    await channel.permissionOverwrites.edit(everyone, { ViewChannel: hidden ? null : false }).catch(() => null);
+    return i.reply({ embeds: [embed({ guild: i.guild, color: hidden ? COLORS.success : COLORS.warning,
+      author: { name: hidden ? "👀  Salon visible" : "🙈  Salon masqué" },
+      description: hidden ? "Tout le monde le voit de nouveau." : "Il n'apparaît plus dans la liste des salons." })] });
+  }
+
+  if (action === "invite") {
+    return i.reply({ embeds: [embed({ guild: i.guild, author: { name: "➕  Autoriser quelqu'un" },
+      description: "Choisis la personne à laisser entrer, même si le salon est verrouillé." })],
+      components: [new ActionRowBuilder().addComponents(
+        new UserSelectMenuBuilder().setCustomId("tv:invitepick").setPlaceholder("Choisis un membre…"))], ...EPH });
+  }
+
+  if (action === "invitepick") {
+    const uid = i.values[0];
+    await channel.permissionOverwrites.edit(uid, { ViewChannel: true, Connect: true, Speak: true }).catch(() => null);
+    return i.update({ embeds: [embed({ guild: i.guild, color: COLORS.success,
+      author: { name: `${ICONS.ok}  Autorisé` }, description: `<@${uid}> peut rejoindre ce salon.` })], components: [] });
+  }
+
+  if (action === "kick") {
+    return i.reply({ embeds: [embed({ guild: i.guild, author: { name: "👢  Expulser du salon" },
+      description: "La personne sera déconnectée et ne pourra plus revenir." })],
+      components: [new ActionRowBuilder().addComponents(
+        new UserSelectMenuBuilder().setCustomId("tv:kickpick").setPlaceholder("Choisis un membre…"))], ...EPH });
+  }
+
+  if (action === "kickpick") {
+    const uid = i.values[0];
+    if (uid === ctx.record.owner_id) return i.update({ content: "Tu ne peux pas t'expulser toi-même.", embeds: [], components: [] });
+    const target = await i.guild.members.fetch(uid).catch(() => null);
+    if (target?.voice?.channelId === channel.id) await target.voice.disconnect("Expulsé du vocal temporaire").catch(() => null);
+    await channel.permissionOverwrites.edit(uid, { Connect: false }).catch(() => null);
+    return i.update({ embeds: [embed({ guild: i.guild, color: COLORS.warning,
+      author: { name: "👢  Expulsé" }, description: `<@${uid}> ne peut plus rejoindre ce salon.` })], components: [] });
+  }
+
+  if (action === "transfer") {
+    return i.reply({ embeds: [embed({ guild: i.guild, author: { name: "👑  Transférer le salon" },
+      description: "La personne choisie deviendra propriétaire à ta place." })],
+      components: [new ActionRowBuilder().addComponents(
+        new UserSelectMenuBuilder().setCustomId("tv:transferpick").setPlaceholder("Choisis un membre…"))], ...EPH });
+  }
+
+  if (action === "transferpick") {
+    const uid = i.values[0];
+    await setTempVoiceOwner(channel.id, uid);
+    await channel.permissionOverwrites.edit(uid, { ViewChannel: true, Connect: true, Speak: true, SendMessages: true }).catch(() => null);
+    return i.update({ embeds: [embed({ guild: i.guild, color: COLORS.success,
+      author: { name: "👑  Propriétaire transféré" }, description: `<@${uid}> gère désormais ce salon.` })], components: [] });
+  }
+
+  if (action === "delete") {
+    await i.reply({ embeds: [embed({ guild: i.guild, color: COLORS.danger,
+      author: { name: "🗑️  Suppression" }, description: "Le salon disparaît dans un instant." })] }).catch(() => null);
+    await dropTempVoice(channel.id);
+    setTimeout(() => channel.delete("Supprimé par son propriétaire").catch(() => null), 2000);
+    return;
+  }
+}
+
+/** Traitement des fenêtres de saisie du propriétaire. */
+async function handleTempVoiceModal(i) {
+  const ctx = await guard(i);
+  if (!ctx) return;
+  const { channel } = ctx;
+  const [, action] = i.customId.split(":");
+  const value = i.fields.getTextInputValue(action === "rename" ? "name" : action === "limit" ? "limit" : "kbps").trim();
+
+  if (action === "rename") {
+    await channel.setName(value.slice(0, 90), `Renommé par ${i.user.tag}`).catch(() => null);
+    return i.reply({ embeds: [embed({ guild: i.guild, color: COLORS.success,
+      author: { name: "✏️  Renommé" }, description: `Le salon s'appelle maintenant **${value.slice(0, 90)}**.` })] });
+  }
+
+  if (action === "limit") {
+    const n = Math.max(0, Math.min(99, parseInt(value, 10) || 0));
+    await channel.setUserLimit(n).catch(() => null);
+    return i.reply({ embeds: [embed({ guild: i.guild, color: COLORS.success,
+      author: { name: "👥  Limite modifiée" },
+      description: n === 0 ? "Le salon est de nouveau **illimité**." : `Le salon accepte **${n}** personne(s).` })] });
+  }
+
+  if (action === "bitrate") {
+    const kbps = Math.max(8, Math.min(96, parseInt(value, 10) || 64));
+    await channel.setBitrate(kbps * 1000).catch(() => null);
+    return i.reply({ embeds: [embed({ guild: i.guild, color: COLORS.success,
+      author: { name: "🎚️  Qualité modifiée" }, description: `Débit réglé sur **${kbps} kbps**.` })] });
+  }
+}
+
+/* ========================================================================== */
+/*                          9 - RECOMPENSES VOCALES                           */
 /* ========================================================================== */
 
 // voice.js — récompenses vocales : XP et coins gagnés en restant en vocal.
@@ -2550,7 +2949,7 @@ function voiceSummary(config) {
 }
 
 /* ========================================================================== */
-/*                    9 - INVITATIONS ET ROLE DE CONFIANCE                    */
+/*                   10 - INVITATIONS ET ROLE DE CONFIANCE                    */
 /* ========================================================================== */
 
 // invites.js — suivi des invitations et rôle de confiance « Like ».
@@ -2780,7 +3179,7 @@ function isTrusted(member, config) {
 }
 
 /* ========================================================================== */
-/*                      10 - ACTIONS, ARTICLES, ESCALADE                      */
+/*                      11 - ACTIONS, ARTICLES, ESCALADE                      */
 /* ========================================================================== */
 
 // actions.js — la logique métier, appelable depuis n'importe quelle interface.
@@ -3192,7 +3591,7 @@ async function actionGrantCoins(guild, target, amount, moderator, reason) {
 }
 
 /* ========================================================================== */
-/*                 11 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
+/*                 12 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
 /* ========================================================================== */
 
 // coinsspace.js — remplissage complet de la catégorie ESPACE COINS.
@@ -3413,7 +3812,7 @@ async function setupCoinsSpace(guild, memberPanelFactory) {
 }
 
 /* ========================================================================== */
-/*                12 - AFFECTATION ET VERIFICATION DES SALONS                 */
+/*                13 - AFFECTATION ET VERIFICATION DES SALONS                 */
 /* ========================================================================== */
 
 // destinations.js — la table d'affectation : quel panneau, quelle fonction, quel salon.
@@ -3459,9 +3858,6 @@ const DESTINATIONS = [
       description: "Choisis le type de ticket dans le menu. Un salon privé sera créé avec le staff concerné.\n\nLes ouvertures abusives sont sanctionnées." })],
       components: ticketPanelComponents() }), signature: `${ICONS.ticket}  Centre d'aide` },
 
-  { id: "confessionPost", label: "Panneau confessions", emoji: "🕵️", kind: "panel",
-    path: "funcOverrides.confessionPost", auto: ["se-confesser", "confession"],
-    signature: "🕵️  Confessions anonymes", build: (g) => confessionPanel(g) },
 
   { id: "boutique", label: "Panneau boutique", emoji: "🛒", kind: "panel",
     path: "funcOverrides.boutique", auto: ["boutique-coins", "boutique"],
@@ -3720,7 +4116,7 @@ function summarizeIssues(results) {
 }
 
 /* ========================================================================== */
-/*                       13 - INSTALLATION AUTOMATIQUE                        */
+/*                       14 - INSTALLATION AUTOMATIQUE                        */
 /* ========================================================================== */
 
 // setup.js — installation automatique. Un bouton, tout est branché.
@@ -3782,12 +4178,15 @@ async function autoSetup(guild, user) {
   }
 
   /* 3 — rôle staff pour les tickets --------------------------------------- */
-  const entryStaff = [...detected].filter((d) => d.level >= 1).sort((a, b) => a.level - b.level)[0];
+  // Un rôle nommé exactement « Staff » fait foi ; sinon le rôle staff le plus bas.
+  const named = [...guild.roles.cache.values()].find((r) => norm(r.name) === "staff" && !r.managed);
+  const entryStaff = named ?? [...detected].filter((d) => d.level >= 1).sort((a, b) => a.level - b.level)[0]?.role;
   if (entryStaff) {
-    patch.staffRoleId = entryStaff.role.id;
-    steps.push(step(true, "Rôle staff des tickets", `${entryStaff.role} verra les tickets ouverts`));
+    patch.staffRoleId = entryStaff.id;
+    steps.push(step(true, "Rôle staff des tickets",
+      `${entryStaff} verra les tickets${named ? " (rôle « Staff » reconnu par son nom)" : ""}`));
   } else {
-    steps.push(step(false, "Rôle staff des tickets", "À définir dans Configuration — sans lui personne ne voit les tickets"));
+    steps.push(step(false, "Rôle staff des tickets", "Aucun rôle « Staff » — à définir dans Configuration → Rôles clés"));
   }
 
   /* 3b — rôle de confiance « Like » ---------------------------------------- */
@@ -3892,11 +4291,25 @@ async function autoSetup(guild, user) {
       space.report.filter((r) => r.ok).map((r) => r.label).join(", ") || "aucun salon rempli"));
   }
 
+  /* 8e — vocaux temporaires -------------------------------------------------- */
+  {
+    const hub = resolveHub(guild, await getConfig(guild.id));
+    if (hub) {
+      patch.tempVoice = { ...(patch.tempVoice ?? {}), enabled: true, hubId: hub.id };
+      steps.push(step(true, "Vocaux temporaires",
+        `${hub} — chaque membre obtient son salon juste en dessous, sans limite de places`));
+    } else {
+      steps.push(step(false, "Vocaux temporaires",
+        "Aucun vocal nommé « Créer ton vocal » — crée-le, ou désigne-le dans Vocal → Vocaux temporaires"));
+    }
+  }
+
   /* 9 — catégories de tickets ---------------------------------------------- */
   const cats = TICKET_TYPES.filter((t) => findCategory(guild, t.categories));
-  steps.push(step(cats.length === TICKET_TYPES.length, `Catégories de tickets (${cats.length}/${TICKET_TYPES.length})`,
-    cats.length === TICKET_TYPES.length ? "Toutes trouvées"
-      : `Manquantes : ${TICKET_TYPES.filter((t) => !cats.includes(t)).map((t) => t.label).join(", ")}`));
+  steps.push(step(true, `Catégories de tickets (${cats.length}/${TICKET_TYPES.length} existantes)`,
+    cats.length === TICKET_TYPES.length
+      ? "Toutes présentes"
+      : "Les manquantes seront créées automatiquement au premier ticket, masquées à tous sauf au rôle staff"));
 
   /* 10 — permissions du bot ------------------------------------------------ */
   const missingPerms = [];
@@ -3946,11 +4359,6 @@ async function publishAllLegacy(guild) {
     done.push(`Tickets → ${ticketCh}`);
   }
 
-  const confessCh = findChannel(guild, FUNC_CHANNELS.confessionPost);
-  if (confessCh && canSend(confessCh)) {
-    await confessCh.send(confessionPanel(guild)).catch(() => null);
-    done.push(`Confessions → ${confessCh}`);
-  }
 
   const memberCh = findChannel(guild, ["commandes", "cmds", "bot", "chat"]);
   if (memberCh && canSend(memberCh)) {
@@ -3979,7 +4387,7 @@ function setupReport(guild, result) {
 }
 
 /* ========================================================================== */
-/*             14 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
+/*             15 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
 /* ========================================================================== */
 
 // panel.js — l'interface complète. Tout réglage du bot est atteignable ici.
@@ -4690,6 +5098,37 @@ async function buildSection(id, i, config, page = null) {
 
   /* --------------------------------- VOCAL ------------------------------- */
   if (id === "voice") {
+    if (page === "temp") {
+      const tv = config.tempVoice ?? {};
+      const hub = resolveHub(guild, config);
+      const actifs = await listTempVoice(guild.id);
+      return {
+        embeds: [embed({ guild, author: { name: "➕  Vocaux temporaires" },
+          color: hub ? COLORS.success : COLORS.warning,
+          description: hub
+            ? `Salon d'accueil : ${hub}\nChaque membre qui le rejoint obtient **son propre vocal**, créé juste en dessous, dans la même catégorie.`
+            : "Aucun salon d'accueil. Choisis un vocal ci-dessous : quiconque le rejoindra obtiendra son propre salon.",
+          fields: [
+            { name: "État", value: onOff(tv.enabled), inline: true },
+            { name: "Places par défaut", value: tv.defaultLimit ? `${tv.defaultLimit}` : "illimité", inline: true },
+            { name: "Salons ouverts", value: `${actifs.length}`, inline: true },
+            { name: "Nom donné", value: `\`${tv.nameTemplate ?? "🔊 {user}"}\` — \`{user}\` devient le pseudo` },
+            { name: "Ce que le propriétaire peut faire",
+              value: "Renommer · limiter les places · verrouiller · masquer · régler la qualité · autoriser ou expulser quelqu'un · transférer · supprimer" },
+          ],
+          footer: "Le salon disparaît tout seul dès qu'il se vide" })],
+        components: [
+          row(new ChannelSelectMenuBuilder().setCustomId("p:voice:hub")
+            .setChannelTypes(ChannelType.GuildVoice).setPlaceholder("Salon d'accueil « Créer ton vocal »…")),
+          row(btn("p:voice:tempt", tv.enabled ? "Couper les vocaux temporaires" : "Activer les vocaux temporaires",
+                tv.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
+              btn("p:voice:tempcfg", "Nom et places", ButtonStyle.Primary, "✏️"),
+              btn("p:voice:purge", "Nettoyer les salons vides", ButtonStyle.Secondary, "🧹")),
+          backRow("p:voice"),
+        ],
+      };
+    }
+
     const v = config.voice ?? {};
     const top = await topVoice(guild.id, 8);
     let live = 0;
@@ -4711,7 +5150,8 @@ async function buildSection(id, i, config, page = null) {
         row(btn("p:voice:t", v.enabled ? "Couper les gains vocaux" : "Activer les gains vocaux",
               v.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
             btn("p:voice:cfg", "Régler les gains", ButtonStyle.Primary, "🎚️"),
-            btn("p:voice:tick", "Distribuer maintenant", ButtonStyle.Secondary, "⚡")),
+            btn("p:voice:tick", "Distribuer maintenant", ButtonStyle.Secondary, "⚡"),
+            btn("p:voice:page:temp", "Vocaux temporaires", ButtonStyle.Success, "➕")),
         row(new ChannelSelectMenuBuilder().setCustomId("p:voice:ignore")
           .setChannelTypes(ChannelType.GuildVoice).setPlaceholder("Ajouter/retirer un salon ignoré")),
         backRow(),
@@ -4959,16 +5399,15 @@ async function buildSection(id, i, config, page = null) {
     return {
       embeds: [embed({ guild, author: { name: "📢  Publications" }, color: COLORS.primary,
         description: ["**Espace membre** — niveau, solde, quotidien, travail, classements, boutique",
-          "**Tickets** — menu des 6 catégories", "**Confessions** — bouton anonyme",
+          "**Tickets** — menu des types d'aide",
           "**Menu de rôles** — rôles à cocher", "", "Chaque publication demande ensuite le salon cible."].join("\n") })],
       components: [
         row(btn("p:setup:publish", "Tout publier automatiquement", ButtonStyle.Success, "⚡"),
             btn("p:dest", "Choisir où va chaque panneau", ButtonStyle.Primary, "📍")),
         row(btn("p:publish:pick:member", "Espace membre", ButtonStyle.Primary, "🧭"),
             btn("p:publish:pick:ticket", "Tickets", ButtonStyle.Primary, "🎫"),
-            btn("p:publish:pick:confess", "Confessions", ButtonStyle.Primary, "🕵️")),
-        row(btn("p:publish:pick:roles", "Menu de rôles", ButtonStyle.Secondary, "🎭"),
-            btn("p:publish:pick:say", "Annonce", ButtonStyle.Secondary, "📣"),
+            btn("p:publish:pick:roles", "Menu de rôles", ButtonStyle.Primary, "🎭")),
+        row(btn("p:publish:pick:say", "Annonce", ButtonStyle.Secondary, "📣"),
             btn("p:publish:pick:poll", "Sondage", ButtonStyle.Secondary, "📊")),
         backRow(),
       ],
@@ -5749,6 +6188,25 @@ async function handlePanel(i) {
       await updateConfig(i.guildId, { voice: { ignoredChannels: list } });
       return respond(i, await buildSection("voice", i, await getConfig(i.guildId)));
     }
+    if (action === "hub") {
+      await updateConfig(i.guildId, { tempVoice: { hubId: i.values[0], enabled: true } });
+      return feedback(i, { ok: true, title: "Salon d'accueil défini",
+        text: `<#${i.values[0]}> crée désormais un vocal personnel à chaque connexion.` }, "voice", "temp");
+    }
+    if (action === "tempt") {
+      await updateConfig(i.guildId, { tempVoice: { enabled: !config.tempVoice?.enabled } });
+      return respond(i, await buildSection("voice", i, await getConfig(i.guildId), "temp"));
+    }
+    if (action === "tempcfg") return i.showModal(modal("pm:voice:tempcfg", "Vocaux temporaires", [
+      { id: "name", label: "Nom du salon ({user} = pseudo)", required: true, value: config.tempVoice?.nameTemplate ?? "🔊 {user}", max: 90 },
+      { id: "limit", label: "Places par défaut (0 = illimité)", required: true, value: `${config.tempVoice?.defaultLimit ?? 0}`, max: 2 },
+    ]));
+    if (action === "purge") {
+      await i.deferUpdate();
+      const n = await purgeOrphans(i.guild);
+      return feedback(i, { ok: true, title: n ? `${n} salon(s) nettoyé(s)` : "Rien à nettoyer",
+        text: n ? "Les vocaux temporaires vides ont été supprimés." : "Aucun salon temporaire vide." }, "voice", "temp");
+    }
     if (action === "tick") {
       await i.deferUpdate();
       const r = await tickVoiceRewards(i.guild);
@@ -5931,7 +6389,7 @@ async function handlePanel(i) {
   /* ------------------------------ PUBLICATIONS --------------------------- */
   if (section === "publish") {
     if (action === "pick") {
-      const labels = { member: "Espace membre", ticket: "Tickets", confess: "Confessions", roles: "Menu de rôles", say: "Annonce", poll: "Sondage" };
+      const labels = { member: "Espace membre", ticket: "Tickets", roles: "Menu de rôles", say: "Annonce", poll: "Sondage" };
       return respond(i, { embeds: [embed({ guild: i.guild, author: { name: `📢  ${labels[arg]}` }, description: "Dans quel salon ?" })],
         components: [row(new ChannelSelectMenuBuilder().setCustomId(`p:publish:go:${arg}`)
           .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
@@ -5955,7 +6413,6 @@ async function handlePanel(i) {
         { id: "options", label: "Choix séparés par des virgules", required: true, long: true, max: 500 }]));
       for (const ch of usable) {
         if (arg === "member") await ch.send(memberPanel(i.guild)).catch(() => null);
-        else if (arg === "confess") await ch.send(confessionPanel(i.guild)).catch(() => null);
         else await ch.send({ embeds: [embed({ guild: i.guild, author: { name: `${ICONS.ticket}  Centre d'aide` },
           description: "Choisis le type de ticket dans le menu ci-dessous." })], components: ticketPanelComponents() }).catch(() => null);
       }
@@ -6280,6 +6737,15 @@ async function handleModal(i, parts, config, level) {
     }
   }
 
+  if (section === "voice" && action === "tempcfg") {
+    const limit = int("limit");
+    await updateConfig(i.guildId, { tempVoice: {
+      nameTemplate: f("name").slice(0, 90) || "🔊 {user}",
+      defaultLimit: Math.max(0, Math.min(99, limit ?? 0)) } });
+    return feedback(i, { ok: true, title: "Vocaux temporaires réglés",
+      text: `Nom : \`${f("name")}\` · ${limit ? `${limit} place(s)` : "illimité"}` }, "voice", "temp");
+  }
+
   if (section === "voice" && action === "cfg") {
     const patch = {};
     const xp = int("xp"); if (xp !== null) patch.xpPerMinute = Math.max(0, Math.min(500, xp));
@@ -6495,7 +6961,6 @@ async function handleModal(i, parts, config, level) {
       return i.reply({ embeds: [embed({ guild: i.guild, color: r.color,
         author: { name: `${r.ok ? ICONS.ok : ICONS.no}  ${r.title}` }, description: r.text })], ...EPH });
     }
-    if (action === "confess") return postConfession(i, f("text"));
     if (action === "pay") {
       const to = await i.client.users.fetch(f("user").replace(/\D/g, "")).catch(() => null);
       const amount = int("amount");
@@ -6672,14 +7137,12 @@ async function handlePublic(i, parts, config) {
   if (action === "pay") return i.showModal(modal("pm:pub:pay", "Envoyer des coins",
     [{ id: "user", label: "Identifiant du destinataire", required: true, max: 25 },
      { id: "amount", label: "Montant", required: true, max: 10 }]));
-  if (action === "confess") return i.showModal(modal("pm:pub:confess", "Confession anonyme",
-    [{ id: "text", label: "Ta confession", required: true, long: true, max: 1500 }]));
 
   return false;
 }
 
 /* ========================================================================== */
-/*                    15 - COMMANDES ET MENUS CONTEXTUELS                     */
+/*                    16 - COMMANDES ET MENUS CONTEXTUELS                     */
 /* ========================================================================== */
 
 // commands.js — trois commandes seulement. Tout le reste passe par /panel.
@@ -6705,7 +7168,7 @@ def(new SlashCommandBuilder()
         guild: i.guild,
         color: COLORS.neutral,
         author: { name: `${ICONS.info}  Panneau réservé au staff` },
-        description: "Tu es **Membre**. Les fonctions qui te concernent (niveau, coins, quotidien, boutique, tickets, confessions) sont sur les panneaux publiés dans les salons du serveur.",
+        description: "Tu es **Membre**. Les fonctions qui te concernent (niveau, coins, quotidien, boutique, tickets, vocaux) sont sur les panneaux publiés dans les salons du serveur.",
         footer: "Un responsable peut les publier via /panel → Publications",
       })], ...EPH });
     }
@@ -6738,7 +7201,7 @@ def(new SlashCommandBuilder().setName("help").setDescription("Comment fonctionne
       },
       {
         name: "👥  Pour les membres",
-        value: "Aucune commande à taper. Les panneaux publiés dans les salons donnent accès au niveau, au solde, au quotidien, au travail, aux classements, à la boutique, aux tickets et aux confessions.",
+        value: "Aucune commande à taper. Les panneaux publiés dans les salons donnent accès au niveau, au solde, au quotidien, au travail, aux classements, à la boutique et aux tickets. Le salon « Créer ton vocal » leur donne leur propre vocal.",
       },
     ];
 
@@ -6886,7 +7349,7 @@ const contextMenus = [
 ];
 
 /* ========================================================================== */
-/*                     16 - CLIENT, EVENEMENTS, DEMARRAGE                     */
+/*                     17 - CLIENT, EVENEMENTS, DEMARRAGE                     */
 /* ========================================================================== */
 
 // index.js — client, événements, démarrage.
@@ -6969,6 +7432,10 @@ client.once(Events.ClientReady, async (c) => {
     console.log(`[compteurs] humains ${num(counts.members)} · connectés ${counts.online ?? "n/d"} · vocal ${counts.voice} · états vocaux suivis ${guild.voiceStates.cache.size}`);
     if (counts.online === null) console.warn("[compteurs] Connectés indisponible → active Presence Intent dans le portail développeur");
     await updateCounters(guild, true).catch(() => null);
+    const orphans = await purgeOrphans(guild).catch(() => 0);
+    if (orphans) console.log(`[vocal] ${orphans} salon(x) temporaire(s) orphelin(s) supprimé(s)`);
+    const hub = resolveHub(guild, await getConfig(guild.id));
+    console.log(hub ? `[vocal] salon d'accueil : ${hub.name}` : "[vocal] aucun salon « Créer ton vocal » trouvé");
 
     try {
       const results = await verifyDestinations(guild, await getConfig(guild.id));
@@ -7079,6 +7546,12 @@ client.on(Events.InteractionCreate, async (i) => {
       if (handled !== false) return;
     }
 
+    if (i.isStringSelectMenu() || i.isUserSelectMenu()) {
+      if (i.customId?.startsWith("tv:")) return handleTempVoice(i);
+    }
+
+    if (i.isModalSubmit() && i.customId?.startsWith("tvm:")) return handleTempVoiceModal(i);
+
     if (i.isStringSelectMenu()) {
       if (i.customId === "ticket:pick") { await i.deferReply(EPH); return createTicket(i, i.values[0]); }
       if (i.customId === "rolemenu") return handleRoleMenu(i);
@@ -7107,6 +7580,7 @@ client.on(Events.InteractionCreate, async (i) => {
       }
       if (ns === "gw") return handleGiveawayButton(i, action, arg);
       if (ns === "drop" && action === "claim") return claimDrop(i, arg);
+      if (ns === "tv") return handleTempVoice(i);
       return;
     }
   } catch (err) {
@@ -7402,6 +7876,19 @@ client.on(Events.VoiceStateUpdate, async (before, after) => {
   if (!guild || !member) return;
   if (isSuspended(guild.id)) return;
   const config = await getConfig(guild.id);
+
+  // « Créer ton vocal » : on fabrique le salon du membre
+  if (config.tempVoice?.enabled && after.channelId && after.channelId !== before.channelId) {
+    const hub = resolveHub(guild, config);
+    if (hub && after.channelId === hub.id) {
+      await createTempVoice(member, hub, config).catch((e) => console.error("[vocal]", e.message));
+      return;
+    }
+  }
+  // Vocal temporaire quitté : suppression s'il est vide
+  if (before.channelId && before.channelId !== after.channelId) {
+    await cleanupIfEmpty(guild, before.channelId, config).catch(() => null);
+  }
 
   // Piège vocal (JOIN = sanction)
   if (config.trapVoiceId && config.trapAction !== "off" && after.channelId === config.trapVoiceId && before.channelId !== after.channelId) {
