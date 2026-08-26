@@ -188,55 +188,57 @@ function norm(name = "") {
 // par ordre de préférence. Le premier trouvé sur le serveur est utilisé.
 
 const LOG_ROUTES = {
+  // Ordre calqué sur le routage que tu as choisi à la main : la détection
+  // automatique retombe exactement sur les mêmes salons, sans rien reforcer.
   messageDelete: ["logs-messages", "logs-mod"],
   messageEdit: ["logs-messages", "logs-mod"],
-  messageLink: ["auto-mod", "logs-messages"],
+  messageLink: ["logs-messages", "auto-mod"],
   messagePurge: ["logs-messages", "logs-mod"],
   embedDelete: ["logs-messages"],
 
   automod: ["auto-mod", "logs-mod"],
-  antipub: ["auto-mod", "logs-mod"],
-  spam: ["auto-mod", "logs-mod"],
-  toxic: ["auto-mod", "logs-mod"],
+  antipub: ["logs-mod", "auto-mod"],
+  spam: ["logs-mod", "auto-mod"],
+  toxic: ["logs-mod", "auto-mod"],
 
   sanction: ["logs-mod", "sanctions"],
   ban: ["logs-mod", "sanctions"],
   kick: ["logs-mod", "sanctions"],
   timeout: ["logs-mod", "sanctions"],
-  warn: ["avertissements", "sanctions", "logs-mod"],
+  warn: ["logs-mod", "avertissements", "sanctions"],
   jail: ["logs-mod", "jugement"],
 
-  memberJoin: ["arriver", "logs-mod"],
-  memberLeave: ["logs-mod"],
-  memberUpdate: ["logs-edit-role", "logs-role"],
-  memberRoles: ["logs-role", "logs-edit-role"],
-  rolesRemoved: ["logs-role", "logs-edit-role"],
+  memberJoin: ["member-log", "arriver", "logs-mod"],
+  memberLeave: ["member-log", "logs-mod"],
+  memberUpdate: ["member-log", "logs-edit-role"],
+  memberRoles: ["member-log", "logs-role", "logs-edit-role"],
+  rolesRemoved: ["logs-edit-role", "logs-role", "member-log"],
 
   voice: ["voice-log"],
   voiceDisconnect: ["voice-log"],
   voiceMove: ["voice-log"],
   voiceMute: ["voice-log"],
 
-  roleCreate: ["logs-role", "logs-edit-role"],
+  roleCreate: ["logs-edit-role", "logs-role"],
   roleDelete: ["logs-role", "logs-edit-role"],
-  roleUpdate: ["logs-edit-role", "logs-role"],
+  roleUpdate: ["logs-role", "logs-edit-role"],
 
-  channelCreate: ["logs-mod"],
-  channelDelete: ["ne-jamais-delete", "a-ne-jamais-supr", "logs-mod"],
-  channelUpdate: ["logs-mod"],
-  permissions: ["logs-edit-role", "logs-mod"],
+  channelCreate: ["logs-channel", "logs-mod"],
+  channelDelete: ["logs-channel", "ne-jamais-delete", "logs-mod"],
+  channelUpdate: ["logs-channel", "logs-mod"],
+  permissions: ["logs-bot", "logs-edit-role"],
 
-  guildUpdate: ["logs-mod"],
-  webhook: ["logs-mod"],
-  botAdd: ["logs-mod"],
-  thread: ["logs-messages"],
+  guildUpdate: ["logs-bot", "logs-mod"],
+  webhook: ["logs-bot", "logs-mod"],
+  botAdd: ["logs-bot", "logs-mod"],
+  thread: ["logs-bot", "logs-messages"],
   invite: ["invitations", "logs-mod"],
 
   ticket: ["tickets", "logs-mod"],
-  raid: ["logs-mod", "ne-jamais-delete"],
-  antinuke: ["ne-jamais-delete", "a-ne-jamais-supr", "logs-mod"],
+  raid: ["logs-urgence", "ne-jamais-delete", "logs-mod"],
+  antinuke: ["logs-urgence", "ne-jamais-delete", "a-ne-jamais-supr"],
   coins: ["logs-coins", "logs-db-coins-save"],
-  giveaway: ["proof", "logs-mod"],
+  giveaway: ["logs-giveaway", "proof", "logs-mod"],
 };
 
 /** Salons fonctionnels (le bot y publie ou y écoute). */
