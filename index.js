@@ -15,6 +15,16 @@
 //     Seul le proprietaire de 0x peut passer outre.
 //     Interrupteur : Panneau > Permissions > Immunite admin.
 //
+//   GRADES
+//     Echelle de roles gagnee a l'heure de vocal ET au nombre de messages.
+//     Promotion automatique, ancien grade retire, annonce dans le salon des
+//     niveaux. Panneau > Grades pour composer l'echelle.
+//
+//   COMPTEURS
+//     Discord n'autorise que 2 renommages par salon toutes les 10 minutes.
+//     Le bot reagit donc a l'instant tant qu'il lui reste du budget, puis
+//     attend. Le panneau affiche le temps restant quand c'est le cas.
+//
 //   CREER TON VOCAL
 //     Rejoindre le salon d'accueil cree un vocal personnel juste en dessous,
 //     dans la meme categorie, sans limite de places. Le proprietaire le
@@ -377,6 +387,7 @@ function embed({ title, description, color = COLORS.primary, fields = [], footer
   if (guild) e.setFooter({ text: footer ? `${footer} • ${BRAND}` : BRAND, iconURL: guild.iconURL({ size: 64 }) ?? undefined });
   else if (footer) e.setFooter({ text: footer.slice(0, 2048) });
   if (thumb) e.setThumbnail(thumb);
+  e.thumb = (url) => (url ? e.setThumbnail(url) : e);   // ignore une URL absente
   if (image) e.setImage(image);
   return e;
 }
@@ -626,6 +637,16 @@ const DEFAULT_CONFIG = {
   levelsEnabled: true,
   levelRewards: {},
 
+  // Grades gagnés à l'heure de vocal et au message
+  ranks: {
+    enabled: true,
+    autoPromote: true,
+    removePrevious: true,
+    requireBoth: true,   // il faut les heures ET les messages
+    announce: true,
+    ladder: [],          // [{ roleId, name, hours, messages }]
+  },
+
   // Escalade : le cumul d'avertissements déclenche une sanction automatique
   escalation: {
     enabled: true,
@@ -640,7 +661,8 @@ const DEFAULT_CONFIG = {
 
   // Rappel des tickets laissés sans réponse
   ticketReminder: { enabled: true, hours: 6 },
-  ticketCategories: {},  // type de ticket -> identifiant de la catégorie créée
+  ticketCategories: {},
+  purge: { level: 7, protectedChannels: [] },   // niveau 7 = propriétaire de 0x uniquement  // type de ticket -> identifiant de la catégorie créée
 
   // Vocaux temporaires : « Créer ton vocal »
   tempVoice: {
@@ -765,6 +787,7 @@ async function initDatabase() {
       type TEXT NOT NULL, reason TEXT NOT NULL, duration_ms BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     await q(`CREATE INDEX IF NOT EXISTS sanctions_lookup ON sanctions (guild_id, user_id, type)`);
     await q(`CREATE TABLE IF NOT EXISTS levels (guild_id TEXT, user_id TEXT, xp INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id))`);
+    await q(`ALTER TABLE levels ADD COLUMN IF NOT EXISTS messages INTEGER NOT NULL DEFAULT 0`);
     await q(`CREATE TABLE IF NOT EXISTS economy (
       guild_id TEXT, user_id TEXT, coins BIGINT NOT NULL DEFAULT 0,
       last_daily TIMESTAMPTZ, last_work TIMESTAMPTZ, streak INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id))`);
@@ -1193,6 +1216,34 @@ async function dropTempVoice(channelId) {
 async function listTempVoice(guildId) {
   if (ready) return (await q("SELECT * FROM temp_voice WHERE guild_id=$1", [guildId])).rows;
   return [...mem.tempVoice.values()].filter((r) => r.guild_id === guildId);
+}
+
+/* ---------------------------- NOMBRE DE MESSAGES -------------------------- */
+
+async function addMessageCount(guildId, userId, n = 1) {
+  if (ready) {
+    const r = await q(`INSERT INTO levels (guild_id,user_id,messages) VALUES ($1,$2,$3)
+      ON CONFLICT (guild_id,user_id) DO UPDATE SET messages = levels.messages + $3 RETURNING messages`,
+      [guildId, userId, n]);
+    return r.rows[0]?.messages ?? 0;
+  }
+  const k = `${guildId}:${userId}`;
+  const cur = (mem.messages ??= new Map());
+  const v = (cur.get(k) ?? 0) + n;
+  cur.set(k, v);
+  return v;
+}
+
+async function getMessageCount(guildId, userId) {
+  if (ready) return (await q("SELECT messages FROM levels WHERE guild_id=$1 AND user_id=$2", [guildId, userId])).rows[0]?.messages ?? 0;
+  return (mem.messages ??= new Map()).get(`${guildId}:${userId}`) ?? 0;
+}
+
+async function topMessages(guildId, limit = 10) {
+  if (ready) return (await q("SELECT user_id, messages FROM levels WHERE guild_id=$1 ORDER BY messages DESC LIMIT $2", [guildId, limit]))
+    .rows.map((r) => ({ userId: r.user_id, messages: r.messages }));
+  return [...(mem.messages ??= new Map()).entries()].filter(([k]) => k.startsWith(`${guildId}:`))
+    .sort((a, b) => b[1] - a[1]).slice(0, limit).map(([k, messages]) => ({ userId: k.split(":")[1], messages }));
 }
 
 /* ------------------------------- TEMPS VOCAL ------------------------------ */
@@ -1947,6 +1998,32 @@ async function computeCounts(guild) {
 
 const lastCounterValue = new Map();
 
+/**
+ * Discord n'autorise que DEUX renommages par salon et par tranche de 10 minutes.
+ * On tient donc un budget : tant qu'il en reste, le compteur réagit à la seconde.
+ */
+const renameLog = new Map();   // channelId -> [horodatages]
+
+function renameBudget(channelId) {
+  const now = Date.now();
+  const recent = (renameLog.get(channelId) ?? []).filter((t) => now - t < 600_000);
+  renameLog.set(channelId, recent);
+  return 2 - recent.length;
+}
+
+function noteRename(channelId) {
+  const arr = renameLog.get(channelId) ?? [];
+  arr.push(Date.now());
+  renameLog.set(channelId, arr);
+}
+
+/** Quand le prochain renommage sera possible. */
+function nextRenameIn(channelId) {
+  const arr = (renameLog.get(channelId) ?? []).filter((t) => Date.now() - t < 600_000);
+  if (arr.length < 2) return 0;
+  return Math.max(0, 600_000 - (Date.now() - Math.min(...arr)));
+}
+
 async function updateCounters(guild, force = false) {
   const config = await getConfig(guild.id);
   const counts = await computeCounts(guild);
@@ -1977,6 +2054,12 @@ async function updateCounters(guild, force = false) {
     const memoKey = `${guild.id}:${counter.key}`;
     if (!force && lastCounterValue.get(memoKey) === value) { report.push({ key: counter.key, value, status: "inchangé" }); continue; }
 
+    if (renameBudget(channel.id) <= 0) {
+      const wait = Math.ceil(nextRenameIn(channel.id) / 1000);
+      report.push({ key: counter.key, value, status: `en attente ${wait}s — limite Discord de 2 renommages / 10 min` });
+      continue;
+    }
+
     // setName peut lever de façon synchrone : le try/catch est indispensable
     let ok = false;
     try {
@@ -1985,8 +2068,8 @@ async function updateCounters(guild, force = false) {
     } catch (e) {
       report.push({ key: counter.key, value, status: `échec : ${String(e.message).slice(0, 60)}` });
     }
-    if (ok) { lastCounterValue.set(memoKey, value); report.push({ key: counter.key, value, status: "mis à jour" }); }
-    await new Promise((r) => setTimeout(r, 2000));
+    if (ok) { lastCounterValue.set(memoKey, value); noteRename(channel.id); report.push({ key: counter.key, value, status: "mis à jour" }); }
+    await new Promise((r) => setTimeout(r, 600));
   }
 
   return { counts, report };
@@ -2526,6 +2609,8 @@ function memberPanel(guild) {
         pbtn("pub:pay", "Envoyer des coins", ButtonStyle.Secondary, "🤝"),
       ),
       new ActionRowBuilder().addComponents(
+        pbtn("pub:grade", "Mon grade", ButtonStyle.Primary, "🎖️"),
+        pbtn("pub:echelle", "Les grades", ButtonStyle.Secondary, "📜"),
         pbtn("pub:invites", "Mes invitations", ButtonStyle.Primary, "🔗"),
         pbtn("pub:top:invites", "Top invitations", ButtonStyle.Secondary, "🏅"),
         pbtn("pub:top:voice", "Top vocal", ButtonStyle.Secondary, "🔊"),
@@ -2535,7 +2620,165 @@ function memberPanel(guild) {
 }
 
 /* ========================================================================== */
-/*                           8 - VOCAUX TEMPORAIRES                           */
+/*                             8 - PURGE DE MASSE                             */
+/* ========================================================================== */
+
+// masspurge.js — purge de masse : plusieurs salons d'un coup, sans les supprimer.
+
+
+/** Limite Discord : la suppression groupée ignore tout ce qui dépasse 14 jours. */
+const MAX_AGE_MS = 13.5 * 86_400_000;
+const HARD_CAP = 5000;        // plafond par salon, pour ne jamais tourner sans fin
+const TIME_BUDGET_MS = 9 * 60_000;
+
+/** Demandes en attente de confirmation : userId -> { guildId, ids, label } */
+const pending = new Map();
+
+function stashPurge(userId, data) {
+  pending.set(userId, { ...data, at: Date.now() });
+}
+function takePurge(userId) {
+  const p = pending.get(userId);
+  if (!p || Date.now() - p.at > 10 * 60_000) { pending.delete(userId); return null; }
+  return p;
+}
+function clearPurge(userId) { pending.delete(userId); }
+
+/* ========================================================================== */
+/*                            CHOIX DES SALONS                                */
+/* ========================================================================== */
+
+const PURGEABLE = [ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.GuildVoice];
+
+/**
+ * Sépare ce qui sera purgé de ce qui est épargné.
+ * Les salons de journaux sont protégés d'office : y effacer les traces
+ * de modération serait le pire effet de bord possible.
+ */
+function planPurge(guild, config, { scope, categoryId = null, channelIds = null }) {
+  const logIds = new Set();
+  for (const key of Object.keys(LOG_ROUTES)) {
+    const ch = resolveLogChannel(guild, key, config);
+    if (ch) logIds.add(ch.id);
+  }
+  const manual = new Set(config.purge?.protectedChannels ?? []);
+
+  let candidates = [];
+  if (scope === "channels") {
+    candidates = (channelIds ?? []).map((id) => guild.channels.cache.get(id)).filter(Boolean);
+  } else if (scope === "category") {
+    candidates = [...guild.channels.cache.values()].filter((c) => c.parentId === categoryId);
+  } else {
+    candidates = [...guild.channels.cache.values()];
+  }
+
+  const targets = [];
+  const skipped = [];
+  for (const ch of candidates) {
+    if (!PURGEABLE.includes(ch.type)) continue;
+    if (logIds.has(ch.id)) { skipped.push({ ch, why: "journal" }); continue; }
+    if (manual.has(ch.id)) { skipped.push({ ch, why: "protégé" }); continue; }
+    if (!canSend(ch)) { skipped.push({ ch, why: "inaccessible" }); continue; }
+    if (!ch.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.ManageMessages)) {
+      skipped.push({ ch, why: "permission manquante" }); continue;
+    }
+    targets.push(ch);
+  }
+  return { targets, skipped };
+}
+
+/* ========================================================================== */
+/*                              EXÉCUTION                                     */
+/* ========================================================================== */
+
+/**
+ * Vide les salons choisis. Rien n'est supprimé au-delà de 14 jours,
+ * et les messages épinglés sont toujours conservés.
+ * @returns {Promise<{deleted:number, perChannel:Array, partial:boolean}>}
+ */
+async function runMassPurge(guild, targets, perChannelLimit, moderator) {
+  const started = Date.now();
+  const perChannel = [];
+  let deleted = 0;
+  let partial = false;
+
+  for (const channel of targets) {
+    if (Date.now() - started > TIME_BUDGET_MS) { partial = true; break; }
+
+    let removedHere = 0;
+    const cap = perChannelLimit > 0 ? perChannelLimit : HARD_CAP;
+
+    // On boucle par paquets de 100, la limite d'un appel groupé
+    for (let pass = 0; pass < Math.ceil(cap / 100); pass++) {
+      if (Date.now() - started > TIME_BUDGET_MS) { partial = true; break; }
+
+      const fetched = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+      if (!fetched) break;
+      const list = typeof fetched.values === "function" ? [...fetched.values()] : [];
+      const cutoff = Date.now() - MAX_AGE_MS;
+      const batch = list
+        .filter((m) => m.createdTimestamp > cutoff && !m.pinned)
+        .slice(0, Math.min(100, cap - removedHere));
+      if (!batch.length) break;
+
+      const done = await channel.bulkDelete(batch, true).catch(() => null);
+      const n = done?.size ?? 0;
+      removedHere += n;
+      deleted += n;
+      if (n < batch.length) break;   // plus rien de supprimable ici
+
+      await new Promise((r) => setTimeout(r, 900));
+    }
+
+    if (removedHere) perChannel.push({ channel, count: removedHere });
+    await new Promise((r) => setTimeout(r, 400));
+  }
+
+  await log(guild, "messagePurge", embed({
+    guild, color: COLORS.danger, author: { name: "🧹  Purge de masse" },
+    description: `**${num(deleted)}** message(s) supprimé(s) dans **${perChannel.length}** salon(s).`,
+    fields: [
+      { name: "Lancée par", value: `<@${moderator.id}>`, inline: true },
+      { name: "Salons visés", value: `${targets.length}`, inline: true },
+      ...(partial ? [{ name: "⚠️ Interrompue", value: "Temps maximum atteint — relance pour finir." }] : []),
+      { name: "Détail", value: perChannel.slice(0, 20).map((x) => `${x.channel} — ${num(x.count)}`).join("\n").slice(0, 1000) || "—" },
+    ],
+  }));
+
+  return { deleted, perChannel, partial };
+}
+
+/* ========================================================================== */
+/*                                 AFFICHAGE                                  */
+/* ========================================================================== */
+
+function previewEmbed(guild, plan, label) {
+  const byReason = {};
+  for (const s of plan.skipped) (byReason[s.why] ??= []).push(s.ch);
+
+  return embed({
+    guild,
+    color: plan.targets.length ? COLORS.danger : COLORS.warning,
+    author: { name: "🧹  Purge de masse — aperçu" },
+    description: [
+      `Portée : **${label}**`,
+      "",
+      plan.targets.length
+        ? `### ${plan.targets.length} salon(s) seront vidés`
+        : `### ${ICONS.no} Aucun salon à purger`,
+      plan.targets.slice(0, 30).map((c) => `${c}`).join(" ").slice(0, 1500),
+      plan.targets.length > 30 ? `\n_… et ${plan.targets.length - 30} autre(s)_` : "",
+    ].filter(Boolean).join("\n"),
+    fields: Object.entries(byReason).map(([why, list]) => ({
+      name: `Épargnés — ${why} (${list.length})`,
+      value: list.slice(0, 15).map((c) => `${c}`).join(" ").slice(0, 1000),
+    })),
+    footer: "Rien au-delà de 14 jours · les messages épinglés sont conservés · les salons ne sont pas supprimés",
+  });
+}
+
+/* ========================================================================== */
+/*                           9 - VOCAUX TEMPORAIRES                           */
 /* ========================================================================== */
 
 // tempvoice.js — « Créer ton vocal » : salons vocaux temporaires.
@@ -2864,7 +3107,7 @@ async function handleTempVoiceModal(i) {
 }
 
 /* ========================================================================== */
-/*                          9 - RECOMPENSES VOCALES                           */
+/*                          10 - RECOMPENSES VOCALES                          */
 /* ========================================================================== */
 
 // voice.js — récompenses vocales : XP et coins gagnés en restant en vocal.
@@ -2906,6 +3149,14 @@ async function tickVoiceRewards(guild) {
   const levelUps = [];
   let rewarded = 0;
 
+  // Le temps de présence est compté pour tout le monde : il sert aux grades,
+  // indépendamment des conditions de récompense.
+  for (const group of byChannel.values()) {
+    for (const { member } of group) {
+      if (member) await addVoiceMinutes(guild.id, member.id, minutes);
+    }
+  }
+
   for (const group of byChannel.values()) {
     if (group.length < (v.minMembers ?? 2)) continue;
 
@@ -2917,7 +3168,6 @@ async function tickVoiceRewards(guild) {
 
       const result = await addXp(guild.id, member.id, xp);
       if (baseCoins > 0 && config.economy?.enabled) await addCoins(guild.id, member.id, baseCoins);
-      await addVoiceMinutes(guild.id, member.id, minutes);
       rewarded++;
 
       if (result?.leveledUp) levelUps.push({ member, level: result.level });
@@ -2951,7 +3201,151 @@ function voiceSummary(config) {
 }
 
 /* ========================================================================== */
-/*                   10 - INVITATIONS ET ROLE DE CONFIANCE                    */
+/*                                11 - GRADES                                 */
+/* ========================================================================== */
+
+// ranks.js — grades gagnés à l'heure de vocal et au message.
+
+
+/* ========================================================================== */
+/*                          LECTURE DE L'ÉCHELLE                              */
+/* ========================================================================== */
+
+/** L'échelle, du grade le plus bas au plus haut. */
+function ladder(config) {
+  return [...(config.ranks?.ladder ?? [])].sort((a, b) => (a.hours - b.hours) || (a.messages - b.messages));
+}
+
+/** Un membre remplit-il les conditions de ce grade ? */
+function meets(rank, stats, requireBoth = true) {
+  const okHours = stats.hours >= Number(rank.hours ?? 0);
+  const okMsgs = stats.messages >= Number(rank.messages ?? 0);
+  return requireBoth ? (okHours && okMsgs) : (okHours || okMsgs);
+}
+
+/** Statistiques brutes d'un membre. */
+async function memberStats(guildId, userId) {
+  const minutes = await getVoiceMinutes(guildId, userId);
+  const messages = await getMessageCount(guildId, userId);
+  return { minutes, hours: minutes / 60, messages };
+}
+
+/** @returns {{current, next, index}} */
+function situate(config, stats) {
+  const list = ladder(config);
+  const both = config.ranks?.requireBoth !== false;
+  let index = -1;
+  for (let n = 0; n < list.length; n++) if (meets(list[n], stats, both)) index = n;
+  return { current: index >= 0 ? list[index] : null, next: list[index + 1] ?? null, index, list };
+}
+
+/* ========================================================================== */
+/*                              PROMOTION                                     */
+/* ========================================================================== */
+
+/**
+ * Attribue le grade mérité. Les grades inférieurs sont retirés si demandé,
+ * pour qu'un membre ne cumule pas toute l'échelle.
+ * @returns {Promise<{promoted:boolean, rank?:object, from?:object}>}
+ */
+async function applyRank(member, config) {
+  const r = config.ranks ?? {};
+  if (!r.enabled || !r.autoPromote) return { promoted: false };
+
+  const stats = await memberStats(member.guild.id, member.id);
+  const { current, list } = situate(config, stats);
+  if (!current) return { promoted: false };
+
+  const role = member.guild.roles.cache.get(current.roleId);
+  if (!role) return { promoted: false, missingRole: true };
+  if (member.roles.cache.has(role.id)) return { promoted: false, already: true };
+  if (role.position >= member.guild.members.me.roles.highest.position) return { promoted: false, tooHigh: true };
+
+  const previous = list
+    .filter((x) => x.roleId !== current.roleId && member.roles.cache.has(x.roleId))
+    .map((x) => x.roleId);
+
+  await member.roles.add(role.id, `Grade atteint : ${current.name ?? role.name}`).catch(() => null);
+  if (r.removePrevious !== false && previous.length) {
+    const removable = previous.filter((id) => {
+      const rr = member.guild.roles.cache.get(id);
+      return rr && rr.editable && !rr.managed;
+    });
+    if (removable.length) await member.roles.remove(removable, "Montée de grade").catch(() => null);
+  }
+
+  return { promoted: true, rank: current, role, removed: previous.length, stats };
+}
+
+/* ========================================================================== */
+/*                              AFFICHAGE                                     */
+/* ========================================================================== */
+
+const fmtH = (h) => (h >= 1 ? `${Math.floor(h)} h` : `${Math.round(h * 60)} min`);
+
+/** Fiche de progression d'un membre. */
+function progressEmbed(guild, user, config, stats) {
+  const { current, next } = situate(config, stats);
+
+  const fields = [
+    { name: "🎙️ Temps vocal", value: `**${fmtH(stats.hours)}**`, inline: true },
+    { name: "💬 Messages", value: `**${num(stats.messages)}**`, inline: true },
+    { name: "🎖️ Grade actuel", value: current ? `<@&${current.roleId}>` : "_aucun_", inline: true },
+  ];
+
+  if (next) {
+    const hNow = Math.min(stats.hours, next.hours);
+    const mNow = Math.min(stats.messages, next.messages);
+    fields.push({
+      name: `Prochain grade — ${next.name ?? "suivant"}`,
+      value: [
+        `<@&${next.roleId}>`,
+        "",
+        `Vocal   ${bar(hNow, next.hours)}  ${fmtH(stats.hours)} / ${next.hours} h`,
+        `Messages ${bar(mNow, next.messages)}  ${num(stats.messages)} / ${num(next.messages)}`,
+        "",
+        stats.hours >= next.hours && stats.messages >= next.messages
+          ? `${ICONS.ok} Conditions remplies`
+          : `Il te manque ${[
+              stats.hours < next.hours ? `**${fmtH(next.hours - stats.hours)}** de vocal` : null,
+              stats.messages < next.messages ? `**${num(next.messages - stats.messages)}** messages` : null,
+            ].filter(Boolean).join(" et ")}`,
+      ].join("\n"),
+    });
+  } else if (current) {
+    fields.push({ name: "Sommet atteint", value: "Tu es au grade le plus élevé de l'échelle." });
+  }
+
+  return embed({
+    guild,
+    color: current ? COLORS.gold : COLORS.primary,
+    author: { name: `🎖️  Grade de ${user.username}` },
+    fields,
+    footer: config.ranks?.requireBoth === false
+      ? "Un seul des deux critères suffit" : "Les deux critères doivent être remplis",
+  }).thumb(user.displayAvatarURL({ size: 128 }));
+}
+
+/** Tableau complet de l'échelle. */
+function ladderEmbed(guild, config, stats = null) {
+  const list = ladder(config);
+  if (!list.length) {
+    return embed({ guild, color: COLORS.warning, author: { name: "🎖️  Grades" },
+      description: "_Aucun grade défini._ Ajoute-les depuis le panneau." });
+  }
+  const { current } = stats ? situate(config, stats) : { current: null };
+  return embed({
+    guild, color: COLORS.gold, author: { name: "🎖️  Échelle des grades" },
+    description: [...list].reverse().map((r) => {
+      const mine = current && current.roleId === r.roleId;
+      return `${mine ? "➜" : "　"} <@&${r.roleId}> — **${r.hours} h** de vocal · **${num(r.messages)}** messages`;
+    }).join("\n").slice(0, 4000),
+    footer: `${list.length} grade(s) · progression automatique`,
+  });
+}
+
+/* ========================================================================== */
+/*                   12 - INVITATIONS ET ROLE DE CONFIANCE                    */
 /* ========================================================================== */
 
 // invites.js — suivi des invitations et rôle de confiance « Like ».
@@ -3181,7 +3575,7 @@ function isTrusted(member, config) {
 }
 
 /* ========================================================================== */
-/*                      11 - ACTIONS, ARTICLES, ESCALADE                      */
+/*                      13 - ACTIONS, ARTICLES, ESCALADE                      */
 /* ========================================================================== */
 
 // actions.js — la logique métier, appelable depuis n'importe quelle interface.
@@ -3593,7 +3987,7 @@ async function actionGrantCoins(guild, target, amount, moderator, reason) {
 }
 
 /* ========================================================================== */
-/*                 12 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
+/*                 14 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
 /* ========================================================================== */
 
 // coinsspace.js — remplissage complet de la catégorie ESPACE COINS.
@@ -3814,7 +4208,7 @@ async function setupCoinsSpace(guild, memberPanelFactory) {
 }
 
 /* ========================================================================== */
-/*                13 - AFFECTATION ET VERIFICATION DES SALONS                 */
+/*                15 - AFFECTATION ET VERIFICATION DES SALONS                 */
 /* ========================================================================== */
 
 // destinations.js — la table d'affectation : quel panneau, quelle fonction, quel salon.
@@ -4118,7 +4512,7 @@ function summarizeIssues(results) {
 }
 
 /* ========================================================================== */
-/*                       14 - INSTALLATION AUTOMATIQUE                        */
+/*                       16 - INSTALLATION AUTOMATIQUE                        */
 /* ========================================================================== */
 
 // setup.js — installation automatique. Un bouton, tout est branché.
@@ -4389,7 +4783,7 @@ function setupReport(guild, result) {
 }
 
 /* ========================================================================== */
-/*             15 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
+/*             17 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
 /* ========================================================================== */
 
 // panel.js — l'interface complète. Tout réglage du bot est atteignable ici.
@@ -4412,6 +4806,7 @@ const SECTIONS = [
   { id: "counters", label: "Compteurs", emoji: "📊", level: 4, desc: "Membres, connectés, vocal", trusted: true },
   { id: "eco", label: "Économie", emoji: "🪙", level: 4, desc: "Coins, boutique, colis", trusted: true },
   { id: "levels", label: "Niveaux", emoji: "📈", level: 4, desc: "XP, récompenses, annonces", trusted: true },
+  { id: "ranks", label: "Grades", emoji: "🎖️", level: 4, desc: "Montée au temps de vocal et au message", trusted: true },
   { id: "voice", label: "Vocal", emoji: "🔊", level: 4, desc: "XP et coins gagnés en vocal", trusted: true },
   { id: "channels", label: "Droits des salons", emoji: "🔐", level: 4, desc: "Qui peut voir, écrire et parler où", trusted: true },
   { id: "escalation", label: "Escalade", emoji: "⚖️", level: 4, desc: "Sanction automatique au cumul d'avertissements", trusted: true },
@@ -4643,7 +5038,48 @@ async function buildSection(id, i, config, page = null) {
           btn("p:mod:lock", "Verrouiller ce salon", ButtonStyle.Secondary, "🔒"),
           btn("p:mod:unban", "Débannir un ID", ButtonStyle.Secondary, "♻️"),
         ),
+        row(btn("p:mod:page:mass", "Purge de masse — plusieurs salons", ButtonStyle.Danger, "🧹")),
         backRow(),
+      ],
+    };
+  }
+
+  /* ---------------------------- PURGE DE MASSE --------------------------- */
+  if (id === "mod" && page === "mass") {
+    const need = Number(config.purge?.level ?? 7);
+    if (level < need) {
+      return { embeds: [embed({ guild, color: COLORS.danger, author: { name: "🔒  Purge de masse" },
+        description: `Cette opération demande **${PERM_LABELS[need]}**.\nTon niveau : **${PERM_LABELS[level]}**.` })],
+        components: [backRow("p:mod")] };
+    }
+    const protectedCount = Object.keys(LOG_ROUTES).filter((k) => resolveLogChannel(guild, k, config)).length;
+    return {
+      embeds: [embed({ guild, author: { name: "🧹  Purge de masse" }, color: COLORS.danger,
+        description: [
+          "Vide plusieurs salons d'un coup. **Les salons ne sont pas supprimés.**",
+          "",
+          "**Ce qui n'est jamais touché :**",
+          "• les messages de plus de **14 jours** — limite Discord, rien à y faire",
+          "• les messages **épinglés**",
+          `• tes **salons de journaux** (${protectedCount} détectés) et ceux que tu protèges`,
+        ].join("\n"),
+        fields: [
+          { name: "Niveau requis", value: PERM_LABELS[need], inline: true },
+          { name: "Protégés à la main", value: `${config.purge?.protectedChannels?.length ?? 0}`, inline: true },
+        ],
+        footer: "Un aperçu s'affiche avant toute suppression" })],
+      components: [
+        row(new ChannelSelectMenuBuilder().setCustomId("p:mod:mpsel")
+          .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.GuildVoice)
+          .setMinValues(1).setMaxValues(25).setPlaceholder("Purger des salons précis…")),
+        row(new ChannelSelectMenuBuilder().setCustomId("p:mod:mpcat")
+          .setChannelTypes(ChannelType.GuildCategory).setPlaceholder("Purger toute une catégorie…")),
+        row(new ChannelSelectMenuBuilder().setCustomId("p:mod:mpprot")
+          .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.GuildVoice)
+          .setPlaceholder("Protéger / déprotéger un salon…")),
+        row(btn("p:mod:mpall", "Tout le serveur", ButtonStyle.Danger, "🌍"),
+            btn("p:mod:mplevel", "Qui peut le faire", ButtonStyle.Secondary, "🛡️"),
+            btn("p:mod", "Retour", ButtonStyle.Secondary, "◀️")),
       ],
     };
   }
@@ -4975,6 +5411,35 @@ async function buildSection(id, i, config, page = null) {
             btn("p:home", "Retour", ButtonStyle.Secondary, "◀️")),
       ],
     };
+  }
+
+  /* --------------------------------- GRADES ------------------------------ */
+  if (id === "ranks") {
+    const r = config.ranks ?? {};
+    const list = ladder(config);
+    const comps = [
+      row(btn("p:ranks:t", r.enabled ? "Couper les grades" : "Activer les grades",
+            r.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
+          btn("p:ranks:auto", r.autoPromote ? "Promotion auto : oui" : "Promotion auto : non",
+            r.autoPromote ? ButtonStyle.Success : ButtonStyle.Secondary, "⬆️"),
+          btn("p:ranks:both", r.requireBoth === false ? "Un seul critère" : "Les deux critères",
+            ButtonStyle.Secondary, "🎯"),
+          btn("p:ranks:prev", r.removePrevious === false ? "Cumule les grades" : "Retire l'ancien",
+            ButtonStyle.Secondary, "🔁")),
+      row(new RoleSelectMenuBuilder().setCustomId("p:ranks:add").setPlaceholder("Ajouter un grade : choisis le rôle…")),
+    ];
+    if (list.length) comps.push(row(new StringSelectMenuBuilder().setCustomId("p:ranks:del")
+      .setPlaceholder("Retirer un grade…")
+      .addOptions(list.slice(0, 25).map((x) => ({ label: (x.name ?? guild.roles.cache.get(x.roleId)?.name ?? x.roleId).slice(0, 100),
+        value: x.roleId, description: `${x.hours} h · ${num(x.messages)} messages`.slice(0, 100) })))));
+    comps.push(row(btn("p:ranks:recalc", "Recalculer tout le monde", ButtonStyle.Primary, "🔄"),
+                   btn("p:home", "Retour", ButtonStyle.Secondary, "◀️")));
+
+    const e = ladderEmbed(guild, config);
+    e.data.description = `État : **${onOff(r.enabled)}** · promotion ${r.autoPromote ? "automatique" : "manuelle"}\n`
+      + `${r.requireBoth === false ? "Un seul critère suffit" : "Heures **et** messages requis"}\n\n`
+      + (e.data.description ?? "");
+    return { embeds: [e], components: comps };
   }
 
   /* -------------------------------- NIVEAUX ------------------------------ */
@@ -5471,7 +5936,7 @@ async function showMemberCard(i, userId, config) {
       { name: "Coins", value: num(wallet.coins), inline: true },
       { name: "Rôles", value: member.roles.cache.filter((r) => r.id !== i.guild.id).sort((a, b) => b.position - a.position).map((r) => r.toString()).slice(0, 10).join(" ") || "_aucun_" },
     ],
-  }).setThumbnail(member.user.displayAvatarURL({ size: 256 }));
+  }).thumb(member.user.displayAvatarURL({ size: 256 }));
 
   return respond(i, {
     embeds: [card],
@@ -5565,6 +6030,59 @@ async function handlePanel(i) {
   if (section === "mod") {
     if (action === "pick") return showMemberCard(i, i.values[0], config);
     if (action === "card") return showMemberCard(i, arg, config);
+
+    if (["mpsel", "mpcat", "mpall", "mpprot", "mplevel", "mplvlset", "mprun"].includes(action)) {
+      const need = Number(config.purge?.level ?? 7);
+      if (level < need) return feedback(i, { ok: false, title: "Niveau insuffisant",
+        text: `La purge de masse demande **${PERM_LABELS[need]}**.`, color: COLORS.danger }, "mod", "mass");
+
+      if (action === "mplevel") return respond(i, { embeds: [embed({ guild: i.guild,
+        author: { name: "🛡️  Qui peut lancer une purge de masse" }, color: COLORS.warning,
+        description: "Une purge mal lancée efface des milliers de messages sans retour possible.\nGarde ce niveau le plus haut possible." })],
+        components: [row(new StringSelectMenuBuilder().setCustomId("p:mod:mplvlset").setPlaceholder("Niveau requis…")
+          .addOptions([{ label: PERM_LABELS[7], value: "7", emoji: "🔒" },
+            ...[6, 5, 4].map((l) => ({ label: PERM_LABELS[l], value: String(l) }))])),
+          row(btn("p:mod:page:mass", "Retour", ButtonStyle.Secondary, "◀️"))] });
+
+      if (action === "mplvlset") {
+        await updateConfig(i.guildId, { purge: { level: Number(i.values[0]) } });
+        return feedback(i, { ok: true, title: "Niveau enregistré",
+          text: `Seul un **${PERM_LABELS[i.values[0]]}** peut lancer une purge de masse.` }, "mod", "mass");
+      }
+
+      if (action === "mpprot") {
+        const list = [...(config.purge?.protectedChannels ?? [])];
+        const v = i.values[0];
+        const idx = list.indexOf(v);
+        idx === -1 ? list.push(v) : list.splice(idx, 1);
+        await updateConfig(i.guildId, { purge: { protectedChannels: list } });
+        return feedback(i, { ok: true, title: idx === -1 ? "Salon protégé" : "Protection retirée",
+          text: `<#${v}> ${idx === -1 ? "ne sera jamais purgé" : "peut de nouveau être purgé"}.` }, "mod", "mass");
+      }
+
+      if (action === "mprun") {
+        if (!takePurge(i.user.id)) return feedback(i, { ok: false, title: "Aperçu expiré",
+          text: "Recommence la sélection.", color: COLORS.warning }, "mod", "mass");
+        return i.showModal(modal(`pm:mod:mprun:${arg}`, "Confirmer la purge",
+          [{ id: "mot", label: "Tape PURGER en majuscules", required: true, max: 10 }]));
+      }
+
+      let plan = null, label = "";
+      if (action === "mpsel") { plan = planPurge(i.guild, config, { scope: "channels", channelIds: i.values }); label = `${i.values.length} salon(s) choisi(s)`; }
+      else if (action === "mpcat") { plan = planPurge(i.guild, config, { scope: "category", categoryId: i.values[0] }); label = `catégorie ${i.guild.channels.cache.get(i.values[0])?.name ?? "?"}`; }
+      else if (action === "mpall") { plan = planPurge(i.guild, config, { scope: "all" }); label = "tout le serveur"; }
+
+      if (plan) {
+        if (!plan.targets.length) return feedback(i, { ok: false, title: "Rien à purger",
+          text: "Tous les salons visés sont protégés ou hors de ma portée.", color: COLORS.warning }, "mod", "mass");
+        stashPurge(i.user.id, { guildId: i.guildId, ids: plan.targets.map((c) => c.id), label });
+        return respond(i, { embeds: [previewEmbed(i.guild, plan, label)],
+          components: [row(
+            btn("p:mod:mprun:100", "Purger 100 par salon", ButtonStyle.Danger, "🧹"),
+            btn("p:mod:mprun:0", "Tout purger", ButtonStyle.Danger, "🔥"),
+            btn("p:mod:page:mass", "Annuler", ButtonStyle.Secondary, "◀️"))] });
+      }
+    }
 
     if (action === "purge") return i.showModal(modal(`pm:mod:purge:${i.channelId}`, "Purger ce salon",
       [{ id: "amount", label: "Nombre de messages (1-100)", required: true, max: 3 },
@@ -6030,6 +6548,49 @@ async function handlePanel(i) {
     if (action === "force") { await i.deferUpdate(); await updateCounters(i.guild, true); return respond(i, await buildSection("counters", i, config)); }
   }
 
+  /* --------------------------------- GRADES ------------------------------ */
+  if (section === "ranks") {
+    const r = config.ranks ?? {};
+    if (action === "t") { await updateConfig(i.guildId, { ranks: { enabled: !r.enabled } });
+      return respond(i, await buildSection("ranks", i, await getConfig(i.guildId))); }
+    if (action === "auto") { await updateConfig(i.guildId, { ranks: { autoPromote: !r.autoPromote } });
+      return respond(i, await buildSection("ranks", i, await getConfig(i.guildId))); }
+    if (action === "both") { await updateConfig(i.guildId, { ranks: { requireBoth: r.requireBoth === false } });
+      return respond(i, await buildSection("ranks", i, await getConfig(i.guildId))); }
+    if (action === "prev") { await updateConfig(i.guildId, { ranks: { removePrevious: r.removePrevious === false } });
+      return respond(i, await buildSection("ranks", i, await getConfig(i.guildId))); }
+
+    if (action === "add") {
+      const role = i.guild.roles.cache.get(i.values[0]);
+      if (role.position >= i.guild.members.me.roles.highest.position)
+        return feedback(i, { ok: false, title: "Rôle trop haut", text: `${role} est au-dessus du mien, je ne pourrai pas l'attribuer.`, color: COLORS.danger }, "ranks");
+      return i.showModal(modal(`pm:ranks:add:${role.id}`, `Grade — ${role.name}`.slice(0, 45), [
+        { id: "hours", label: "Heures de vocal requises", required: true, placeholder: "10", max: 5 },
+        { id: "messages", label: "Messages requis", required: true, placeholder: "700", max: 8 },
+        { id: "name", label: "Nom affiché (vide = nom du rôle)", max: 60 },
+      ]));
+    }
+
+    if (action === "del") {
+      const kept = (r.ladder ?? []).filter((x) => x.roleId !== i.values[0]);
+      await updateConfig(i.guildId, { ranks: { ladder: kept } });
+      return feedback(i, { ok: true, title: "Grade retiré", text: `<@&${i.values[0]}> ne fait plus partie de l'échelle.` }, "ranks");
+    }
+
+    if (action === "recalc") {
+      await i.deferUpdate();
+      let n = 0, vus = 0;
+      for (const m of i.guild.members.cache.values()) {
+        if (m.user.bot) continue;
+        vus++;
+        const up = await applyRank(m, config).catch(() => ({ promoted: false }));
+        if (up.promoted) n++;
+      }
+      return feedback(i, { ok: true, title: `${n} promotion(s)`,
+        text: `${num(vus)} membre(s) passés en revue. Les grades sont à jour.` }, "ranks");
+    }
+  }
+
   /* -------------------------------- NIVEAUX ------------------------------ */
   if (section === "levels") {
     if (action === "t") { await updateConfig(i.guildId, { levelsEnabled: !config.levelsEnabled }); return respond(i, await buildSection("levels", i, await getConfig(i.guildId))); }
@@ -6451,6 +7012,30 @@ async function handleModal(i, parts, config, level) {
       await ch.setRateLimitPerUser(s, i.user.tag).catch(() => null);
       return feedback(i, { ok: true, title: s ? "Mode lent activé" : "Mode lent coupé", text: `${ch} — ${s ? `${s} seconde(s) entre chaque message` : "plus de limite"}.` }, "mod");
     }
+    if (action === "mprun") {
+      if (f("mot").trim().toUpperCase() !== "PURGER")
+        return feedback(i, { ok: false, title: "Confirmation refusée",
+          text: "Il fallait taper `PURGER`. Rien n'a été supprimé.", color: COLORS.warning }, "mod", "mass");
+      const job = takePurge(i.user.id);
+      if (!job) return feedback(i, { ok: false, title: "Aperçu expiré",
+        text: "Recommence la sélection.", color: COLORS.warning }, "mod", "mass");
+      clearPurge(i.user.id);
+
+      await i.deferReply(EPH);
+      const targets = job.ids.map((id) => i.guild.channels.cache.get(id)).filter(Boolean);
+      const r = await runMassPurge(i.guild, targets, Number(arg) || 0, i.user);
+
+      return i.editReply({ embeds: [embed({ guild: i.guild,
+        color: r.partial ? COLORS.warning : COLORS.success,
+        author: { name: `🧹  ${num(r.deleted)} message(s) supprimé(s)` },
+        description: `Portée : **${job.label}** · ${r.perChannel.length} salon(s) nettoyé(s)`
+          + (r.partial ? "\n\n⚠️ Arrêtée au bout de 9 minutes — relance pour finir." : ""),
+        fields: r.perChannel.length
+          ? [{ name: "Détail", value: r.perChannel.slice(0, 20).map((x) => `${x.channel} — ${num(x.count)}`).join("\n").slice(0, 1000) }]
+          : [{ name: "Résultat", value: "Aucun message de moins de 14 jours à supprimer." }],
+        footer: "Rapport complet dans tes journaux" })] });
+    }
+
     if (action === "unban") return feedback(i, await actionUnban(i.guild, f("userid").replace(/\D/g, ""), i.user, f("reason") || "Non précisée"), "mod");
 
     const target = await i.guild.members.fetch(arg).catch(() => null);
@@ -6543,6 +7128,19 @@ async function handleModal(i, parts, config, level) {
   }
 
   /* -------------------------------- NIVEAUX ------------------------------ */
+  if (section === "ranks" && action === "add") {
+    const hours = Number(f("hours").replace(",", "."));
+    const messages = int("messages");
+    if (!Number.isFinite(hours) || hours < 0 || messages === null || messages < 0)
+      return feedback(i, { ok: false, title: "Valeurs invalides", text: "Entre un nombre d'heures et un nombre de messages.", color: COLORS.danger }, "ranks");
+    const role = i.guild.roles.cache.get(arg);
+    const list = (config.ranks?.ladder ?? []).filter((x) => x.roleId !== arg);
+    list.push({ roleId: arg, name: f("name") || role?.name || "Grade", hours, messages });
+    await updateConfig(i.guildId, { ranks: { ladder: list } });
+    return feedback(i, { ok: true, title: "Grade enregistré",
+      text: `${role} — **${hours} h** de vocal et **${num(messages)}** messages.`, color: COLORS.gold }, "ranks");
+  }
+
   if (section === "levels" && action === "reward") {
     const lvl = int("level");
     if (lvl === null || lvl < 1) return feedback(i, { ok: false, title: "Niveau invalide", text: "Entre un nombre supérieur à 0.", color: COLORS.danger }, "levels");
@@ -7049,6 +7647,16 @@ async function handlePublic(i, parts, config) {
   const card = (r) => reply({ embeds: [embed({ guild: i.guild, color: r.color,
     author: { name: `${r.ok === false ? ICONS.no : ICONS.ok}  ${r.title}` }, description: r.text })] });
 
+  if (action === "grade") {
+    const stats = await memberStats(i.guildId, i.user.id);
+    return reply({ embeds: [progressEmbed(i.guild, i.user, config, stats)] });
+  }
+
+  if (action === "echelle") {
+    const stats = await memberStats(i.guildId, i.user.id);
+    return reply({ embeds: [ladderEmbed(i.guild, config, stats)] });
+  }
+
   if (action === "rank") {
     const vmin = await getVoiceMinutes(i.guildId, i.user.id);
     const { xp, level, rank } = await getUserLevel(i.guildId, i.user.id);
@@ -7059,7 +7667,7 @@ async function handlePublic(i, parts, config) {
       fields: [{ name: "XP total", value: num(xp), inline: true },
         { name: "Classement", value: rank ? `#${rank}` : "—", inline: true },
         { name: "Temps vocal", value: vmin >= 60 ? `${Math.floor(vmin / 60)} h ${vmin % 60} min` : `${vmin} min`, inline: true }] })
-      .setThumbnail(i.user.displayAvatarURL({ size: 128 }))] });
+      .thumb(i.user.displayAvatarURL({ size: 128 }))] });
   }
   if (action === "coins") {
     const w = await getWallet(i.guildId, i.user.id);
@@ -7144,7 +7752,7 @@ async function handlePublic(i, parts, config) {
 }
 
 /* ========================================================================== */
-/*                    16 - COMMANDES ET MENUS CONTEXTUELS                     */
+/*                    18 - COMMANDES ET MENUS CONTEXTUELS                     */
 /* ========================================================================== */
 
 // commands.js — trois commandes seulement. Tout le reste passe par /panel.
@@ -7351,7 +7959,7 @@ const contextMenus = [
 ];
 
 /* ========================================================================== */
-/*                     17 - CLIENT, EVENEMENTS, DEMARRAGE                     */
+/*                     19 - CLIENT, EVENEMENTS, DEMARRAGE                     */
 /* ========================================================================== */
 
 // index.js — client, événements, démarrage.
@@ -7492,6 +8100,17 @@ client.once(Events.ClientReady, async (c) => {
         voiceTicks.set(g.id, 0);
         const r = await tickVoiceRewards(g);
         if (r.rewarded) console.log(`[vocal] ${g.name} : ${r.rewarded} récompensé(s)`);
+
+        // Le temps de vocal peut déclencher une montée de grade
+        if (cfg.ranks?.enabled && cfg.ranks?.autoPromote) {
+          for (const vs of g.voiceStates.cache.values()) {
+            if (!vs.channelId) continue;
+            const m = g.members.cache.get(vs.id);
+            if (!m || m.user.bot) continue;
+            const up = await applyRank(m, cfg).catch(() => ({ promoted: false }));
+            if (up.promoted) await announceRank(g, m, up, cfg);
+          }
+        }
       } catch (e) { console.error("[vocal]", e.message); }
     }
   }, 60_000).unref();
@@ -7670,6 +8289,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
     }
   }
 
+  scheduleCounters(member.guild);
   await handleInviteJoin(member).catch((e) => console.error("[invites]", e.message));
 
   if (config.autoroleId) await member.roles.add(config.autoroleId, "Autorole").catch(() => null);
@@ -7678,7 +8298,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
     const ch = member.guild.channels.cache.get(config.welcomeChannelId);
     if (ch && canSend(ch)) {
       await ch.send({ embeds: [embed({ description: fill(config.welcomeMessage, member), color: COLORS.success })
-        .setThumbnail(member.user.displayAvatarURL({ size: 128 }))] }).catch(() => null);
+        .thumb(member.user.displayAvatarURL({ size: 128 }))] }).catch(() => null);
     }
   }
 
@@ -7704,6 +8324,7 @@ client.on(Events.GuildMemberRemove, async (member) => {
   }
   if (isSuspended(member.guild.id)) return;
 
+  scheduleCounters(member.guild);
   await handleInviteLeave(member).catch(() => null);
   const kicker = await findExecutor(member.guild, "kick", member.id);
   if (kicker && !isWhitelisted(member.guild, kicker.id, await getConfig(member.guild.id))) {
@@ -7724,6 +8345,13 @@ client.on(Events.GuildMemberRemove, async (member) => {
       { name: "Total", value: num(member.guild.memberCount), inline: true },
     ],
   }));
+});
+
+client.on(Events.PresenceUpdate, (before, after) => {
+  const guild = after?.guild;
+  if (!guild || isSuspended(guild.id)) return;
+  if (before?.status === after?.status) return;
+  scheduleCounters(guild);
 });
 
 client.on(Events.GuildMemberUpdate, async (before, after) => {
@@ -7758,6 +8386,19 @@ client.on(Events.GuildMemberUpdate, async (before, after) => {
 /* ========================= MESSAGES : AUTOMOD + XP ======================== */
 
 const xpCooldown = new Map();
+
+/**
+ * Rafraîchit les compteurs peu après un changement, sans rafale :
+ * on regroupe les mouvements sur 3 secondes avant de renommer.
+ */
+const counterTimers = new Map();
+function scheduleCounters(guild) {
+  if (counterTimers.has(guild.id)) return;
+  counterTimers.set(guild.id, setTimeout(() => {
+    counterTimers.delete(guild.id);
+    updateCounters(guild).catch(() => null);
+  }, 3000));
+}
 
 client.on(Events.MessageCreate, async (message) => {
   if (!message.guild || message.author.bot) return;
@@ -7805,6 +8446,16 @@ client.on(Events.MessageCreate, async (message) => {
     }
   }
 
+  // Compteur de messages : il sert aux grades, sans temporisation
+  if (config.ranks?.enabled) {
+    const total = await addMessageCount(message.guild.id, message.author.id, 1);
+    // On ne vérifie la promotion que sur les paliers, pour ne pas marteler la base
+    if (total % 25 === 0 && message.member) {
+      const r = await applyRank(message.member, config).catch(() => ({ promoted: false }));
+      if (r.promoted) await announceRank(message.guild, message.member, r, config);
+    }
+  }
+
   if (!config.levelsEnabled) return;
   const key = `${message.guild.id}:${message.author.id}`;
   const now = Date.now();
@@ -7825,6 +8476,21 @@ client.on(Events.MessageCreate, async (message) => {
     await target.send(`${message.author} passe **niveau ${result.level}**${reward ? ` et débloque <@&${reward}>` : ""} !`).catch(() => null);
   }
 });
+
+/** Annonce une montée de grade dans le salon des niveaux. */
+async function announceRank(guild, member, result, config) {
+  if (config.ranks?.announce === false) return;
+  const target = resolveFuncChannel(guild, "levelUp", config);
+  if (!target || !canSend(target)) return;
+  await target.send({ embeds: [embed({
+    guild, color: COLORS.gold, author: { name: "🎖️  Montée de grade" },
+    description: `${member} atteint **${result.rank.name ?? result.role.name}** ${result.role}`,
+    fields: [
+      { name: "Temps vocal", value: `${Math.floor(result.stats.hours)} h`, inline: true },
+      { name: "Messages", value: num(result.stats.messages), inline: true },
+    ],
+  })] }).catch(() => null);
+}
 
 client.on(Events.MessageDelete, async (message) => {
   if (!message.guild || message.author?.bot) return;
@@ -7891,6 +8557,9 @@ client.on(Events.VoiceStateUpdate, async (before, after) => {
   if (before.channelId && before.channelId !== after.channelId) {
     await cleanupIfEmpty(guild, before.channelId, config).catch(() => null);
   }
+
+  // Le compteur vocal réagit tout de suite, dans la limite autorisée par Discord
+  if (before.channelId !== after.channelId) scheduleCounters(guild);
 
   // Piège vocal (JOIN = sanction)
   if (config.trapVoiceId && config.trapAction !== "off" && after.channelId === config.trapVoiceId && before.channelId !== after.channelId) {
