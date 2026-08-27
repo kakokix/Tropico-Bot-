@@ -26,6 +26,11 @@
 //     chaque commande s'ouvre, se ferme et change de niveau requis.
 //     Les niveaux de perm s'appliquent comme au panneau.
 //
+//   EMOJIS DU SERVEUR
+//     Discord n'interprete ":monemoji:" que quand un humain le tape.
+//     Le bot traduit desormais automatiquement en <:nom:id> ou <a:nom:id>
+//     dans tous les embeds : reglements, annonces, panneaux, tickets.
+//
 //   APPARENCE
 //     La couleur d'accent du bot se choisit dans Panneau > Apparence :
 //     16 teintes ou n'importe quel code #RRGGBB. Elle remplace le bleu
@@ -182,7 +187,7 @@ import pg from "pg";
 
 
 /* ========================================================================== */
-/*               1 - CONSTANTES, COULEURS, DETECTION DES SALONS               */
+/*                1 - CONSTANTES, COULEURS, EMOJIS, DETECTION                 */
 /* ========================================================================== */
 
 // core.js — constantes, résolution automatique des salons, helpers.
@@ -246,6 +251,45 @@ function parseColor(input) {
 }
 
 const hexOf = (n) => "#" + Number(n ?? 0).toString(16).padStart(6, "0").toUpperCase();
+
+/**
+ * Discord n'interprète « :monemoji: » que quand un humain le tape.
+ * Un bot doit écrire la forme complète : <:nom:id>, ou <a:nom:id> si le
+ * dessin est animé. Sans ça, le texte reste tel quel à l'écran — c'est
+ * exactement ce qui arrivait aux règlements écrits depuis le panneau.
+ */
+function resolveEmojis(guild, text) {
+  if (!guild || typeof text !== "string" || !text.includes(":")) return text;
+  return text.replace(/(?<!<a?):([a-zA-Z0-9_]{2,32}):/g, (brut, nom) => {
+    const e = guild.emojis?.cache?.find((x) => x.name === nom)
+      ?? guild.emojis?.cache?.find((x) => x.name?.toLowerCase() === nom.toLowerCase());
+    return e ? `<${e.animated ? "a" : ""}:${e.name}:${e.id}>` : brut;
+  });
+}
+
+/**
+ * Normalise un emoji saisi à la main : unicode, « :nom: », « <:nom:id> »
+ * ou un identifiant seul. Renvoie ce que Discord accepte sur un bouton,
+ * ou null si rien ne correspond.
+ */
+function resolveEmojiRef(guild, input) {
+  const s = String(input ?? "").trim();
+  if (!s) return null;
+  const complet = s.match(/^<(a?):([a-zA-Z0-9_]+):(\d+)>$/);
+  if (complet) return { id: complet[3], name: complet[2], animated: complet[1] === "a" };
+  const court = s.match(/^:?([a-zA-Z0-9_]{2,32}):?$/);
+  if (court && guild) {
+    const e = guild.emojis?.cache?.find((x) => x.name?.toLowerCase() === court[1].toLowerCase());
+    if (e) return { id: e.id, name: e.name, animated: e.animated };
+  }
+  if (/^\d{15,25}$/.test(s) && guild) {
+    const e = guild.emojis?.cache?.get(s);
+    if (e) return { id: e.id, name: e.name, animated: e.animated };
+  }
+  // Emoji unicode : on le laisse tel quel
+  if (/\p{Extended_Pictographic}/u.test(s)) return s;
+  return null;
+}
 
 /** Normalise un nom de salon : enlève emojis, accents, séparateurs. */
 function norm(name = "") {
@@ -341,16 +385,21 @@ const FUNC_CHANNELS = {
 
 /** Types de tickets → catégories existantes du serveur. */
 const TICKET_TYPES = [
-  { id: "support", label: "Aide générale", emoji: "🆘",
-    categories: ["tickets-aide", "support-24h-24h-7j-7", "support"], createName: "🆘 Tickets Aide" },
-  { id: "abus", label: "Signaler un abus", emoji: "🚨",
-    categories: ["tickets-abus"], createName: "🚨 Tickets Abus" },
-  { id: "recrutement", label: "Candidature staff", emoji: "⭐",
-    categories: ["tickets-recrutement", "recrutement"], createName: "⭐ Tickets Recrutement" },
-  { id: "coins", label: "Espace coins", emoji: "🪙",
-    categories: ["tickets-coins"], createName: "🪙 Tickets Coins" },
-  { id: "partenariat", label: "Partenariat", emoji: "🤝",
-    categories: ["tickets-partenariats"], createName: "🤝 Tickets Partenariats" },
+  { id: "couronne", label: "Ticket Couronne", emoji: "👑",
+    desc: "Réservé aux demandes qui remontent directement à la direction",
+    categories: ["tickets-couronne", "couronne"], createName: "👑 Tickets Couronne" },
+
+  { id: "staff", label: "Gestion Staff", emoji: "🛡️",
+    desc: "Candidature, absence, question interne à l'équipe",
+    categories: ["tickets-gestion-staff", "gestion-staff"], createName: "🛡️ Gestion Staff" },
+
+  { id: "abus", label: "Gestion Abus", emoji: "⚖️",
+    desc: "Signaler un membre, un staff, ou contester une sanction",
+    categories: ["tickets-gestion-abus", "gestion-abus"], createName: "⚖️ Gestion Abus" },
+
+  { id: "community", label: "Community", emoji: "💬",
+    desc: "Partenariat, événement, idée, question générale",
+    categories: ["tickets-community", "community"], createName: "💬 Tickets Community" },
 ];
 
 /** Compteurs vocaux : détectés sur le motif "Nom : nombre". */
@@ -450,11 +499,13 @@ function embed({ title, description, color, fields = [], footer, thumb, image, a
   // Sans couleur demandée — ou avec le bleu par défaut — on prend celle du serveur.
   const teinte = (color === undefined || color === COLORS.primary) ? brandColor(guild) : color;
   const e = new EmbedBuilder().setColor(teinte).setTimestamp();
-  if (title) e.setTitle(title.slice(0, 256));
-  if (description) e.setDescription(description.slice(0, 4000));
-  if (fields.length) e.addFields(fields.slice(0, 25).map((f) => ({ ...f, value: String(f.value).slice(0, 1024) || "—" })));
-  if (author) e.setAuthor(author);
-  if (guild) e.setFooter({ text: footer ? `${footer} • ${BRAND}` : BRAND, iconURL: guild.iconURL({ size: 64 }) ?? undefined });
+  const em = (s) => resolveEmojis(guild, s);
+  if (title) e.setTitle(em(title).slice(0, 256));
+  if (description) e.setDescription(em(description).slice(0, 4000));
+  if (fields.length) e.addFields(fields.slice(0, 25).map((f) => ({
+    ...f, name: em(String(f.name)).slice(0, 256), value: em(String(f.value)).slice(0, 1024) || "—" })));
+  if (author) e.setAuthor({ ...author, name: em(author.name ?? "").slice(0, 256) });
+  if (guild) e.setFooter({ text: (footer ? `${footer} • ${BRAND}` : BRAND).slice(0, 2048), iconURL: guild.iconURL({ size: 64 }) ?? undefined });
   else if (footer) e.setFooter({ text: footer.slice(0, 2048) });
   if (thumb) e.setThumbnail(thumb);
   e.thumb = (url) => (url ? e.setThumbnail(url) : e);   // ignore une URL absente
@@ -760,6 +811,8 @@ const DEFAULT_CONFIG = {
   // Rappel des tickets laissés sans réponse
   ticketReminder: { enabled: true, hours: 6 },
   ticketCategories: {},
+  ticketStyle: {},        // id du type -> { label, emoji, desc } personnalisés
+  ticketRoles: {},        // id du type -> identifiant du rôle qui y a accès
   purge: { level: 7, protectedChannels: [] },   // niveau 7 = propriétaire de 0x uniquement  // type de ticket -> identifiant de la catégorie créée
 
   // Vocaux temporaires : « Créer ton vocal »
@@ -2317,12 +2370,52 @@ async function claimDrop(interaction, id) {
 /*                                 TICKETS                                    */
 /* ========================================================================== */
 
-function ticketPanelComponents() {
+/** Le type, avec les retouches faites depuis le panneau. */
+function ticketKind(config, id) {
+  const base = TICKET_TYPES.find((t) => t.id === id);
+  if (!base) return null;
+  return { ...base, ...(config?.ticketStyle?.[id] ?? {}) };
+}
+
+function ticketPanelComponents(guild, config) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId("ticket:pick")
-    .setPlaceholder("Choisis le type de ticket")
-    .addOptions(TICKET_TYPES.map((t) => ({ label: t.label, value: t.id, emoji: t.emoji })));
+    .setPlaceholder("Ouvre un ticket — choisis ta catégorie");
+
+  for (const base of TICKET_TYPES) {
+    const t = ticketKind(config, base.id);
+    const option = { label: t.label.slice(0, 100), value: t.id, description: (t.desc ?? "").slice(0, 100) };
+    const e = resolveEmojiRef(guild, t.emoji);
+    if (e) option.emoji = e;
+    menu.addOptions(option);
+  }
   return [new ActionRowBuilder().addComponents(menu)];
+}
+
+/** Devanture du centre d'aide. */
+function ticketPanel(guild, config) {
+  const lignes = TICKET_TYPES.map((base) => {
+    const t = ticketKind(config, base.id);
+    return `${t.emoji}  **${t.label}**\n　${t.desc ?? ""}`;
+  });
+  return {
+    embeds: [embed({
+      guild, color: COLORS.primary, author: { name: `${ICONS.ticket}  Centre d'aide` },
+      description: [
+        "```",
+        "  ╔═══════════════════════════════╗",
+        "  ║   O U V R I R   U N   T I C K E T   ║",
+        "  ╚═══════════════════════════════╝",
+        "```",
+        "Un salon privé s'ouvre entre toi et l'équipe concernée.",
+        "Personne d'autre n'y a accès.",
+        "",
+        lignes.join("\n\n"),
+      ].join("\n"),
+      footer: "Un seul ticket ouvert à la fois · les ouvertures abusives sont sanctionnées",
+    })],
+    components: ticketPanelComponents(guild, config),
+  };
 }
 
 async function createTicket(interaction, kindId) {
@@ -6236,9 +6329,7 @@ const DESTINATIONS = [
 
   { id: "ticketPanel", label: "Panneau de tickets", emoji: "🎫", kind: "panel",
     path: "funcOverrides.ticketPanel", auto: ["tickets"],
-    build: (g) => ({ embeds: [embed({ guild: g, author: { name: `${ICONS.ticket}  Centre d'aide` }, color: COLORS.primary,
-      description: "Choisis le type de ticket dans le menu. Un salon privé sera créé avec le staff concerné.\n\nLes ouvertures abusives sont sanctionnées." })],
-      components: ticketPanelComponents() }), signature: `${ICONS.ticket}  Centre d'aide` },
+    build: (g, c) => ticketPanel(g, c), signature: `${ICONS.ticket}  Centre d'aide` },
 
 
   { id: "boutique", label: "Panneau boutique", emoji: "🛒", kind: "panel",
@@ -6745,11 +6836,7 @@ async function publishAllLegacy(guild) {
 
   const ticketCh = findChannel(guild, FUNC_CHANNELS.ticketPanel);
   if (ticketCh && canSend(ticketCh)) {
-    await ticketCh.send({
-      embeds: [embed({ guild, author: { name: `${ICONS.ticket}  Centre d'aide` }, color: COLORS.primary,
-        description: "Choisis le type de ticket dans le menu. Un salon privé sera créé avec le staff concerné.\n\nLes ouvertures abusives sont sanctionnées." })],
-      components: ticketPanelComponents(),
-    }).catch(() => null);
+    await ticketCh.send(ticketPanel(guild, await getConfig(guild.id))).catch(() => null);
     done.push(`Tickets → ${ticketCh}`);
   }
 
@@ -7385,6 +7472,11 @@ async function buildSection(id, i, config, page = null) {
       components: [
         row(new ChannelSelectMenuBuilder().setCustomId("p:tickets:publish").setChannelTypes(ChannelType.GuildText)
           .setPlaceholder("Publier le panneau de tickets dans…")),
+        row(new StringSelectMenuBuilder().setCustomId("p:tickets:style").setPlaceholder("Personnaliser une catégorie…")
+          .addOptions(TICKET_TYPES.map((t) => {
+            const k = { ...t, ...(config.ticketStyle?.[t.id] ?? {}) };
+            return { label: k.label.slice(0, 100), value: t.id, description: (k.desc ?? "").slice(0, 100) };
+          }))),
         row(btn("p:tickets:refresh", "Actualiser le compteur", ButtonStyle.Primary, "🔄"),
             btn("p:tickets:remind", config.ticketReminder?.enabled ? "Couper les rappels" : "Activer les rappels",
               config.ticketReminder?.enabled ? ButtonStyle.Danger : ButtonStyle.Success, "⏰"),
@@ -8756,12 +8848,20 @@ async function handlePanel(i) {
     if (action === "publish") {
       const ch = i.guild.channels.cache.get(i.values[0]);
       if (!canSend(ch)) return feedback(i, { ok: false, title: "Salon inaccessible", text: `Je ne peux pas écrire dans ${ch}.`, color: COLORS.danger }, "tickets");
-      await ch.send({ embeds: [embed({ guild: i.guild, author: { name: `${ICONS.ticket}  Centre d'aide` }, color: COLORS.primary,
-        description: "Choisis le type de ticket dans le menu. Un salon privé sera créé avec le staff concerné.\n\nLes ouvertures abusives sont sanctionnées." })],
-        components: ticketPanelComponents() });
+      await ch.send(ticketPanel(i.guild, config));
       return feedback(i, { ok: true, title: "Panneau publié", text: `Le menu est en ligne dans ${ch}.` }, "tickets");
     }
     if (action === "refresh") { await refreshTicketCounter(i.guild); return feedback(i, { ok: true, title: "Compteur actualisé", text: "Le salon compteur-tickets est à jour." }, "tickets"); }
+    if (action === "style") {
+      const id = i.values[0];
+      const base = TICKET_TYPES.find((t) => t.id === id);
+      const k = { ...base, ...(config.ticketStyle?.[id] ?? {}) };
+      return i.showModal(modal(`pm:tickets:style:${id}`, `Catégorie — ${base.label}`.slice(0, 45), [
+        { id: "label", label: "Nom affiché", required: true, value: k.label, max: 90 },
+        { id: "emoji", label: "Emoji — unicode ou :nomdelemoji:", value: String(k.emoji ?? ""), max: 60 },
+        { id: "desc", label: "Petite description sous le nom", value: k.desc ?? "", max: 95 },
+      ]));
+    }
     if (action === "remind") { await updateConfig(i.guildId, { ticketReminder: { enabled: !config.ticketReminder?.enabled } });
       return respond(i, await buildSection("tickets", i, await getConfig(i.guildId))); }
     if (action === "delay") return i.showModal(modal("pm:tickets:delay", "Délai avant rappel",
@@ -9439,8 +9539,7 @@ async function handlePanel(i) {
         { id: "options", label: "Choix séparés par des virgules", required: true, long: true, max: 500 }]));
       for (const ch of usable) {
         if (arg === "member") await ch.send(memberPanel(i.guild)).catch(() => null);
-        else await ch.send({ embeds: [embed({ guild: i.guild, author: { name: `${ICONS.ticket}  Centre d'aide` },
-          description: "Choisis le type de ticket dans le menu ci-dessous." })], components: ticketPanelComponents() }).catch(() => null);
+        else await ch.send(ticketPanel(i.guild, config)).catch(() => null);
       }
       const skipped = targets.length - usable.length;
       return feedback(i, { ok: true, title: `Publié dans ${usable.length} salon(s)`,
@@ -9771,6 +9870,20 @@ async function handleModal(i, parts, config, level) {
   }
 
   /* -------------------------------- ÉCONOMIE ----------------------------- */
+  if (section === "tickets" && action === "style") {
+    const emoji = f("emoji").trim();
+    if (emoji && !resolveEmojiRef(i.guild, emoji)) {
+      return feedback(i, { ok: false, title: "Emoji introuvable",
+        text: `Aucun emoji nommé \`${emoji}\` sur ce serveur. Utilise un emoji du clavier, ou \`:nom:\` exactement comme il apparaît dans tes réactions.`,
+        color: COLORS.danger }, "tickets");
+    }
+    const style = { ...(config.ticketStyle ?? {}) };
+    style[arg] = { label: f("label"), emoji: emoji || undefined, desc: f("desc") || undefined };
+    await updateConfig(i.guildId, { ticketStyle: style });
+    return feedback(i, { ok: true, title: "Catégorie personnalisée",
+      text: `${emoji} **${f("label")}**\n${f("desc") || "_sans description_"}\n\nRepublie le panneau pour l'appliquer.` }, "tickets");
+  }
+
   if (section === "tickets" && action === "delay") {
     const h = int("hours");
     if (h === null || h < 1) return feedback(i, { ok: false, title: "Valeur invalide", text: "Entre un nombre d'heures supérieur à 0.", color: COLORS.danger }, "tickets");
