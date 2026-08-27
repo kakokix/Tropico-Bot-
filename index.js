@@ -26,6 +26,16 @@
 //     chaque commande s'ouvre, se ferme et change de niveau requis.
 //     Les niveaux de perm s'appliquent comme au panneau.
 //
+//   ECHELLE DES GRADES
+//     18 grades reconnus par leur nom, de Staff (1 h / 100 msg) a Maitre
+//     (220 h / 20 000 msg). Panneau > Grades > Detecter automatiquement.
+//
+//   MENUS DE ROLES
+//     Les membres se donnent leurs roles eux-memes, par categorie :
+//     couleur, genre, age, situation, notifications, centres d'interet.
+//     Reconnaissance automatique par nom, roles separateurs ignores.
+//     Un menu a choix unique retire l'ancien role du groupe.
+//
 //   TRESORERIE
 //     Panneau > Tresorerie : crediter ou retirer a une personne, a tout un
 //     role, ou a l'ensemble du serveur. Masse monetaire visible en direct.
@@ -281,6 +291,7 @@ const FUNC_CHANNELS = {
   partenariats: ["partenariats", "annonce"],
   boutique: ["coins"],
   casino: ["casino", "coins"],
+  roleMenus: ["role", "roles", "choix-des-roles", "auto-role"],
   drops: ["coins"],
   tempVoiceHub: ["creer-ton-vocal", "cree-ton-vocal", "creer-un-vocal", "creer-son-vocal"],
   sondages: ["sondage", "sondages"],
@@ -688,6 +699,8 @@ const DEFAULT_CONFIG = {
     debtBlocksCasino: true,  // en dette, plus de mise au casino ni d'achat
     maxDebt: 100_000,
   },
+
+  roleMenus: [],   // [{ id, title, emoji, desc, max, roleIds }]
 
   // Commandes à préfixe : !ban, ?kick, *mute…
   prefix: {
@@ -4362,11 +4375,293 @@ function voiceSummary(config) {
 }
 
 /* ========================================================================== */
-/*                                13 - GRADES                                 */
+/*                            13 - MENUS DE ROLES                             */
+/* ========================================================================== */
+
+// rolemenus.js — panneaux de rôles à choisir soi-même, groupés par catégorie.
+
+
+/* ========================================================================== */
+/*                          LECTURE DES NOMS DE RÔLES                         */
+/* ========================================================================== */
+
+/** Les rôles séparateurs — barres pleines — ne sont jamais proposés. */
+function isSeparator(role) {
+  const n = role.name.replace(/[\s\u200B-\u200D\uFEFF]/g, "");
+  return n.length > 0 && /^[▬─━—_═\-=·•|]+$/.test(n);
+}
+
+/**
+ * Découpe « 🥂 ¦En Couple » en emoji + libellé.
+ * Les séparateurs décoratifs (¦ | • -) sont retirés du libellé.
+ */
+function roleLabel(role) {
+  const raw = role.name.trim();
+  // Un emoji peut porter un sélecteur de variante, une teinte de peau
+  // (🤏🏽) ou être une séquence liée (👨‍👩‍👧). On capture l'ensemble.
+  const m = raw.match(/^(\p{Extended_Pictographic}(?:[\uFE0F\u{1F3FB}-\u{1F3FF}]|\u200D\p{Extended_Pictographic}[\uFE0F]?)*)/u);
+  const emoji = m ? m[1] : null;
+  let label = (m ? raw.slice(m[0].length) : raw).replace(/^[\s¦|•·\-—:]+/, "").trim();
+  if (!label) label = raw;
+  return { emoji, label: label.slice(0, 100) };
+}
+
+/** Nom réduit à l'essentiel, pour la reconnaissance automatique. */
+/** Nom réduit à l'essentiel : sans emoji, sans ¦, sans accent, en minuscules. */
+function roleKey(role) {
+  return norm(roleLabel(role).label).replace(/-/g, " ").replace(/\s+/g, " ").trim();
+}
+const nomReduit = roleKey;
+
+/* ========================================================================== */
+/*                        CATÉGORIES RECONNUES D'OFFICE                       */
+/* ========================================================================== */
+
+/** `max: 0` = choix multiples · `max: 1` = un seul à la fois. */
+const PRESET = [
+  { id: "couleur", title: "Couleur du pseudo", emoji: "🎨", max: 1,
+    desc: "Une seule couleur à la fois. Reprends le menu pour changer.",
+    match: ["beige", "jaune", "rose", "orange", "bleu", "blanc", "marron", "rouge", "noir", "violet", "vert"] },
+
+  { id: "genre", title: "Genre", emoji: "🚻", max: 1,
+    desc: "Comment tu veux qu'on te désigne.",
+    match: ["homme", "femme", "transgenre"] },
+
+  { id: "age", title: "Tranche d'âge", emoji: "🎂", max: 1,
+    desc: "Obligatoire pour accéder à certains salons.",
+    match: ["13 17 ans", "13 a 17 ans", "+ 18 ans", "18 ans", "+18 ans"] },
+
+  { id: "amour", title: "Situation", emoji: "💞", max: 1,
+    desc: "Si tu as envie de le partager.",
+    match: ["celibataire", "complique", "en couple"] },
+
+  { id: "notif", title: "Notifications", emoji: "🔔", max: 0,
+    desc: "Ce pour quoi tu acceptes d'être mentionné.",
+    match: ["giveaways notif", "giveaway notif", "partenariat notif", "animation notif"] },
+
+  { id: "perso", title: "Centres d'intérêt", emoji: "✨", max: 0,
+    desc: "Autant que tu veux.",
+    match: ["prince", "princesse", "douceur", "sportif", "mangas", "hlel", "geek", "musique", "hlou", "artiste"] },
+];
+
+/**
+ * Repère les rôles du serveur correspondant à chaque catégorie.
+ * L'ordre des rôles suit celui de la catégorie, pas celui du serveur.
+ */
+function detectGroups(guild) {
+  const dispo = [...guild.roles.cache.values()]
+    .filter((r) => r.id !== guild.id && !r.managed && !isSeparator(r));
+
+  const pris = new Set();
+  const groups = [];
+
+  for (const p of PRESET) {
+    const roleIds = [];
+    for (const attendu of p.match) {
+      const trouve = dispo.find((r) => !pris.has(r.id) && nomReduit(r) === attendu);
+      if (trouve) { roleIds.push(trouve.id); pris.add(trouve.id); }
+    }
+    if (roleIds.length) groups.push({ id: p.id, title: p.title, emoji: p.emoji, desc: p.desc, max: p.max, roleIds });
+  }
+  return groups;
+}
+
+/* ========================================================================== */
+/*                              AFFICHAGE                                     */
+/* ========================================================================== */
+
+const COULEURS = { couleur: 0xE91E63, genre: 0x5865F2, age: 0xFEE75C, amour: 0xEB459E, notif: 0x57F287, perso: 0x9B59B6 };
+
+/** Bandeau d'ouverture du panneau. */
+function headerMessage(guild, groups) {
+  return {
+    embeds: [embed({
+      guild, color: COLORS.primary,
+      author: { name: "🎭  Choisis tes rôles" },
+      description: [
+        "```",
+        "  ╔═══════════════════════════════╗",
+        "  ║   🎭   T E S   R Ô L E S   🎭  ║",
+        "  ╚═══════════════════════════════╝",
+        "```",
+        "Chaque menu ci-dessous te donne le rôle choisi et retire l'ancien.",
+        "Rien n'est définitif : reviens quand tu veux.",
+        "",
+        groups.map((g) => `${g.emoji} **${g.title}** — ${g.roleIds.length} choix${g.max === 1 ? " · un seul" : ""}`).join("\n"),
+      ].join("\n"),
+      footer: "Pour retirer un rôle, rouvre le menu et désélectionne-le",
+    })],
+    components: [],
+  };
+}
+
+/** Un message par catégorie : embed + menu déroulant. */
+function groupMessage(guild, group) {
+  const roles = group.roleIds.map((id) => guild.roles.cache.get(id)).filter(Boolean);
+  if (!roles.length) return null;
+
+  const options = roles.slice(0, 25).map((r) => {
+    const { emoji, label } = roleLabel(r);
+    const o = { label: label.slice(0, 100), value: r.id };
+    if (emoji) o.emoji = emoji;
+    return o;
+  });
+
+  return {
+    embeds: [embed({
+      guild, color: COULEURS[group.id] ?? COLORS.primary,
+      author: { name: `${group.emoji}  ${group.title}` },
+      description: [
+        group.desc ?? "",
+        "",
+        roles.map((r) => `${r}`).join("  "),
+      ].filter(Boolean).join("\n"),
+      footer: group.max === 1 ? "Un seul choix — le précédent est retiré automatiquement" : "Autant de choix que tu veux",
+    })],
+    components: [new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`rm:${group.id}`)
+        .setPlaceholder(group.max === 1 ? `Choisis ${group.title.toLowerCase()}…` : `Choisis dans ${group.title.toLowerCase()}…`)
+        .setMinValues(0)
+        .setMaxValues(group.max === 1 ? 1 : Math.min(options.length, 25))
+        .addOptions(options))],
+  };
+}
+
+/* ========================================================================== */
+/*                              PUBLICATION                                   */
+/* ========================================================================== */
+
+/** Retrouve notre message par sa signature, sinon en poste un nouveau. */
+async function poserOuModifier(channel, payload, signature) {
+  let mien = null;
+  try {
+    const recents = await channel.messages.fetch({ limit: 40 });
+    const liste = typeof recents?.find === "function" ? recents : [...(recents?.values?.() ?? [])];
+    mien = liste.find((m) => {
+      if (m.author?.id !== channel.guild.members.me.id) return false;
+      const e = m.embeds?.[0];
+      const nom = e?.author?.name ?? e?.data?.author?.name ?? "";
+      return nom === signature;
+    });
+  } catch { mien = null; }
+  if (mien) return mien.edit(payload).then(() => mien).catch(() => channel.send(payload).catch(() => null));
+  return channel.send(payload).catch(() => null);
+}
+
+/**
+ * Publie le panneau complet : bandeau puis une carte par catégorie.
+ * Relançable sans créer de doublon.
+ */
+async function publishRoleMenus(guild, channel) {
+  const config = await getConfig(guild.id);
+  const groups = config.roleMenus ?? [];
+  if (!groups.length) return { ok: false, reason: "Aucune catégorie définie." };
+  if (!canSend(channel)) return { ok: false, reason: `Je ne peux pas écrire dans ${channel}.` };
+
+  await poserOuModifier(channel, headerMessage(guild, groups), "🎭  Choisis tes rôles");
+  let posees = 0;
+  for (const g of groups) {
+    const payload = groupMessage(guild, g);
+    if (!payload) continue;
+    await poserOuModifier(channel, payload, `${g.emoji}  ${g.title}`);
+    posees++;
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  return { ok: true, channel, posees };
+}
+
+/* ========================================================================== */
+/*                          CHOIX D'UN MEMBRE                                 */
+/* ========================================================================== */
+
+async function handleRoleMenuSelect(i) {
+  const groupId = i.customId.split(":")[1];
+  const config = await getConfig(i.guildId);
+  const group = (config.roleMenus ?? []).find((g) => g.id === groupId);
+  if (!group) return i.reply({ content: "Ce menu n'existe plus.", ...EPH });
+
+  const dansLeGroupe = group.roleIds.filter((id) => i.guild.roles.cache.has(id));
+  const choisis = i.values ?? [];
+  const aRetirer = dansLeGroupe.filter((id) => !choisis.includes(id) && i.member.roles.cache.has(id));
+  const aAjouter = choisis.filter((id) => !i.member.roles.cache.has(id));
+
+  const monRang = i.guild.members.me.roles.highest.position;
+  const tropHaut = [...aAjouter, ...aRetirer].filter((id) => (i.guild.roles.cache.get(id)?.position ?? 0) >= monRang);
+  if (tropHaut.length) {
+    return i.reply({ embeds: [embed({ guild: i.guild, color: COLORS.danger,
+      author: { name: `${ICONS.no}  Rôle trop haut` },
+      description: `${tropHaut.map((id) => `<@&${id}>`).join(" ")} est au-dessus du mien : je ne peux pas y toucher.\nRemonte le rôle de 0x dans les paramètres du serveur.` })], ...EPH });
+  }
+
+  if (aRetirer.length) await i.member.roles.remove(aRetirer, "Menu de rôles").catch(() => null);
+  if (aAjouter.length) await i.member.roles.add(aAjouter, "Menu de rôles").catch(() => null);
+
+  const lignes = [];
+  if (aAjouter.length) lignes.push(`✅ Ajouté : ${aAjouter.map((id) => `<@&${id}>`).join(" ")}`);
+  if (aRetirer.length) lignes.push(`➖ Retiré : ${aRetirer.map((id) => `<@&${id}>`).join(" ")}`);
+  if (!lignes.length) lignes.push("Rien n'a changé.");
+
+  return i.reply({ embeds: [embed({ guild: i.guild, color: COLORS.success,
+    author: { name: `${group.emoji}  ${group.title}` }, description: lignes.join("\n") })], ...EPH });
+}
+
+/* ========================================================================== */
+/*                                14 - GRADES                                 */
 /* ========================================================================== */
 
 // ranks.js — grades gagnés à l'heure de vocal et au message.
 
+
+/* ========================================================================== */
+/*                    ÉCHELLE RECONNUE AUTOMATIQUEMENT                        */
+/* ========================================================================== */
+
+/**
+ * L'échelle du serveur, telle qu'elle figure dans le guide « comment rank up ».
+ * Chaque entrée est repérée par le nom du rôle, emoji et « ¦ » retirés.
+ */
+const PRESET_LADDER = [
+  { match: "staff",           hours: 1,   messages: 100 },
+  { match: "staff confirme",  hours: 5,   messages: 300 },
+  { match: "moderateur",      hours: 10,  messages: 700 },
+  { match: "assistant",       hours: 15,  messages: 800 },
+  { match: "bras droit",      hours: 20,  messages: 1000 },
+  { match: "gouverneur",      hours: 25,  messages: 1500 },
+  { match: "manager",         hours: 30,  messages: 2000 },
+  { match: "superviseur",     hours: 40,  messages: 2500 },
+  { match: "dirigeant",       hours: 45,  messages: 3500 },
+  { match: "pilier",          hours: 50,  messages: 4500 },
+  { match: "sommet",          hours: 65,  messages: 5500 },
+  { match: "empereur",        hours: 80,  messages: 7000 },
+  { match: "proprietaire",    hours: 100, messages: 8500 },
+  { match: "gardien",         hours: 120, messages: 10000 },
+  { match: "legende",         hours: 140, messages: 12000 },
+  { match: "doyen",           hours: 160, messages: 14000 },
+  { match: "templier",        hours: 180, messages: 16000 },
+  { match: "maitre",          hours: 220, messages: 20000 },
+];
+
+/**
+ * Compose l'échelle à partir des rôles présents sur le serveur.
+ * @returns {{ladder:Array, trouves:Array, manquants:Array}}
+ */
+function detectLadder(guild) {
+  const dispo = [...guild.roles.cache.values()]
+    .filter((r) => r.id !== guild.id && !r.managed && !isSeparator(r));
+
+  const ladder = [];
+  const manquants = [];
+  const pris = new Set();
+
+  for (const p of PRESET_LADDER) {
+    const role = dispo.find((r) => !pris.has(r.id) && roleKey(r) === p.match);
+    if (!role) { manquants.push(p.match); continue; }
+    pris.add(role.id);
+    ladder.push({ roleId: role.id, name: roleLabel(role).label, hours: p.hours, messages: p.messages });
+  }
+  return { ladder, trouves: ladder.length, manquants };
+}
 
 /* ========================================================================== */
 /*                          LECTURE DE L'ÉCHELLE                              */
@@ -4506,7 +4801,7 @@ function ladderEmbed(guild, config, stats = null) {
 }
 
 /* ========================================================================== */
-/*                   14 - INVITATIONS ET ROLE DE CONFIANCE                    */
+/*                   15 - INVITATIONS ET ROLE DE CONFIANCE                    */
 /* ========================================================================== */
 
 // invites.js — suivi des invitations et rôle de confiance « Like ».
@@ -4736,7 +5031,7 @@ function isTrusted(member, config) {
 }
 
 /* ========================================================================== */
-/*                      15 - ACTIONS, ARTICLES, ESCALADE                      */
+/*                      16 - ACTIONS, ARTICLES, ESCALADE                      */
 /* ========================================================================== */
 
 // actions.js — la logique métier, appelable depuis n'importe quelle interface.
@@ -5160,7 +5455,7 @@ async function actionGrantCoins(guild, target, amount, moderator, reason) {
 }
 
 /* ========================================================================== */
-/*                          16 - COMMANDES A PREFIXE                          */
+/*                          17 - COMMANDES A PREFIXE                          */
 /* ========================================================================== */
 
 // prefix.js — commandes à préfixe. Le caractère et la liste se règlent au panneau.
@@ -5466,7 +5761,7 @@ async function handlePrefix(message, config) {
 }
 
 /* ========================================================================== */
-/*                 17 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
+/*                 18 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
 /* ========================================================================== */
 
 // coinsspace.js — remplissage complet de la catégorie ESPACE COINS.
@@ -5735,7 +6030,7 @@ async function setupCoinsSpace(guild, memberPanelFactory) {
 }
 
 /* ========================================================================== */
-/*                18 - AFFECTATION ET VERIFICATION DES SALONS                 */
+/*                19 - AFFECTATION ET VERIFICATION DES SALONS                 */
 /* ========================================================================== */
 
 // destinations.js — la table d'affectation : quel panneau, quelle fonction, quel salon.
@@ -5785,6 +6080,10 @@ const DESTINATIONS = [
   { id: "boutique", label: "Panneau boutique", emoji: "🛒", kind: "panel",
     path: "funcOverrides.boutique", auto: ["boutique-coins", "boutique"],
     signature: `${ICONS.coin}  Boutique`, build: (g, c) => shopPanel(g, c) },
+
+  { id: "roleMenus", label: "Menus de rôles", emoji: "🎭", kind: "panel",
+    path: "funcOverrides.roleMenus", auto: ["role", "roles", "choix-des-roles"],
+    signature: "🎭  Choisis tes rôles", special: "roleMenus" },
 
   { id: "casino", label: "Panneau casino", emoji: "🎰", kind: "panel",
     path: "funcOverrides.casino", auto: ["casino", "coins"],
@@ -5903,6 +6202,10 @@ async function publishDestination(guild, config, dest) {
   if (dest.special === "ticketCounter") {
     await refreshTicketCounter(guild);
     return { ok: true, channel };
+  }
+  if (dest.special === "roleMenus") {
+    const r = await publishRoleMenus(guild, channel);
+    return r.ok ? { ok: true, channel } : { ok: false, reason: r.reason };
   }
   const message = await publishOrEdit(channel, dest.build(guild, config), dest.signature);
   if (message?.id) {
@@ -6043,7 +6346,7 @@ function summarizeIssues(results) {
 }
 
 /* ========================================================================== */
-/*                       19 - INSTALLATION AUTOMATIQUE                        */
+/*                       20 - INSTALLATION AUTOMATIQUE                        */
 /* ========================================================================== */
 
 // setup.js — installation automatique. Un bouton, tout est branché.
@@ -6314,7 +6617,7 @@ function setupReport(guild, result) {
 }
 
 /* ========================================================================== */
-/*             20 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
+/*             21 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
 /* ========================================================================== */
 
 // panel.js — l'interface complète. Tout réglage du bot est atteignable ici.
@@ -6337,6 +6640,7 @@ const SECTIONS = [
   { id: "counters", label: "Compteurs", emoji: "📊", level: 4, desc: "Membres, connectés, vocal", trusted: true },
   { id: "eco", label: "Économie", emoji: "🪙", level: 4, desc: "Coins, boutique, colis", trusted: true },
   { id: "money", label: "Trésorerie", emoji: "💸", level: 4, desc: "Donner et retirer des coins", trusted: true },
+  { id: "rolemenus", label: "Menus de rôles", emoji: "🎭", level: 4, desc: "Rôles que les membres se donnent", trusted: true },
   { id: "prefix", label: "Préfixe", emoji: "⌨️", level: 5, desc: "Commandes texte : !ban, ?kick…", trusted: true },
   { id: "levels", label: "Niveaux", emoji: "📈", level: 4, desc: "XP, récompenses, annonces", trusted: true },
   { id: "ranks", label: "Grades", emoji: "🎖️", level: 4, desc: "Montée au temps de vocal et au message", trusted: true },
@@ -6954,7 +7258,8 @@ async function buildSection(id, i, config, page = null) {
     const r = config.ranks ?? {};
     const list = ladder(config);
     const comps = [
-      row(btn("p:ranks:t", r.enabled ? "Couper les grades" : "Activer les grades",
+      row(btn("p:ranks:detect", "Détecter automatiquement", ButtonStyle.Success, "🪄"),
+          btn("p:ranks:t", r.enabled ? "Couper les grades" : "Activer les grades",
             r.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
           btn("p:ranks:auto", r.autoPromote ? "Promotion auto : oui" : "Promotion auto : non",
             r.autoPromote ? ButtonStyle.Success : ButtonStyle.Secondary, "⬆️"),
@@ -7159,6 +7464,66 @@ async function buildSection(id, i, config, page = null) {
           .setChannelTypes(ChannelType.GuildVoice).setPlaceholder("Ajouter/retirer un salon ignoré")),
         backRow(),
       ],
+    };
+  }
+
+  /* ----------------------------- MENUS DE RÔLES -------------------------- */
+  if (id === "rolemenus") {
+    const groups = config.roleMenus ?? [];
+
+    if (page?.startsWith("g_")) {
+      const g = groups.find((x) => x.id === page.slice(2));
+      if (g) {
+        const roles = g.roleIds.map((r) => guild.roles.cache.get(r)).filter(Boolean);
+        return {
+          embeds: [embed({ guild, author: { name: `${g.emoji}  ${g.title}` }, color: COLORS.primary,
+            description: `${g.desc ?? ""}\n\n**${g.max === 1 ? "Un seul choix" : "Choix multiples"}** · ${roles.length} rôle(s)`,
+            fields: [{ name: "Rôles proposés", value: roles.length
+              ? roles.map((r) => `${r} — _${roleLabel(r).label}_`).join("\n").slice(0, 1000) : "_aucun_" }] })],
+          components: [
+            row(new RoleSelectMenuBuilder().setCustomId(`p:rolemenus:add:${g.id}`)
+              .setMinValues(1).setMaxValues(20).setPlaceholder("Ajouter des rôles à cette catégorie…")),
+            ...(roles.length ? [row(new StringSelectMenuBuilder().setCustomId(`p:rolemenus:rm:${g.id}`)
+              .setPlaceholder("Retirer un rôle…")
+              .addOptions(roles.slice(0, 25).map((r) => ({ label: roleLabel(r).label.slice(0, 100), value: r.id }))))] : []),
+            row(btn(`p:rolemenus:max:${g.id}`, g.max === 1 ? "Passer en choix multiples" : "Passer en choix unique",
+                  ButtonStyle.Primary, "🔁"),
+                btn(`p:rolemenus:drop:${g.id}`, "Supprimer la catégorie", ButtonStyle.Danger, "🗑️"),
+                btn("p:rolemenus", "Retour", ButtonStyle.Secondary, "◀️")),
+          ],
+        };
+      }
+    }
+
+    const sansGroupe = [...guild.roles.cache.values()]
+      .filter((r) => r.id !== guild.id && !r.managed && !isSeparator(r) && !groups.some((g) => g.roleIds.includes(r.id)));
+
+    const comps = [
+      row(btn("p:rolemenus:detect", "Détecter automatiquement", ButtonStyle.Success, "🪄"),
+          btn("p:rolemenus:pub", "Publier dans le salon", ButtonStyle.Primary, "📤"),
+          btn("p:rolemenus:clear", "Tout effacer", ButtonStyle.Danger, "🗑️")),
+    ];
+    if (groups.length) comps.push(row(new StringSelectMenuBuilder().setCustomId("p:rolemenus:pick")
+      .setPlaceholder("Ouvrir une catégorie…")
+      .addOptions(groups.slice(0, 25).map((g) => ({ label: g.title.slice(0, 100), value: g.id, emoji: g.emoji,
+        description: `${g.roleIds.length} rôle(s) · ${g.max === 1 ? "un seul" : "multiples"}`.slice(0, 100) })))));
+    comps.push(backRow());
+
+    return {
+      embeds: [embed({ guild, author: { name: "🎭  Menus de rôles" },
+        color: groups.length ? COLORS.success : COLORS.warning,
+        description: groups.length
+          ? "Les membres se donnent ces rôles eux-mêmes, catégorie par catégorie."
+          : "Aucune catégorie. Appuie sur **Détecter automatiquement** : je reconnais les couleurs, le genre, l'âge, la situation, les notifications et les centres d'intérêt.",
+        fields: [
+          ...groups.map((g) => ({ name: `${g.emoji} ${g.title}`,
+            value: g.roleIds.map((r) => `<@&${r}>`).join(" ").slice(0, 1000) || "_vide_",
+            inline: false })),
+          { name: "Rôles hors catégorie", value: sansGroupe.length
+            ? `${sansGroupe.length} rôle(s) non proposés` : "aucun", inline: true },
+        ].slice(0, 25),
+        footer: "Les rôles séparateurs (barres) sont ignorés d'office" })],
+      components: comps,
     };
   }
 
@@ -8219,6 +8584,19 @@ async function handlePanel(i) {
     if (action === "prev") { await updateConfig(i.guildId, { ranks: { removePrevious: r.removePrevious === false } });
       return respond(i, await buildSection("ranks", i, await getConfig(i.guildId))); }
 
+    if (action === "detect") {
+      const d = detectLadder(i.guild);
+      if (!d.ladder.length) return feedback(i, { ok: false, title: "Aucun grade reconnu",
+        text: `Je cherche des rôles nommés ${PRESET_LADDER.slice(0, 4).map((p) => `**${p.match}**`).join(", ")}… et les 14 autres.`,
+        color: COLORS.warning }, "ranks");
+      await updateConfig(i.guildId, { ranks: { enabled: true, ladder: d.ladder } });
+      return feedback(i, { ok: d.manquants.length === 0,
+        title: `${d.trouves} grade(s) sur ${PRESET_LADDER.length}`,
+        text: d.ladder.map((g) => `<@&${g.roleId}> — **${g.hours} h** · **${num(g.messages)}** msg`).join("\n").slice(0, 1500)
+          + (d.manquants.length ? `\n\n⚠️ Introuvables : ${d.manquants.join(", ")}` : ""),
+        color: d.manquants.length ? COLORS.warning : COLORS.gold }, "ranks");
+    }
+
     if (action === "add") {
       const role = i.guild.roles.cache.get(i.values[0]);
       if (role.position >= i.guild.members.me.roles.highest.position)
@@ -8435,6 +8813,73 @@ async function handlePanel(i) {
       return feedback(i, { ok: true, title: "Distribution effectuée",
         text: r.rewarded ? `${r.rewarded} personne(s) récompensée(s)${r.levelUps.length ? ` · ${r.levelUps.length} montée(s) de niveau` : ""}.`
           : "Personne d'éligible : salons vides, membres seuls ou casque coupé." }, "voice");
+    }
+  }
+
+  /* ----------------------------- MENUS DE RÔLES -------------------------- */
+  if (section === "rolemenus") {
+    const groups = [...(config.roleMenus ?? [])];
+
+    if (action === "detect") {
+      const trouves = detectGroups(i.guild);
+      if (!trouves.length) return feedback(i, { ok: false, title: "Rien reconnu",
+        text: "Aucun rôle ne correspond aux catégories connues. Crée les catégories à la main.", color: COLORS.warning }, "rolemenus");
+      await updateConfig(i.guildId, { roleMenus: trouves });
+      return feedback(i, { ok: true, title: `${trouves.length} catégorie(s) reconnue(s)`,
+        text: trouves.map((g) => `${g.emoji} **${g.title}** — ${g.roleIds.length} rôle(s)`).join("\n") }, "rolemenus");
+    }
+
+    if (action === "pick") return respond(i, await buildSection("rolemenus", i, config, `g_${i.values[0]}`));
+
+    if (action === "add") {
+      const g = groups.find((x) => x.id === arg);
+      if (!g) return respond(i, await buildSection("rolemenus", i, config));
+      const monRang = i.guild.members.me.roles.highest.position;
+      const refuses = i.values.filter((id) => (i.guild.roles.cache.get(id)?.position ?? 0) >= monRang);
+      g.roleIds = [...new Set([...g.roleIds, ...i.values.filter((id) => !refuses.includes(id))])].slice(0, 25);
+      await updateConfig(i.guildId, { roleMenus: groups });
+      return feedback(i, { ok: refuses.length === 0, title: "Rôles ajoutés",
+        text: `${g.emoji} **${g.title}** propose maintenant ${g.roleIds.length} rôle(s).`
+          + (refuses.length ? `\n\n⚠️ Ignorés car au-dessus de mon rôle : ${refuses.map((r) => `<@&${r}>`).join(" ")}` : ""),
+        color: refuses.length ? COLORS.warning : COLORS.success }, "rolemenus", `g_${g.id}`);
+    }
+
+    if (action === "rm") {
+      const g = groups.find((x) => x.id === arg);
+      if (!g) return respond(i, await buildSection("rolemenus", i, config));
+      g.roleIds = g.roleIds.filter((r) => r !== i.values[0]);
+      await updateConfig(i.guildId, { roleMenus: groups });
+      return feedback(i, { ok: true, title: "Rôle retiré", text: `<@&${i.values[0]}> n'est plus proposé.` }, "rolemenus", `g_${g.id}`);
+    }
+
+    if (action === "max") {
+      const g = groups.find((x) => x.id === arg);
+      if (!g) return respond(i, await buildSection("rolemenus", i, config));
+      g.max = g.max === 1 ? 0 : 1;
+      await updateConfig(i.guildId, { roleMenus: groups });
+      return respond(i, await buildSection("rolemenus", i, await getConfig(i.guildId), `g_${g.id}`));
+    }
+
+    if (action === "drop") {
+      await updateConfig(i.guildId, { roleMenus: groups.filter((x) => x.id !== arg) });
+      return feedback(i, { ok: true, title: "Catégorie supprimée", text: "Elle n'apparaîtra plus dans le panneau publié." }, "rolemenus");
+    }
+
+    if (action === "clear") {
+      await updateConfig(i.guildId, { roleMenus: [] });
+      return feedback(i, { ok: true, title: "Tout effacé", text: "Relance la détection quand tu veux." }, "rolemenus");
+    }
+
+    if (action === "pub") {
+      await i.deferUpdate();
+      const dest = DESTINATIONS.find((d) => d.id === "roleMenus");
+      const { channel } = resolveDestination(i.guild, config, dest);
+      if (!channel) return feedback(i, { ok: false, title: "Aucun salon",
+        text: "Crée un salon **rôles**, ou choisis-en un dans 📍 Affectations.", color: COLORS.warning }, "rolemenus");
+      const r = await publishRoleMenus(i.guild, channel);
+      return feedback(i, r.ok
+        ? { ok: true, title: "Panneau publié", text: `${r.posees} catégorie(s) dans ${channel}.` }
+        : { ok: false, title: "Publication impossible", text: r.reason, color: COLORS.danger }, "rolemenus");
     }
   }
 
@@ -9558,7 +10003,7 @@ async function handlePublic(i, parts, config) {
 }
 
 /* ========================================================================== */
-/*                    21 - COMMANDES ET MENUS CONTEXTUELS                     */
+/*                    22 - COMMANDES ET MENUS CONTEXTUELS                     */
 /* ========================================================================== */
 
 // commands.js — trois commandes seulement. Tout le reste passe par /panel.
@@ -9765,7 +10210,7 @@ const contextMenus = [
 ];
 
 /* ========================================================================== */
-/*                     22 - CLIENT, EVENEMENTS, DEMARRAGE                     */
+/*                     23 - CLIENT, EVENEMENTS, DEMARRAGE                     */
 /* ========================================================================== */
 
 // index.js — client, événements, démarrage.
@@ -9983,6 +10428,7 @@ client.on(Events.InteractionCreate, async (i) => {
     if (i.isStringSelectMenu()) {
       if (i.customId === "ticket:pick") { await i.deferReply(EPH); return createTicket(i, i.values[0]); }
       if (i.customId === "rolemenu") return handleRoleMenu(i);
+      if (i.customId?.startsWith("rm:")) return handleRoleMenuSelect(i);
       return;
     }
 
