@@ -26,6 +26,11 @@
 //     chaque commande s'ouvre, se ferme et change de niveau requis.
 //     Les niveaux de perm s'appliquent comme au panneau.
 //
+//   FICHE DE MODERATION EN IMAGE
+//     Le menu contextuel et le panneau affichent tout sur un membre en une
+//     image : avatar, rang, grade, coins, niveau, vocal, messages,
+//     invitations, sanctions, dates, roles portes, alertes muet/Alcatraz.
+//
 //   IMAGES DU CASINO
 //     Les six jeux sont dessines en PNG : roulette, machine, blackjack,
 //     demineur, des, pile ou face. Avatar du joueur en en-tete.
@@ -2890,7 +2895,7 @@ function memberPanel(guild) {
 }
 
 /* ========================================================================== */
-/*                            8 - DESSIN DES JEUX                             */
+/*                     8 - DESSIN DES JEUX ET DES FICHES                      */
 /* ========================================================================== */
 
 // render.js — les jeux du casino dessinés en image.
@@ -3540,6 +3545,179 @@ function renderFlip({ sortie, choix, mise, gain, joueur, solde , avatar}) {
   verdict(ctx, px + 28, py + 200, pw - 56, gagne, gagne ? gain : mise,
     gagne ? "Bien vu." : "Raté d'un côté.");
   pied(ctx, L, H, solde);
+  return c.toBuffer("image/png");
+}
+
+
+/* ========================================================================== */
+/*                        FICHE DE MODÉRATION                                 */
+/* ========================================================================== */
+
+/** Petite tuile de statistique. */
+function tuile(ctx, x, y, w, h, titre, valeur, teinte) {
+  arrondi(ctx, x, y, w, h, 14);
+  ctx.fillStyle = "rgba(255,255,255,0.04)"; ctx.fill();
+  ctx.strokeStyle = P.bord; ctx.lineWidth = 1; ctx.stroke();
+  ctx.fillStyle = teinte ?? P.orClair; ctx.fillRect(x, y + 12, 3, h - 24);
+  ctx.textAlign = "left";
+  ctx.fillStyle = P.faible; ctx.font = f(12);
+  ctx.fillText(propre(titre).toUpperCase(), x + 16, y + 26);
+  ctx.fillStyle = P.texte; ctx.font = f(23, true);
+  ctx.fillText(propre(valeur), x + 16, y + 55);
+}
+
+/** Compteur de sanction, cerclé, coloré selon la gravité. */
+function jeton(ctx, cx, cy, r, n, libelle, teinte) {
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fillStyle = n > 0 ? `${teinte}22` : "rgba(255,255,255,0.04)"; ctx.fill();
+  ctx.strokeStyle = n > 0 ? teinte : "rgba(255,255,255,0.12)"; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.textAlign = "center";
+  ctx.fillStyle = n > 0 ? teinte : P.faible; ctx.font = f(26, true);
+  ctx.fillText(String(n), cx, cy + 9);
+  ctx.fillStyle = P.faible; ctx.font = f(12);
+  ctx.fillText(propre(libelle).toUpperCase(), cx, cy + r + 22);
+  ctx.textAlign = "left";
+}
+
+/**
+ * Tout ce qu'on sait d'un membre, sur une seule image.
+ */
+function renderMemberCard({
+  pseudo, tag, identifiant, rang, immunise, muetJusqua, alcatraz,
+  coins, niveau, xp, minutesVocal, messages, invitations, grade,
+  avertissements, timeouts, expulsions, bannissements,
+  compteCree, arriveLe, roles, rolesNoms, avatar, serveur,
+}) {
+  if (!PRET) return null;
+  const L = 1000, H = 620;
+  const { c, ctx } = scene(L, H);
+
+  ctx.textAlign = "left";
+  ctx.fillStyle = P.texte; ctx.font = f(24, true);
+  ctx.fillText("F I C H E   D E   M O D É R A T I O N", 40, 48);
+  ctx.fillStyle = P.faible; ctx.font = f(14);
+  ctx.fillText(propre(serveur ?? ""), 40, 70);
+  ctx.strokeStyle = "rgba(255,255,255,0.07)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(40, 88); ctx.lineTo(L - 40, 88); ctx.stroke();
+
+  /* ------------------------- colonne d'identité ------------------------- */
+  const gx = 40, gy = 110, gw = 300, gh = 380;
+  cadre(ctx, gx, gy, gw, gh);
+
+  const ax = gx + gw / 2, ay = gy + 92;
+  if (avatar) {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(ax, ay, 58, 0, Math.PI * 2); ctx.closePath(); ctx.clip();
+    try { ctx.drawImage(avatar, ax - 58, ay - 58, 116, 116); } catch { /* image illisible */ }
+    ctx.restore();
+  } else {
+    ctx.beginPath(); ctx.arc(ax, ay, 58, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fill();
+  }
+  ctx.beginPath(); ctx.arc(ax, ay, 58, 0, Math.PI * 2);
+  ctx.strokeStyle = muetJusqua || alcatraz ? "#ff4757" : "rgba(212,175,55,0.75)";
+  ctx.lineWidth = 3; ctx.stroke();
+
+  ctx.textAlign = "center";
+  ctx.fillStyle = P.texte; ctx.font = f(24, true);
+  ctx.fillText(propre(pseudo).slice(0, 20), ax, ay + 96);
+  ctx.fillStyle = P.faible; ctx.font = f(14);
+  ctx.fillText(propre(tag).slice(0, 28), ax, ay + 118);
+  ctx.fillStyle = P.tres; ctx.font = f(12);
+  ctx.fillText(String(identifiant), ax, ay + 138);
+
+  // bandeau du niveau de permission
+  const bw = gw - 60, bx2 = gx + 30, by2 = ay + 156;
+  arrondi(ctx, bx2, by2, bw, 34, 17);
+  ctx.fillStyle = "rgba(212,175,55,0.16)"; ctx.fill();
+  ctx.fillStyle = P.orClair; ctx.font = f(15, true);
+  ctx.fillText(propre(rang).toUpperCase().slice(0, 26), gx + gw / 2, by2 + 23);
+
+  if (grade) {
+    arrondi(ctx, bx2, by2 + 44, bw, 32, 16);
+    ctx.fillStyle = "rgba(123,47,247,0.18)"; ctx.fill();
+    ctx.fillStyle = "#c9a6ff"; ctx.font = f(14, true);
+    ctx.fillText(propre(grade).slice(0, 28), gx + gw / 2, by2 + 66);
+  }
+  ctx.textAlign = "left";
+
+  /* ---------------------------- alertes --------------------------------- */
+  let ay2 = gy + gh + 18;
+  const alerte = (txt, teinte) => {
+    arrondi(ctx, gx, ay2, gw, 34, 10);
+    ctx.fillStyle = `${teinte}22`; ctx.fill();
+    ctx.strokeStyle = teinte; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.fillStyle = teinte; ctx.font = f(14, true);
+    ctx.fillText(propre(txt).slice(0, 34), gx + 14, ay2 + 22);
+    ay2 += 42;
+  };
+  if (alcatraz) alerte("Enfermé en Alcatraz", "#ff4757");
+  if (muetJusqua) alerte(`Muet jusqu'au ${muetJusqua}`, "#ffa502");
+  if (immunise) alerte("Immunisé — Administrateur", "#f5c518");
+
+  /* --------------------------- tuiles de stats -------------------------- */
+  const tx = 366, tw = 190, th = 74, tg = 12;
+  const stats = [
+    ["Coins", coins < 0 ? `− ${nb(-coins)}` : nb(coins), coins < 0 ? "#ff4757" : P.orClair],
+    ["Niveau", `${niveau}  ·  ${nb(xp)} XP`, "#7b2ff7"],
+    ["Temps vocal", minutesVocal >= 60 ? `${Math.floor(minutesVocal / 60)} h ${minutesVocal % 60} min` : `${minutesVocal} min`, "#00d4ff"],
+    ["Messages", nb(messages), "#3ddc84"],
+    ["Invitations", nb(invitations), "#ff2d95"],
+    ["Rôles", nb(roles), "#c9cee0"],
+  ];
+  stats.forEach(([titre, valeur, teinte], n) => {
+    const x = tx + (n % 3) * (tw + tg), y = 110 + Math.floor(n / 3) * (th + tg);
+    tuile(ctx, x, y, tw, th, titre, valeur, teinte);
+  });
+
+  /* ---------------------------- sanctions ------------------------------- */
+  const sx = tx, sy = 110 + 2 * (th + tg) + 14, sw = 3 * tw + 2 * tg, sh = 150;
+  cadre(ctx, sx, sy, sw, sh);
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("SANCTIONS", sx + 24, sy + 40);
+
+  const jetons = [
+    [avertissements, "Avertis.", "#ffa502"],
+    [timeouts, "Silences", "#00d4ff"],
+    [expulsions, "Expulsions", "#ff7f50"],
+    [bannissements, "Bans", "#ff4757"],
+  ];
+  jetons.forEach(([n, lib, teinte], k) => {
+    jeton(ctx, sx + 90 + k * 140, sy + 88, 30, n, lib, teinte);
+  });
+
+  /* ------------------------------ dates --------------------------------- */
+  const dy = sy + sh + 16;
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("COMPTE CRÉÉ", sx + 4, dy + 16);
+  ctx.fillText("A REJOINT LE", sx + 300, dy + 16);
+  ctx.fillStyle = P.texte; ctx.font = f(16, true);
+  ctx.fillText(propre(compteCree), sx + 4, dy + 40);
+  ctx.fillText(propre(arriveLe), sx + 300, dy + 40);
+
+  /* --------------------------- liste des rôles -------------------------- */
+  if (rolesNoms?.length) {
+    ctx.fillStyle = P.faible; ctx.font = f(13);
+    ctx.fillText("RÔLES PORTÉS", sx + 4, dy + 76);
+    let px2 = sx + 4, py2 = dy + 92;
+    for (const nom of rolesNoms.slice(0, 12)) {
+      const libelle = propre(nom).slice(0, 22);
+      if (!libelle) continue;
+      ctx.font = f(13);
+      const lw = ctx.measureText(libelle).width + 22;
+      if (px2 + lw > L - 40) { px2 = sx + 4; py2 += 30; }
+      if (py2 > H - 46) break;
+      arrondi(ctx, px2, py2, lw, 24, 12);
+      ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fill();
+      ctx.strokeStyle = P.bord; ctx.lineWidth = 1; ctx.stroke();
+      ctx.fillStyle = "#c9cee0"; ctx.fillText(libelle, px2 + 11, py2 + 16);
+      px2 += lw + 8;
+    }
+  }
+
+  ctx.textAlign = "right"; ctx.fillStyle = P.tres; ctx.font = f(12);
+  ctx.fillText("0x • NAOYA", L - 30, H - 24);
+  ctx.textAlign = "left";
   return c.toBuffer("image/png");
 }
 
@@ -9036,7 +9214,51 @@ async function showMemberCard(i, userId, config) {
     ],
   }).thumb(member.user.displayAvatarURL({ size: 256 }));
 
+  // Fiche en image, avec repli sur l'encadré texte si le dessin est éteint
+  let fichier = null;
+  if (renderReady()) {
+    try {
+      const avatar = await chargerAvatar(member.user.displayAvatarURL({ extension: "png", size: 256 }));
+      const roles = member.roles.cache.filter((r) => r.id !== i.guild.id)
+        .sort((a, b) => b.position - a.position);
+      const stats = await memberStats(i.guild.id, userId);
+      const situation = situate(config, stats).current;
+      const inv = await inviterStats(i.guild.id, userId).catch(() => ({ total: 0 }));
+
+      const buffer = renderMemberCard({
+        pseudo: member.displayName ?? member.user.username,
+        tag: `@${member.user.username}`,
+        identifiant: member.id,
+        rang: PERM_LABELS[permLevel(member, config)],
+        immunise: hasAdminImmunity(member, config),
+        muetJusqua: muted ? member.communicationDisabledUntil.toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" }) : null,
+        alcatraz: config.jailRoleId ? member.roles.cache.has(config.jailRoleId) : false,
+        coins: wallet.coins, niveau: lvl.level, xp: lvl.xp,
+        minutesVocal: stats.minutes, messages: stats.messages,
+        invitations: inv?.total ?? 0,
+        grade: situation ? `${situation.name} — ${situation.hours} h / ${num(situation.messages)}` : null,
+        avertissements: warns,
+        timeouts: await countSanctions(i.guild.id, userId, "timeout"),
+        expulsions: await countSanctions(i.guild.id, userId, "kick"),
+        bannissements: await countSanctions(i.guild.id, userId, "ban"),
+        compteCree: member.user.createdAt.toLocaleDateString("fr-FR"),
+        arriveLe: member.joinedAt ? member.joinedAt.toLocaleDateString("fr-FR") : "—",
+        roles: roles.size,
+        rolesNoms: roles.map((r) => roleLabel(r).label),
+        avatar, serveur: i.guild.name,
+      });
+      if (buffer) {
+        const nom = `fiche-${member.id}.png`;
+        card.setImage(`attachment://${nom}`);
+        card.data.fields = [];
+        card.data.description = undefined;
+        fichier = { attachment: buffer, name: nom };
+      }
+    } catch (e) { console.error("[fiche]", e.message); }
+  }
+
   return respond(i, {
+    ...(fichier ? { files: [fichier], attachments: [] } : {}),
     embeds: [card],
     components: [
       row(btn(`p:mod:warn:${userId}`, "Avertir", ButtonStyle.Secondary, "⚠️"),
