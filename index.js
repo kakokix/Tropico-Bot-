@@ -11447,6 +11447,11 @@ client.once(Events.ClientReady, async (c) => {
   console.log("[0x] configuration verrouillee sur l identifiant " + OWNER_ID);
   await deployCommands();
 
+  // Dessin des jeux : si la bibliothèque ou la police manquent, le casino
+  // repassera en texte au lieu de faire tomber le bot.
+  await initRender();
+  console.log(`[images] casino en ${renderReady() ? "image" : "texte"}`);
+
   for (const guild of c.guilds.cache.values()) {
     const watch = await watchOwner(guild, { announce: false }).catch(() => ({ suspended: false }));
     if (watch.suspended) {
