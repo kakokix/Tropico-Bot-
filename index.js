@@ -26,6 +26,12 @@
 //     chaque commande s'ouvre, se ferme et change de niveau requis.
 //     Les niveaux de perm s'appliquent comme au panneau.
 //
+//   IMAGES DU CASINO
+//     Les six jeux sont dessines en PNG : roulette, machine, blackjack,
+//     demineur, des, pile ou face. Avatar du joueur en en-tete.
+//     Necessite @napi-rs/canvas et le fichier font.ttf a cote d'index.js.
+//     Si l'un des deux manque, le casino repasse en texte sans planter.
+//
 //   EMOJIS DU SERVEUR
 //     Discord n'interprete ":monemoji:" que quand un humain le tape.
 //     Le bot traduit desormais automatiquement en <:nom:id> ou <a:nom:id>
@@ -2884,7 +2890,661 @@ function memberPanel(guild) {
 }
 
 /* ========================================================================== */
-/*                  8 - ARRIERE-SALLE : ACTIVITES ILLEGALES                   */
+/*                            8 - DESSIN DES JEUX                             */
+/* ========================================================================== */
+
+// render.js — les jeux du casino dessinés en image.
+//
+// La bibliothèque de dessin est chargée à la demande : si elle manque,
+// le casino continue de tourner en texte, sans planter.
+
+let CV = null;                 // module @napi-rs/canvas
+let POLICE = "sans-serif";
+let PRET = false;
+
+/** Palette commune à toutes les images. */
+const P = {
+  fond1: "#1a0f2e", fond2: "#0f1225", fond3: "#2a1030",
+  or: "#d4af37", orClair: "#f5c518",
+  rouge: "#c8102e", rougeClair: "#ff5a6e",
+  vert: "#1db954", vertClair: "#3ddc84",
+  noir: "#14161f", ardoise: "#2b2f42",
+  panneau: "rgba(255,255,255,0.045)",
+  bord: "rgba(255,255,255,0.09)",
+  texte: "#ffffff", faible: "rgba(255,255,255,0.45)", tres: "rgba(255,255,255,0.22)",
+  arc: ["#00d4ff", "#7b2ff7", "#ff2d95"],
+};
+
+/**
+ * Charge la bibliothèque et choisit une police.
+ * Pose un fichier `font.ttf` à côté d'index.js pour imposer la tienne.
+ * @returns {Promise<boolean>}
+ */
+async function initRender() {
+  if (PRET) return true;
+  try {
+    CV = await import("@napi-rs/canvas");
+    try {
+      const { existsSync } = await import("node:fs");
+      for (const chemin of ["./font.ttf", "./assets/font.ttf", "/app/font.ttf"]) {
+        if (existsSync(chemin)) { CV.GlobalFonts.registerFromPath(chemin, "Naoya"); break; }
+      }
+    } catch { /* pas de police fournie, on prendra celle du système */ }
+
+    const dispo = CV.GlobalFonts.families.map((f) => f.family);
+    POLICE = ["Naoya", "Liberation Sans", "DejaVu Sans", "FreeSans", "Arial", "Helvetica"]
+      .find((f) => dispo.includes(f)) ?? "sans-serif";
+    PRET = true;
+    console.log(`[images] dessin activé · police « ${POLICE} »`);
+    return true;
+  } catch (e) {
+    console.warn("[images] dessin indisponible, le casino restera en texte :", e.message);
+    PRET = false;
+    return false;
+  }
+}
+
+const renderReady = () => PRET;
+
+/**
+ * Télécharge la photo de profil. Un échec n'empêche jamais le rendu :
+ * l'image sort simplement sans l'avatar.
+ */
+async function chargerAvatar(url) {
+  if (!PRET || !url) return null;
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 2500);
+    const r = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(t);
+    if (!r.ok) return null;
+    return await CV.loadImage(Buffer.from(await r.arrayBuffer()));
+  } catch { return null; }
+}
+
+/* ========================================================================== */
+/*                            OUTILS DE DESSIN                                */
+/* ========================================================================== */
+
+const f = (taille, gras = false) => `${gras ? "bold " : ""}${taille}px "${POLICE}"`;
+const nb = (n) => Number(n).toLocaleString("fr-FR");
+
+/**
+ * Les polices système ne contiennent pas les emojis en couleur : dessiné tel
+ * quel, un emoji sort en carré vide. On les retire de tout texte peint.
+ */
+const propre = (s) => String(s ?? "")
+  .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{20E3}]/gu, "")
+  .replace(/\s{2,}/g, " ").trim();
+
+/** Nom lisible de chaque symbole de la machine. */
+const MOT_SYMBOLE = {
+  "🍒": "cerises", "🍋": "citrons", "🍊": "oranges", "🔔": "cloches",
+  "💎": "diamants", "7️⃣": "sept", "🌟": "étoiles",
+};
+
+function arrondi(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/** Toile de fond commune : dégradé, quadrillage, filet d'en-tête. */
+function scene(L, H) {
+  const c = CV.createCanvas(L, H);
+  const ctx = c.getContext("2d");
+  const g = ctx.createLinearGradient(0, 0, L, H);
+  g.addColorStop(0, P.fond1); g.addColorStop(0.5, P.fond2); g.addColorStop(1, P.fond3);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, L, H);
+  ctx.strokeStyle = "rgba(255,255,255,0.03)"; ctx.lineWidth = 1;
+  for (let x = 0; x < L; x += 28) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+  for (let y = 0; y < H; y += 28) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(L, y); ctx.stroke(); }
+  return { c, ctx };
+}
+
+function entete(ctx, L, titre, joueur, mise, avatar) {
+  let x = 40;
+  if (avatar) {
+    // Photo de profil, découpée en rond, cerclée d'or
+    ctx.save();
+    ctx.beginPath(); ctx.arc(72, 52, 28, 0, Math.PI * 2); ctx.closePath(); ctx.clip();
+    try { ctx.drawImage(avatar, 44, 24, 56, 56); } catch { /* image illisible */ }
+    ctx.restore();
+    ctx.beginPath(); ctx.arc(72, 52, 28, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(212,175,55,0.75)"; ctx.lineWidth = 2.5; ctx.stroke();
+    x = 116;
+  }
+  ctx.textAlign = "left";
+  ctx.fillStyle = P.texte; ctx.font = f(27, true);
+  ctx.fillText(propre(titre).split("").join(" "), x, 50);
+  ctx.fillStyle = P.faible; ctx.font = f(15);
+  ctx.fillText(propre(joueur), x, 74);
+
+  if (mise !== undefined) {
+    arrondi(ctx, L - 190, 28, 150, 34, 17);
+    ctx.fillStyle = "rgba(212,175,55,0.16)"; ctx.fill();
+    ctx.fillStyle = P.orClair; ctx.font = f(15, true); ctx.textAlign = "center";
+    ctx.fillText(`MISE ${nb(mise)}`, L - 115, 50);
+    ctx.textAlign = "left";
+  }
+  ctx.strokeStyle = "rgba(255,255,255,0.07)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(40, 90); ctx.lineTo(L - 40, 90); ctx.stroke();
+}
+
+/**
+ * Une pièce d'or dessinée au trait : tranche, face, reflet.
+ * Les polices système n'ont aucun emoji en couleur, il faut donc la peindre.
+ */
+function piece(ctx, cx, cy, r) {
+  ctx.save();
+  // tranche, légèrement décalée vers le bas
+  ctx.beginPath(); ctx.arc(cx, cy + r * 0.14, r, 0, Math.PI * 2);
+  ctx.fillStyle = "#a8811b"; ctx.fill();
+  // face
+  const g = ctx.createLinearGradient(cx - r, cy - r, cx + r, cy + r);
+  g.addColorStop(0, "#ffe27a"); g.addColorStop(0.45, "#f0c02e"); g.addColorStop(1, "#c99a12");
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fillStyle = g; ctx.fill();
+  // liseré intérieur
+  ctx.beginPath(); ctx.arc(cx, cy, r * 0.72, 0, Math.PI * 2);
+  ctx.strokeStyle = "rgba(140,100,10,0.55)"; ctx.lineWidth = Math.max(1, r * 0.11); ctx.stroke();
+  // reflet
+  ctx.beginPath();
+  ctx.arc(cx, cy, r * 0.86, Math.PI * 1.05, Math.PI * 1.5);
+  ctx.strokeStyle = "rgba(255,255,255,0.75)"; ctx.lineWidth = Math.max(1, r * 0.14);
+  ctx.lineCap = "round"; ctx.stroke();
+  ctx.restore();
+}
+
+function pied(ctx, L, H, solde) {
+  piece(ctx, 52, H - 32, 13);
+  ctx.fillStyle = P.texte; ctx.font = f(17, true); ctx.textAlign = "left";
+  ctx.fillText(nb(solde), 72, H - 26);
+  ctx.textAlign = "right"; ctx.fillStyle = P.tres; ctx.font = f(12);
+  ctx.fillText("0x • NAOYA CASINO", L - 30, H - 24);
+  ctx.textAlign = "left";
+}
+
+/** Cadre latéral avec sa barre arc-en-ciel. */
+function cadre(ctx, x, y, w, h) {
+  arrondi(ctx, x, y, w, h, 20);
+  ctx.fillStyle = P.panneau; ctx.fill();
+  ctx.strokeStyle = P.bord; ctx.lineWidth = 1.5; ctx.stroke();
+  const b = ctx.createLinearGradient(x, 0, x + w, 0);
+  b.addColorStop(0, P.arc[0]); b.addColorStop(0.5, P.arc[1]); b.addColorStop(1, P.arc[2]);
+  ctx.fillStyle = b; ctx.fillRect(x + 18, y, w - 36, 3);
+}
+
+/** Bloc « GAGNÉ / PERDU » avec le montant. */
+function verdict(ctx, x, y, w, gagne, montant, phrase) {
+  ctx.textAlign = "left";
+  ctx.fillStyle = gagne ? P.vertClair : "#ff4757";
+  ctx.font = f(w < 300 ? 27 : 34, true);
+  ctx.fillText(gagne ? "GAGNÉ" : "PERDU", x, y);
+  ctx.textAlign = "right";
+  ctx.fillText(`${gagne ? "+" : "−"}${nb(Math.abs(montant))}`, x + w, y);
+  ctx.textAlign = "left";
+  ctx.fillStyle = "rgba(255,255,255,0.35)"; ctx.font = `italic ${f(15)}`;
+  ctx.fillText(propre(phrase), x, y + 40);
+}
+
+function etoile(ctx, cx, cy, r, couleur) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = (Math.PI / 5) * i - Math.PI / 2;
+    const rr = i % 2 ? r * 0.45 : r;
+    ctx[i ? "lineTo" : "moveTo"](cx + Math.cos(a) * rr, cy + Math.sin(a) * rr);
+  }
+  ctx.closePath(); ctx.fillStyle = couleur; ctx.fill();
+}
+
+/* ========================================================================== */
+/*                              ROULETTE                                      */
+/* ========================================================================== */
+
+const ORDRE = [0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26];
+const ROUGE = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
+
+function renderRoulette({ numero, pari, mise, gain, joueur, solde , avatar}) {
+  if (!PRET) return null;
+  const L = 1000, H = 520;
+  const { c, ctx } = scene(L, H);
+  entete(ctx, L, "ROULETTE", joueur, mise, avatar);
+
+  const cx = 258, cy = 300, R = 162;
+  const idx = ORDRE.indexOf(numero);
+  const pas = (Math.PI * 2) / ORDRE.length;
+  const rot = -Math.PI / 2 - idx * pas;
+
+  ctx.save(); ctx.shadowColor = "rgba(0,0,0,0.6)"; ctx.shadowBlur = 30;
+  ctx.beginPath(); ctx.arc(cx, cy, R + 12, 0, Math.PI * 2);
+  const or = ctx.createLinearGradient(cx - R, cy - R, cx + R, cy + R);
+  or.addColorStop(0, P.or); or.addColorStop(0.5, "#8b6914"); or.addColorStop(1, P.or);
+  ctx.fillStyle = or; ctx.fill(); ctx.restore();
+
+  ORDRE.forEach((n, i) => {
+    const a0 = rot + i * pas;
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.arc(cx, cy, R, a0, a0 + pas); ctx.closePath();
+    ctx.fillStyle = n === 0 ? P.vert : ROUGE.has(n) ? P.rouge : P.noir;
+    ctx.fill();
+    ctx.strokeStyle = "rgba(212,175,55,0.35)"; ctx.lineWidth = 1; ctx.stroke();
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate(a0 + pas / 2);
+    ctx.fillStyle = P.texte; ctx.font = f(17, true);
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(String(n), R - 22, 0);
+    ctx.restore();
+  });
+  ctx.textBaseline = "alphabetic";
+
+  ctx.beginPath(); ctx.arc(cx, cy, R * 0.52, 0, Math.PI * 2);
+  ctx.fillStyle = "#161a2e"; ctx.fill();
+  ctx.strokeStyle = "rgba(212,175,55,0.5)"; ctx.lineWidth = 2; ctx.stroke();
+  for (let i = 0; i < 8; i++) {
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate((i * Math.PI) / 4);
+    ctx.strokeStyle = "rgba(212,175,55,0.45)"; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(20, 0); ctx.lineTo(R * 0.52, 0); ctx.stroke(); ctx.restore();
+  }
+  ctx.beginPath(); ctx.arc(cx, cy, 16, 0, Math.PI * 2); ctx.fillStyle = or; ctx.fill();
+
+  const ab = -Math.PI / 2 + pas / 2;
+  const bx = cx + Math.cos(ab) * (R - 34), by = cy + Math.sin(ab) * (R - 34);
+  ctx.save(); ctx.shadowColor = "rgba(255,255,255,0.9)"; ctx.shadowBlur = 14;
+  ctx.beginPath(); ctx.arc(bx, by, 9, 0, Math.PI * 2); ctx.fillStyle = "#fff"; ctx.fill(); ctx.restore();
+
+  const rx = cx + Math.cos(ab) * (R + 16), ry = cy + Math.sin(ab) * (R + 16);
+  ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(rx - 12, ry - 22); ctx.lineTo(rx + 12, ry - 22);
+  ctx.closePath(); ctx.fillStyle = P.orClair; ctx.fill();
+
+  const px = 566, py = 92, pw = 384, ph = 362;
+  cadre(ctx, px, py, pw, ph);
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("VOTRE PARI", px + 28, py + 44);
+  ctx.fillStyle = P.texte; ctx.font = f(32, true);
+  ctx.fillText(propre(pari).toUpperCase(), px + 28, py + 82);
+  ctx.strokeStyle = "rgba(255,255,255,0.08)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(px + 28, py + 104); ctx.lineTo(px + pw - 28, py + 104); ctx.stroke();
+
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("NUMÉRO SORTI", px + 28, py + 136);
+  const couleur = numero === 0 ? P.vert : ROUGE.has(numero) ? P.rouge : P.ardoise;
+  ctx.save(); ctx.shadowColor = couleur; ctx.shadowBlur = 26;
+  ctx.beginPath(); ctx.arc(px + 76, py + 190, 42, 0, Math.PI * 2);
+  ctx.fillStyle = couleur; ctx.fill(); ctx.restore();
+  ctx.fillStyle = P.texte; ctx.font = f(40, true); ctx.textAlign = "center";
+  ctx.fillText(String(numero), px + 76, py + 204);
+  ctx.textAlign = "left";
+  ctx.fillStyle = numero === 0 ? P.vert : ROUGE.has(numero) ? P.rougeClair : "#c9cee0";
+  ctx.font = f(26, true);
+  ctx.fillText(numero === 0 ? "VERT" : ROUGE.has(numero) ? "ROUGE" : "NOIR", px + 138, py + 184);
+  const traits = numero === 0 ? "Seul le plein paie"
+    : [numero % 2 ? "Impair" : "Pair", numero <= 18 ? "1-18" : "19-36",
+       numero <= 12 ? "1ʳᵉ douzaine" : numero <= 24 ? "2ᵉ douzaine" : "3ᵉ douzaine"].join(" · ");
+  ctx.fillStyle = P.faible; ctx.font = f(14);
+  ctx.fillText(traits, px + 138, py + 208);
+
+  verdict(ctx, px + 28, py + 272, pw - 56, gain > 0, gain > 0 ? gain : mise,
+    gain > 0 ? "La banque s'incline…" : "La banque ramasse la mise…");
+  pied(ctx, L, H, solde);
+  return c.toBuffer("image/png");
+}
+
+/* ========================================================================== */
+/*                          MACHINE À SOUS                                    */
+/* ========================================================================== */
+
+/** Les symboles sont dessinés : aucune dépendance à une police d'emojis. */
+function symbole(ctx, nom, cx, cy, t) {
+  ctx.save(); ctx.translate(cx, cy);
+  if (nom === "🍒") {
+    ctx.strokeStyle = "#2e7d32"; ctx.lineWidth = t * 0.07; ctx.beginPath();
+    ctx.moveTo(-t * 0.18, t * 0.1); ctx.quadraticCurveTo(0, -t * 0.45, t * 0.06, -t * 0.42);
+    ctx.moveTo(t * 0.2, t * 0.12); ctx.quadraticCurveTo(t * 0.15, -t * 0.3, t * 0.06, -t * 0.42);
+    ctx.stroke();
+    ctx.fillStyle = "#e53935";
+    ctx.beginPath(); ctx.arc(-t * 0.2, t * 0.24, t * 0.2, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(t * 0.22, t * 0.26, t * 0.18, 0, Math.PI * 2); ctx.fill();
+  } else if (nom === "🍋") {
+    ctx.fillStyle = "#fdd835"; ctx.beginPath();
+    ctx.ellipse(0, 0, t * 0.42, t * 0.3, -0.25, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "rgba(255,255,255,0.35)"; ctx.beginPath();
+    ctx.ellipse(-t * 0.12, -t * 0.1, t * 0.14, t * 0.07, -0.3, 0, Math.PI * 2); ctx.fill();
+  } else if (nom === "🍊") {
+    ctx.fillStyle = "#fb8c00"; ctx.beginPath(); ctx.arc(0, t * 0.04, t * 0.36, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#2e7d32"; ctx.beginPath();
+    ctx.ellipse(t * 0.14, -t * 0.34, t * 0.16, t * 0.07, -0.5, 0, Math.PI * 2); ctx.fill();
+  } else if (nom === "🔔") {
+    ctx.fillStyle = P.or; ctx.beginPath();
+    ctx.moveTo(-t * 0.34, t * 0.22);
+    ctx.quadraticCurveTo(-t * 0.3, -t * 0.34, 0, -t * 0.36);
+    ctx.quadraticCurveTo(t * 0.3, -t * 0.34, t * 0.34, t * 0.22);
+    ctx.closePath(); ctx.fill();
+    ctx.fillRect(-t * 0.38, t * 0.22, t * 0.76, t * 0.08);
+    ctx.beginPath(); ctx.arc(0, t * 0.36, t * 0.09, 0, Math.PI * 2); ctx.fill();
+  } else if (nom === "💎") {
+    ctx.fillStyle = "#4dd0e1"; ctx.beginPath();
+    ctx.moveTo(0, -t * 0.34); ctx.lineTo(t * 0.36, -t * 0.06);
+    ctx.lineTo(0, t * 0.38); ctx.lineTo(-t * 0.36, -t * 0.06);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = t * 0.03;
+    ctx.beginPath(); ctx.moveTo(-t * 0.36, -t * 0.06); ctx.lineTo(t * 0.36, -t * 0.06);
+    ctx.moveTo(0, -t * 0.34); ctx.lineTo(0, t * 0.38); ctx.stroke();
+  } else if (nom === "7️⃣") {
+    ctx.fillStyle = "#ff1744"; ctx.font = f(Math.round(t * 0.95), true);
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("7", 0, t * 0.03);
+  } else {
+    etoile(ctx, 0, 0, t * 0.42, P.orClair);
+  }
+  ctx.restore();
+  ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+}
+
+function renderSlots({ reels, mult, libelle, mise, gain, joueur, solde , avatar}) {
+  if (!PRET) return null;
+  const L = 1000, H = 520;
+  const { c, ctx } = scene(L, H);
+  entete(ctx, L, "MACHINE", joueur, mise, avatar);
+
+  const bx = 60, by = 140, bw = 460, bh = 260;
+  arrondi(ctx, bx, by, bw, bh, 22);
+  const boitier = ctx.createLinearGradient(bx, by, bx, by + bh);
+  boitier.addColorStop(0, "#241a3d"); boitier.addColorStop(1, "#150f26");
+  ctx.fillStyle = boitier; ctx.fill();
+  ctx.strokeStyle = P.or; ctx.lineWidth = 3; ctx.stroke();
+
+  const gagne = gain > 0;
+  const cases = 3, cw = 130, ch = 180, gap = 16;
+  const dx = bx + (bw - (cases * cw + (cases - 1) * gap)) / 2;
+  for (let i = 0; i < cases; i++) {
+    const x = dx + i * (cw + gap), y = by + (bh - ch) / 2;
+    arrondi(ctx, x, y, cw, ch, 14);
+    ctx.fillStyle = "#0b0d18"; ctx.fill();
+    ctx.strokeStyle = gagne ? "rgba(61,220,132,0.7)" : "rgba(255,255,255,0.12)";
+    ctx.lineWidth = gagne ? 3 : 1.5; ctx.stroke();
+    if (gagne) { ctx.save(); ctx.shadowColor = P.vertClair; ctx.shadowBlur = 18; ctx.stroke(); ctx.restore(); }
+    symbole(ctx, reels[i], x + cw / 2, y + ch / 2, 96);
+  }
+
+  ctx.fillStyle = P.tres; ctx.font = f(13);
+  ctx.textAlign = "center";
+  ctx.fillText("3 étoiles ×1500   •   3 sept ×300   •   3 diamants ×125", bx + bw / 2, by + bh + 34);
+  ctx.textAlign = "left";
+
+  const px = 566, py = 92, pw = 384, ph = 362;
+  cadre(ctx, px, py, pw, ph);
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("RÉSULTAT", px + 28, py + 44);
+  ctx.fillStyle = P.texte; ctx.font = f(30, true);
+  ctx.fillText(propre(libelle).slice(0, 26), px + 28, py + 84);
+  ctx.strokeStyle = "rgba(255,255,255,0.08)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(px + 28, py + 106); ctx.lineTo(px + pw - 28, py + 106); ctx.stroke();
+
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("MULTIPLICATEUR", px + 28, py + 140);
+  ctx.save(); ctx.shadowColor = gagne ? P.vertClair : P.ardoise; ctx.shadowBlur = 22;
+  arrondi(ctx, px + 28, py + 156, 150, 62, 14);
+  ctx.fillStyle = gagne ? "rgba(61,220,132,0.15)" : "rgba(255,255,255,0.05)"; ctx.fill(); ctx.restore();
+  ctx.fillStyle = gagne ? P.vertClair : P.faible; ctx.font = f(34, true);
+  ctx.textAlign = "center"; ctx.fillText(`×${mult}`, px + 103, py + 198);
+  ctx.textAlign = "left";
+
+  verdict(ctx, px + 28, py + 278, pw - 56, gagne, gagne ? gain : mise,
+    gagne ? "Les rouleaux te sourient…" : "Les rouleaux ne suivent pas…");
+  pied(ctx, L, H, solde);
+  return c.toBuffer("image/png");
+}
+
+/* ========================================================================== */
+/*                              BLACKJACK                                     */
+/* ========================================================================== */
+
+function carte(ctx, x, y, w, h, rang, enseigne, cachee = false) {
+  arrondi(ctx, x, y, w, h, 10);
+  if (cachee) {
+    const d = ctx.createLinearGradient(x, y, x + w, y + h);
+    d.addColorStop(0, "#3a2a6b"); d.addColorStop(1, "#1d1440");
+    ctx.fillStyle = d; ctx.fill();
+    ctx.strokeStyle = "rgba(212,175,55,0.6)"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.strokeStyle = "rgba(212,175,55,0.35)"; ctx.lineWidth = 1;
+    arrondi(ctx, x + 8, y + 8, w - 16, h - 16, 6); ctx.stroke();
+    etoile(ctx, x + w / 2, y + h / 2, 16, "rgba(212,175,55,0.5)");
+    return;
+  }
+  ctx.fillStyle = "#f7f7fb"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 1; ctx.stroke();
+  const rouge = enseigne === "♥" || enseigne === "♦";
+  ctx.fillStyle = rouge ? "#d32f2f" : "#15161c";
+  ctx.textAlign = "left"; ctx.font = f(21, true);
+  ctx.fillText(rang, x + 9, y + 27);
+  ctx.font = f(19); ctx.fillText(enseigne, x + 9, y + 48);
+  ctx.textAlign = "center"; ctx.font = f(40);
+  ctx.fillText(enseigne, x + w / 2, y + h / 2 + 20);
+}
+
+function renderBlackjack({ joueurCartes, croupierCartes, valeurJoueur, valeurCroupier,
+                                  cacher, termine, texte, mise, gain, joueur, solde , avatar}) {
+  if (!PRET) return null;
+  const L = 1000, H = 540;
+  const { c, ctx } = scene(L, H);
+  entete(ctx, L, "BLACKJACK", joueur, mise, avatar);
+
+  const cw = 84, ch = 118;
+  const rangee = (cartes, y, titre, valeur, masquer) => {
+    ctx.fillStyle = P.faible; ctx.font = f(13);
+    ctx.fillText(titre, 50, y - 14);
+    cartes.slice(0, 6).forEach((k, i) => {
+      const masque = masquer && i === 1;
+      carte(ctx, 50 + i * (cw + 12), y, cw, ch, k.r, k.s, masque);
+    });
+    const bx = 50 + Math.min(cartes.length, 6) * (cw + 12) + 8;
+    arrondi(ctx, bx, y + ch / 2 - 21, 62, 42, 12);
+    ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fill();
+    ctx.fillStyle = P.texte; ctx.font = f(22, true); ctx.textAlign = "center";
+    ctx.fillText(masquer ? "?" : String(valeur), bx + 31, y + ch / 2 + 8);
+    ctx.textAlign = "left";
+  };
+
+  rangee(croupierCartes, 132, "CROUPIER", valeurCroupier, cacher);
+  rangee(joueurCartes, 310, "TOI", valeurJoueur, false);
+
+  const px = 660, py = 92, pw = 290, ph = 362;
+  cadre(ctx, px, py, pw, ph);
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("ÉTAT", px + 24, py + 44);
+  ctx.fillStyle = P.texte; ctx.font = f(21, true);
+  const mots = propre(texte).split(" ");
+  let ligne = "", ly = py + 78;
+  for (const m of mots) {
+    if ((ligne + " " + m).trim().length > 20) { ctx.fillText(ligne, px + 24, ly); ligne = m; ly += 28; }
+    else ligne = (ligne + " " + m).trim();
+  }
+  if (ligne) ctx.fillText(ligne, px + 24, ly);
+
+  if (termine) {
+    verdict(ctx, px + 24, py + 260, pw - 48, gain > 0, gain > 0 ? gain : mise,
+      gain > 0 ? "Bien joué." : gain === 0 ? "Mise rendue." : "Le croupier l'emporte.");
+  } else {
+    ctx.fillStyle = P.faible; ctx.font = f(15);
+    ctx.fillText("Tire, reste, ou double.", px + 24, py + 268);
+    ctx.fillStyle = P.tres; ctx.font = f(13);
+    ctx.fillText("Le croupier tire jusqu'à 17.", px + 24, py + 292);
+  }
+  pied(ctx, L, H, solde);
+  return c.toBuffer("image/png");
+}
+
+/* ========================================================================== */
+/*                              DÉMINEUR                                      */
+/* ========================================================================== */
+
+function renderMines({ bombes, ouvertes, mines, mult, mise, gain, joueur, solde, termine, saute, derniere , avatar}) {
+  if (!PRET) return null;
+  const L = 1000, H = 540;
+  const { c, ctx } = scene(L, H);
+  entete(ctx, L, "DEMINEUR", joueur, mise, avatar);
+
+  const t = 64, gap = 8, gx = 60, gy = 128;
+  for (let n = 0; n < 25; n++) {
+    const x = gx + (n % 5) * (t + gap), y = gy + Math.floor(n / 5) * (t + gap);
+    const ouverte = ouvertes.includes(n);
+    const bombe = bombes.includes(n);
+    arrondi(ctx, x, y, t, t, 12);
+    if (ouverte) { ctx.fillStyle = "rgba(61,220,132,0.16)"; ctx.fill();
+      ctx.strokeStyle = "rgba(61,220,132,0.6)"; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = "#4dd0e1"; ctx.beginPath();
+      ctx.moveTo(x + t / 2, y + t * 0.24); ctx.lineTo(x + t * 0.78, y + t * 0.48);
+      ctx.lineTo(x + t / 2, y + t * 0.78); ctx.lineTo(x + t * 0.22, y + t * 0.48);
+      ctx.closePath(); ctx.fill();
+    } else if (termine && bombe) {
+      const rate = saute && n === derniere;
+      ctx.fillStyle = rate ? "rgba(255,71,87,0.3)" : "rgba(255,255,255,0.05)"; ctx.fill();
+      ctx.strokeStyle = rate ? "#ff4757" : "rgba(255,255,255,0.14)"; ctx.lineWidth = rate ? 3 : 1.5; ctx.stroke();
+      ctx.fillStyle = rate ? "#ff4757" : "rgba(255,255,255,0.35)";
+      ctx.beginPath(); ctx.arc(x + t / 2, y + t / 2 + 3, t * 0.22, 0, Math.PI * 2); ctx.fill();
+      ctx.lineWidth = 3; ctx.strokeStyle = ctx.fillStyle;
+      ctx.beginPath(); ctx.moveTo(x + t / 2 + 8, y + t * 0.3); ctx.lineTo(x + t / 2 + 16, y + t * 0.18); ctx.stroke();
+    } else {
+      ctx.fillStyle = "rgba(120,140,255,0.10)"; ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,0.10)"; ctx.lineWidth = 1.5; ctx.stroke();
+    }
+  }
+
+  const px = 566, py = 92, pw = 384, ph = 362;
+  cadre(ctx, px, py, pw, ph);
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("GRILLE", px + 28, py + 44);
+  ctx.fillStyle = P.texte; ctx.font = f(28, true);
+  ctx.fillText(`${mines} mines · ${ouvertes.length} ouverte${ouvertes.length > 1 ? "s" : ""}`, px + 28, py + 82);
+  ctx.strokeStyle = "rgba(255,255,255,0.08)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(px + 28, py + 104); ctx.lineTo(px + pw - 28, py + 104); ctx.stroke();
+
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("MULTIPLICATEUR", px + 28, py + 138);
+  ctx.fillStyle = saute ? "#ff4757" : P.orClair; ctx.font = f(46, true);
+  ctx.fillText(`×${mult.toFixed(2)}`, px + 28, py + 190);
+  ctx.fillStyle = P.faible; ctx.font = f(15);
+  ctx.fillText(`soit ${nb(Math.floor(mise * mult))} si tu encaisses`, px + 28, py + 218);
+
+  if (termine) verdict(ctx, px + 28, py + 288, pw - 56, !saute, saute ? mise : gain,
+    saute ? "Une mine de trop…" : "Encaissé au bon moment.");
+  else { ctx.fillStyle = "rgba(255,255,255,0.35)"; ctx.font = `italic ${f(15)}`;
+    ctx.fillText("Ouvre encore, ou encaisse.", px + 28, py + 296); }
+  pied(ctx, L, H, solde);
+  return c.toBuffer("image/png");
+}
+
+/* ========================================================================== */
+/*                                 DÉS                                        */
+/* ========================================================================== */
+
+function renderDice({ tirage, seuil, dessus, chance, mult, mise, gain, joueur, solde , avatar}) {
+  if (!PRET) return null;
+  const L = 1000, H = 460;
+  const { c, ctx } = scene(L, H);
+  entete(ctx, L, "DES", joueur, mise, avatar);
+  const gagne = gain > 0;
+
+  const bx = 60, bw = 460, by = 210;
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("1", bx, by + 46); ctx.textAlign = "right";
+  ctx.fillText("100", bx + bw, by + 46); ctx.textAlign = "left";
+
+  arrondi(ctx, bx, by, bw, 16, 8);
+  ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fill();
+  const coupe = bx + (bw * seuil) / 100;
+  arrondi(ctx, dessus ? coupe : bx, by, dessus ? bx + bw - coupe : coupe - bx, 16, 8);
+  ctx.fillStyle = "rgba(61,220,132,0.45)"; ctx.fill();
+
+  ctx.strokeStyle = P.orClair; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(coupe, by - 12); ctx.lineTo(coupe, by + 28); ctx.stroke();
+  ctx.fillStyle = P.orClair; ctx.font = f(14, true); ctx.textAlign = "center";
+  ctx.fillText(String(seuil), coupe, by - 20);
+
+  const tx = bx + (bw * (tirage - 1)) / 99;
+  ctx.save(); ctx.shadowColor = gagne ? P.vertClair : "#ff4757"; ctx.shadowBlur = 20;
+  ctx.beginPath(); ctx.arc(tx, by + 8, 15, 0, Math.PI * 2);
+  ctx.fillStyle = gagne ? P.vertClair : "#ff4757"; ctx.fill(); ctx.restore();
+  ctx.fillStyle = P.texte; ctx.font = f(60, true);
+  ctx.fillText(String(tirage), bx + bw / 2, by - 70);
+  ctx.fillStyle = P.faible; ctx.font = f(14);
+  ctx.fillText(dessus ? `plus haut que ${seuil}` : `plus bas que ${seuil}`, bx + bw / 2, by - 40);
+  ctx.textAlign = "left";
+
+  const px = 566, py = 92, pw = 384, ph = 300;
+  cadre(ctx, px, py, pw, ph);
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("CHANCE", px + 28, py + 44);
+  ctx.fillStyle = P.texte; ctx.font = f(34, true);
+  ctx.fillText(`${Math.round(chance * 100)} %`, px + 28, py + 84);
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("GAIN", px + 210, py + 44);
+  ctx.fillStyle = P.orClair; ctx.font = f(34, true);
+  ctx.fillText(`×${mult.toFixed(2)}`, px + 210, py + 84);
+  ctx.strokeStyle = "rgba(255,255,255,0.08)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(px + 28, py + 108); ctx.lineTo(px + pw - 28, py + 108); ctx.stroke();
+
+  verdict(ctx, px + 28, py + 190, pw - 56, gagne, gagne ? gain : mise,
+    gagne ? "Le dé est de ton côté." : "Le dé en a décidé autrement.");
+  pied(ctx, L, H, solde);
+  return c.toBuffer("image/png");
+}
+
+/* ========================================================================== */
+/*                            PILE OU FACE                                    */
+/* ========================================================================== */
+
+function renderFlip({ sortie, choix, mise, gain, joueur, solde , avatar}) {
+  if (!PRET) return null;
+  const L = 1000, H = 440;
+  const { c, ctx } = scene(L, H);
+  entete(ctx, L, "PILE OU FACE", joueur, mise, avatar);
+  const gagne = gain > 0;
+
+  const cx = 270, cy = 260, R = 100;
+  ctx.save(); ctx.shadowColor = "rgba(0,0,0,0.5)"; ctx.shadowBlur = 26;
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  const met = ctx.createLinearGradient(cx - R, cy - R, cx + R, cy + R);
+  met.addColorStop(0, "#f5d76e"); met.addColorStop(0.5, "#c9a227"); met.addColorStop(1, "#f5d76e");
+  ctx.fillStyle = met; ctx.fill(); ctx.restore();
+  ctx.beginPath(); ctx.arc(cx, cy, R - 12, 0, Math.PI * 2);
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 3; ctx.stroke();
+
+  ctx.fillStyle = "#3a2a00"; ctx.textAlign = "center";
+  if (sortie === "pile") {
+    ctx.font = f(56, true); ctx.fillText("N", cx, cy + 20);
+  } else {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - 44); ctx.lineTo(cx - 34, cy - 8); ctx.lineTo(cx - 22, cy + 40);
+    ctx.lineTo(cx + 22, cy + 40); ctx.lineTo(cx + 34, cy - 8);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.fillStyle = P.texte; ctx.font = f(26, true);
+  ctx.fillText(sortie === "pile" ? "PILE" : "FACE", cx, cy + R + 46);
+  ctx.textAlign = "left";
+
+  const px = 566, py = 92, pw = 384, ph = 280;
+  cadre(ctx, px, py, pw, ph);
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("TON CHOIX", px + 28, py + 44);
+  ctx.fillStyle = P.texte; ctx.font = f(34, true);
+  ctx.fillText(propre(choix).toUpperCase(), px + 28, py + 86);
+  ctx.strokeStyle = "rgba(255,255,255,0.08)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(px + 28, py + 110); ctx.lineTo(px + pw - 28, py + 110); ctx.stroke();
+  ctx.fillStyle = P.faible; ctx.font = f(14);
+  ctx.fillText("Gain ×1,96 — la pièce est équilibrée", px + 28, py + 140);
+
+  verdict(ctx, px + 28, py + 200, pw - 56, gagne, gagne ? gain : mise,
+    gagne ? "Bien vu." : "Raté d'un côté.");
+  pied(ctx, L, H, solde);
+  return c.toBuffer("image/png");
+}
+
+/* ========================================================================== */
+/*                  9 - ARRIERE-SALLE : ACTIVITES ILLEGALES                   */
 /* ========================================================================== */
 
 // crime.js — le quartier illégal. Réussi, tu gardes tout.
@@ -3117,7 +3777,7 @@ async function blockedByDebt(guildId, userId) {
 }
 
 /* ========================================================================== */
-/*                                 9 - CASINO                                 */
+/*                                10 - CASINO                                 */
 /* ========================================================================== */
 
 // casino.js — le casino : jeux réels, probabilités et gains calculés.
@@ -3212,6 +3872,62 @@ async function payout(i, bet, amount, gameLabel) {
 }
 
 const money = (c, n) => `${c} ${num(n)}`;
+
+/**
+ * Attache l'image du jeu au message. Si le dessin est indisponible ou
+ * échoue, on renvoie le message texte tel quel : la partie continue.
+ */
+async function avecImage(i, payload, dessiner) {
+  if (!renderReady()) return payload;
+  try {
+    const avatar = await chargerAvatar(i.user.displayAvatarURL?.({ extension: "png", size: 128 }));
+    const buffer = dessiner(avatar);
+    if (!buffer) return payload;
+    const nom = `0x-${Date.now()}.png`;
+    const e = payload.embeds?.[0];
+    if (e?.setImage) e.setImage(`attachment://${nom}`);
+    return { ...payload, files: [{ attachment: buffer, name: nom }], attachments: [] };
+  } catch (err) {
+    console.error("[casino] image :", err.message);
+    return payload;
+  }
+}
+
+/** Ce qui identifie le joueur sur l'image. */
+const carteJoueur = (i) => ({ joueur: i.member?.displayName ?? i.user.username });
+
+/** Envoie une grille de démineur avec son image. */
+async function envoyerMines(i, st, currency, reply, done = false, blown = false) {
+  const vue = minesView(i.guild, st, currency, done, blown);
+  if (!vue._mn) return reply(vue);
+  const { mult } = vue._mn;
+  delete vue._mn;
+  const solde = (await getWallet(i.guildId, i.user.id)).coins;
+  return reply(await avecImage(i, vue, (avatar) => renderMines({
+    ...carteJoueur(i), avatar,
+    bombes: st.bombs, ouvertes: st.found, mines: st.mines, mult,
+    mise: st.bet, gain: Math.floor(st.bet * mult), solde,
+    termine: done, saute: blown, derniere: st.last ?? null,
+  })));
+}
+
+/** Envoie une main de blackjack avec son image. */
+async function envoyerBlackjack(i, st, currency, reply, done = false, verdict = null) {
+  const vue = blackjackView(i.guild, st, currency, done, verdict);
+  if (!vue._bj) return reply(vue);
+  const { pv, dv } = vue._bj;
+  delete vue._bj;
+  // Le solde est lu avant le dessin : la fonction de rendu est synchrone.
+  const solde = (await getWallet(i.guildId, i.user.id)).coins;
+  return reply(await avecImage(i, vue, (avatar) => renderBlackjack({
+    ...carteJoueur(i), avatar,
+    joueurCartes: st.player, croupierCartes: st.dealer,
+    valeurJoueur: pv, valeurCroupier: dv, cacher: !done, termine: done,
+    texte: done ? (verdict?.text ?? "") : "À toi de jouer",
+    mise: st.bet, gain: done ? (verdict?.win ?? 0) + st.bet : 0,
+    solde,
+  })));
+}
 
 /* ========================================================================== */
 /*                                 HALL                                       */
@@ -3357,6 +4073,20 @@ const showHand = (hand, hideSecond = false) =>
 
 function blackjackView(guild, st, currency, done = false, verdict = null) {
   const pv = handValue(st.player), dv = handValue(st.dealer);
+  if (renderReady()) {
+    return {
+      embeds: [embed({ guild, author: { name: "🃏  Blackjack" },
+        color: done ? (verdict?.win > 0 ? COLORS.success : verdict?.win === 0 ? COLORS.warning : COLORS.danger) : COLORS.gold })],
+      components: done
+        ? [crow(cb("cas:pick:blackjack", "Rejouer", ButtonStyle.Success, "🔁"), cb("cas:lobby", "Casino", ButtonStyle.Secondary, "🎰"))]
+        : [crow(
+            cb("cas:bj:hit", "Tirer", ButtonStyle.Primary, "➕"),
+            cb("cas:bj:stand", "Rester", ButtonStyle.Success, "✋"),
+            cb("cas:bj:double", "Doubler", ButtonStyle.Danger, "✖️", st.player.length !== 2 || !st.canDouble),
+          )],
+      _bj: { done, verdict, pv, dv },
+    };
+  }
   return {
     embeds: [embed({
       guild, color: done ? (verdict?.win > 0 ? COLORS.success : verdict?.win === 0 ? COLORS.warning : COLORS.danger) : COLORS.gold,
@@ -3421,6 +4151,29 @@ function minesMultiplier(m, k) {
 
 function minesView(guild, st, currency, done = false, blown = false) {
   const mult = minesMultiplier(st.mines, st.found.length);
+  if (renderReady()) {
+    const rows = [];
+    if (!done) {
+      for (let r = 0; r < 5; r++) {
+        rows.push(crow(...Array.from({ length: 5 }, (_, cIdx) => {
+          const n = r * 5 + cIdx;
+          const opened = st.found.includes(n);
+          return cb(`cas:mn:${n}`, "", opened ? ButtonStyle.Success : ButtonStyle.Secondary,
+            opened ? "💚" : "🟦", opened);
+        })));
+      }
+    }
+    return {
+      embeds: [embed({ guild, author: { name: "💣  Démineur" },
+        color: done ? (blown ? COLORS.danger : COLORS.success) : COLORS.gold })],
+      components: done
+        ? [crow(cb("cas:pick:mines", "Rejouer", ButtonStyle.Success, "🔁"), cb("cas:lobby", "Casino", ButtonStyle.Secondary, "🎰"))]
+        : [...rows.slice(0, 4), crow(
+            cb("cas:mn:cash", `Encaisser ${num(Math.floor(st.bet * mult))}`, ButtonStyle.Success, "💰", st.found.length === 0),
+            cb("cas:lobby", "Abandonner", ButtonStyle.Danger, "🏳️"))],
+      _mn: { done, blown, mult },
+    };
+  }
   const grid = [];
   for (let n = 0; n < GRID; n++) {
     if (st.found.includes(n)) grid.push("💚");
@@ -3555,7 +4308,7 @@ async function handleCasino(i) {
       st.canDouble = false;
       if (handValue(st.player) >= 21) return finishBlackjack(i, st, currency, reply);
       setSession(i, st);
-      return reply(blackjackView(i.guild, st, currency));
+      return envoyerBlackjack(i, st, currency, reply);
     }
     if (sub === "stand") return finishBlackjack(i, st, currency, reply);
   }
@@ -3579,10 +4332,10 @@ async function handleCasino(i) {
     }
     const solde = await payout(i, st.bet, win, "Roulette");
     endSession(i);
-    return reply({
+    const vue = {
       embeds: [embed({ guild: i.guild, color: win ? COLORS.success : COLORS.danger,
         author: { name: "🔴  Roulette" },
-        description: [
+        description: renderReady() ? undefined : [
           `## ${numColor(n)} ${n}`,
           `Pari : **${label}**`,
           "",
@@ -3590,7 +4343,9 @@ async function handleCasino(i) {
           `Solde : **${money(currency, solde)}**`,
         ].join("\n") })],
       components: [crow(cb("cas:pick:roulette", "Rejouer", ButtonStyle.Success, "🔁"), cb("cas:lobby", "Casino", ButtonStyle.Secondary, "🎰"))],
-    });
+    };
+    return reply(await avecImage(i, vue, (avatar) => renderRoulette({
+      ...carteJoueur(i), avatar, numero: n, pari: label, mise: st.bet, gain: win, solde })));
   }
 
   if (action === "rlnum") {
@@ -3608,35 +4363,39 @@ async function handleCasino(i) {
     if (!st || st.game !== "mines") return reply({ content: "Partie expirée.", embeds: [], components: [] });
     const sub = parts[2];
 
+    /** Termine la partie en affichant la grille, image ou texte. */
+    const fin = async (saute, complement) => {
+      const view = minesView(i.guild, st, currency, true, saute);
+      if (view._mn) return envoyerMines(i, st, currency, reply, true, saute);
+      if (complement) view.embeds[0].data.description += complement;
+      return reply(view);
+    };
+
     if (sub === "cash") {
       const mult = minesMultiplier(st.mines, st.found.length);
       const gain = Math.floor(st.bet * mult);
       const solde = await payout(i, st.bet, gain, "Démineur");
       endSession(i);
-      const view = minesView(i.guild, st, currency, true, false);
-      view.embeds[0].data.description += `\nGain : **${money(currency, gain)}** · solde **${money(currency, solde)}**`;
-      return reply(view);
+      return fin(false, `\nGain : **${money(currency, gain)}** · solde **${money(currency, solde)}**`);
     }
 
     const n = Number(sub);
-    if (st.found.includes(n)) return reply(minesView(i.guild, st, currency));
+    if (st.found.includes(n)) return envoyerMines(i, st, currency, reply);
     if (st.bombs.includes(n)) {
       st.last = n;
       endSession(i);
       await payout(i, st.bet, 0, "Démineur");
-      return reply(minesView(i.guild, st, currency, true, true));
+      return fin(true);
     }
     st.found.push(n);
     if (st.found.length >= GRID - st.mines) {
       const gain = Math.floor(st.bet * minesMultiplier(st.mines, st.found.length));
       await payout(i, st.bet, gain, "Démineur");
       endSession(i);
-      const view = minesView(i.guild, st, currency, true, false);
-      view.embeds[0].data.description += `\n### Grille entière ! **${money(currency, gain)}**`;
-      return reply(view);
+      return fin(false, `\n### Grille entière ! **${money(currency, gain)}**`);
     }
     setSession(i, st);
-    return reply(minesView(i.guild, st, currency));
+    return envoyerMines(i, st, currency, reply);
   }
 
   /* ------------------------------- dés --------------------------------- */
@@ -3650,10 +4409,10 @@ async function handleCasino(i) {
     const gain = gagne ? Math.floor(st.bet * mult) : 0;
     const solde = await payout(i, st.bet, gain, "Dés");
     endSession(i);
-    return reply({
+    const vueD = {
       embeds: [embed({ guild: i.guild, color: gagne ? COLORS.success : COLORS.danger,
         author: { name: "🎲  Dés" },
-        description: [
+        description: renderReady() ? undefined : [
           `## ${roll}`,
           `Pari : **${over ? "plus haut que" : "plus bas que"} ${st.target}** · ${(chance * 100).toFixed(0)} % de chance · ×${mult.toFixed(2)}`,
           "",
@@ -3661,7 +4420,9 @@ async function handleCasino(i) {
           `Solde : **${money(currency, solde)}**`,
         ].join("\n") })],
       components: [crow(cb("cas:pick:dice", "Rejouer", ButtonStyle.Success, "🔁"), cb("cas:lobby", "Casino", ButtonStyle.Secondary, "🎰"))],
-    });
+    };
+    return reply(await avecImage(i, vueD, (avatar) => renderDice({
+      ...carteJoueur(i), avatar, tirage: roll, seuil: st.target, dessus: over, chance, mult, mise: st.bet, gain, solde })));
   }
 
   if (action === "dctarget") {
@@ -3681,10 +4442,10 @@ async function handleCasino(i) {
     const gain = gagne ? Math.floor(st.bet * 1.96) : 0;
     const solde = await payout(i, st.bet, gain, "Pile ou face");
     endSession(i);
-    return reply({
+    const vueF = {
       embeds: [embed({ guild: i.guild, color: gagne ? COLORS.success : COLORS.danger,
         author: { name: "🪙  Pile ou face" },
-        description: [
+        description: renderReady() ? undefined : [
           `## ${sortie === "pile" ? "🪙 Pile" : "👑 Face"}`,
           `Ton choix : **${choix}**`,
           "",
@@ -3692,7 +4453,9 @@ async function handleCasino(i) {
           `Solde : **${money(currency, solde)}**`,
         ].join("\n") })],
       components: [crow(cb("cas:pick:flip", "Rejouer", ButtonStyle.Success, "🔁"), cb("cas:lobby", "Casino", ButtonStyle.Secondary, "🎰"))],
-    });
+    };
+    return reply(await avecImage(i, vueF, (avatar) => renderFlip({
+      ...carteJoueur(i), avatar, sortie, choix, mise: st.bet, gain, solde })));
   }
 }
 
@@ -3744,7 +4507,7 @@ async function startGame(i, game, bet, reply) {
 
     const solde = await payout(i, bet, gain, "Machine à sous");
     setSession(i, { game: "slots", bet });
-    return reply({
+    const vueS = {
       embeds: [embed({ guild: i.guild, color: gain ? COLORS.success : COLORS.danger,
         author: { name: "🎰  Machine à sous" },
         description: [
@@ -3762,7 +4525,13 @@ async function startGame(i, game, bet, reply) {
       components: [crow(cb("cas:sl", `Relancer (${num(bet)})`, ButtonStyle.Success, "🔁"),
         cb("cas:pick:slots", "Changer de mise", ButtonStyle.Secondary, "✏️"),
         cb("cas:lobby", "Casino", ButtonStyle.Secondary, "🎰"))],
-    });
+    };
+    const motSym = MOT_SYMBOLE[r.reels[0].s] ?? "symboles";
+    const libelleImage = r.mult >= 5 ? `Trois ${motSym} !`
+      : r.mult > 0 ? `Paire de ${motSym}` : "Aucune combinaison";
+    return reply(await avecImage(i, vueS, (avatar) => renderSlots({
+      ...carteJoueur(i), avatar, reels: r.reels.map((x) => x.s), mult: r.mult,
+      libelle: libelleImage, mise: bet, gain, solde })));
   }
 
   /* -------------------------- blackjack -------------------------------- */
@@ -3772,7 +4541,7 @@ async function startGame(i, game, bet, reply) {
       player: [deck.pop(), deck.pop()], dealer: [deck.pop(), deck.pop()] };
     if (handValue(st.player) === 21) { setSession(i, st); return finishBlackjack(i, st, currency, reply, true); }
     setSession(i, st);
-    return reply(blackjackView(i.guild, st, currency));
+    return envoyerBlackjack(i, st, currency, reply);
   }
 
   /* --------------------------- roulette -------------------------------- */
@@ -3866,9 +4635,11 @@ async function finishBlackjack(i, st, currency, reply, natural = false) {
   else if (pv === dv) { win = st.bet; text = "Égalité — mise rendue"; }
   else { win = 0; text = `${pv} contre ${dv} — perdu`; }
 
-  const solde = await payout(i, st.bet, win, "Blackjack");
+  await payout(i, st.bet, win, "Blackjack");
+  const solde = (await getWallet(i.guildId, i.user.id)).coins;
   endSession(i);
   const view = blackjackView(i.guild, st, currency, true, { win: win - st.bet, text });
+  if (view._bj) return envoyerBlackjack(i, st, currency, reply, true, { win: win - st.bet, text });
   view.embeds[0].data.description += `\nSolde : **${money(currency, solde)}**`;
   return reply(view);
 }
@@ -3920,11 +4691,12 @@ async function startMines(i, mines) {
   }
   const state = { game: "mines", bet: st.bet, mines, bombs, found: [] };
   setSession(i, state);
-  return i.update(minesView(i.guild, state, config.economy.currency)).catch(() => null);
+  const reply = async (p) => (i.replied || i.deferred ? i.editReply(p) : i.update(p).catch(() => null));
+  return envoyerMines(i, state, config.economy.currency, reply).catch(() => null);
 }
 
 /* ========================================================================== */
-/*                            10 - PURGE DE MASSE                             */
+/*                            11 - PURGE DE MASSE                             */
 /* ========================================================================== */
 
 // masspurge.js — purge de masse : plusieurs salons d'un coup, sans les supprimer.
@@ -4082,7 +4854,7 @@ function previewEmbed(guild, plan, label) {
 }
 
 /* ========================================================================== */
-/*                          11 - VOCAUX TEMPORAIRES                           */
+/*                          12 - VOCAUX TEMPORAIRES                           */
 /* ========================================================================== */
 
 // tempvoice.js — « Créer ton vocal » : salons vocaux temporaires.
@@ -4414,7 +5186,7 @@ async function handleTempVoiceModal(i) {
 }
 
 /* ========================================================================== */
-/*                          12 - RECOMPENSES VOCALES                          */
+/*                          13 - RECOMPENSES VOCALES                          */
 /* ========================================================================== */
 
 // voice.js — récompenses vocales : XP et coins gagnés en restant en vocal.
@@ -4508,7 +5280,7 @@ function voiceSummary(config) {
 }
 
 /* ========================================================================== */
-/*                            13 - MENUS DE ROLES                             */
+/*                            14 - MENUS DE ROLES                             */
 /* ========================================================================== */
 
 // rolemenus.js — panneaux de rôles à choisir soi-même, groupés par catégorie.
@@ -4740,7 +5512,7 @@ async function handleRoleMenuSelect(i) {
 }
 
 /* ========================================================================== */
-/*                                14 - GRADES                                 */
+/*                                15 - GRADES                                 */
 /* ========================================================================== */
 
 // ranks.js — grades gagnés à l'heure de vocal et au message.
@@ -4934,7 +5706,7 @@ function ladderEmbed(guild, config, stats = null) {
 }
 
 /* ========================================================================== */
-/*                      15 - CREATEUR D EMBED ET PALETTE                      */
+/*                      16 - CREATEUR D EMBED ET PALETTE                      */
 /* ========================================================================== */
 
 // embedbuilder.js — créateur d'embed et palette de couleurs du serveur.
@@ -5058,7 +5830,7 @@ async function sendDraft(guild, channel, d) {
 }
 
 /* ========================================================================== */
-/*                   16 - INVITATIONS ET ROLE DE CONFIANCE                    */
+/*                   17 - INVITATIONS ET ROLE DE CONFIANCE                    */
 /* ========================================================================== */
 
 // invites.js — suivi des invitations et rôle de confiance « Like ».
@@ -5288,7 +6060,7 @@ function isTrusted(member, config) {
 }
 
 /* ========================================================================== */
-/*                      17 - ACTIONS, ARTICLES, ESCALADE                      */
+/*                      18 - ACTIONS, ARTICLES, ESCALADE                      */
 /* ========================================================================== */
 
 // actions.js — la logique métier, appelable depuis n'importe quelle interface.
@@ -5712,7 +6484,7 @@ async function actionGrantCoins(guild, target, amount, moderator, reason) {
 }
 
 /* ========================================================================== */
-/*                          18 - COMMANDES A PREFIXE                          */
+/*                          19 - COMMANDES A PREFIXE                          */
 /* ========================================================================== */
 
 // prefix.js — commandes à préfixe. Le caractère et la liste se règlent au panneau.
@@ -6018,7 +6790,7 @@ async function handlePrefix(message, config) {
 }
 
 /* ========================================================================== */
-/*                 19 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
+/*                 20 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
 /* ========================================================================== */
 
 // coinsspace.js — remplissage complet de la catégorie ESPACE COINS.
@@ -6287,7 +7059,7 @@ async function setupCoinsSpace(guild, memberPanelFactory) {
 }
 
 /* ========================================================================== */
-/*                20 - AFFECTATION ET VERIFICATION DES SALONS                 */
+/*                21 - AFFECTATION ET VERIFICATION DES SALONS                 */
 /* ========================================================================== */
 
 // destinations.js — la table d'affectation : quel panneau, quelle fonction, quel salon.
@@ -6601,7 +7373,7 @@ function summarizeIssues(results) {
 }
 
 /* ========================================================================== */
-/*                       21 - INSTALLATION AUTOMATIQUE                        */
+/*                       22 - INSTALLATION AUTOMATIQUE                        */
 /* ========================================================================== */
 
 // setup.js — installation automatique. Un bouton, tout est branché.
@@ -6868,7 +7640,7 @@ function setupReport(guild, result) {
 }
 
 /* ========================================================================== */
-/*             22 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
+/*             23 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
 /* ========================================================================== */
 
 // panel.js — l'interface complète. Tout réglage du bot est atteignable ici.
@@ -10410,7 +11182,7 @@ async function handlePublic(i, parts, config) {
 }
 
 /* ========================================================================== */
-/*                    23 - COMMANDES ET MENUS CONTEXTUELS                     */
+/*                    24 - COMMANDES ET MENUS CONTEXTUELS                     */
 /* ========================================================================== */
 
 // commands.js — trois commandes seulement. Tout le reste passe par /panel.
@@ -10617,7 +11389,7 @@ const contextMenus = [
 ];
 
 /* ========================================================================== */
-/*                     24 - CLIENT, EVENEMENTS, DEMARRAGE                     */
+/*                     25 - CLIENT, EVENEMENTS, DEMARRAGE                     */
 /* ========================================================================== */
 
 // index.js — client, événements, démarrage.
