@@ -8816,11 +8816,22 @@ async function handlePrefix(message, config) {
   const pMusique = config.musique?.prefixe || "+";
   const p = conf.char || "!";
 
-  // Deux préfixes cohabitent : « ! » pour tout, « + » réservé au lecteur.
+  // Deux préfixes cohabitent : général pour tout, musique réservé au lecteur.
+  // S'ils sont identiques, les deux familles de commandes sont acceptées.
   let prefixeUtilise = null;
   let musiqueSeule = false;
-  if (message.content.startsWith(pMusique)) { prefixeUtilise = pMusique; musiqueSeule = true; }
-  else if (conf.enabled && message.content.startsWith(p)) { prefixeUtilise = p; }
+  const startsMus = message.content.startsWith(pMusique);
+  const startsGen = conf.enabled !== false && message.content.startsWith(p);
+
+  if (startsMus && startsGen && pMusique === p) {
+    prefixeUtilise = p;
+    musiqueSeule = false;
+  } else if (startsMus) {
+    prefixeUtilise = pMusique;
+    musiqueSeule = true;
+  } else if (startsGen) {
+    prefixeUtilise = p;
+  }
   if (!prefixeUtilise) return false;
 
   const parts = message.content.slice(prefixeUtilise.length).trim().split(/\s+/);
