@@ -4329,37 +4329,51 @@ async function suivant(guild) {
       ] }));
   } catch (e) {
     const detail = String(e?.message ?? e ?? "erreur inconnue").slice(0, 120);
-    console.error("[musique] lecture :", detail);
+    console.error("[musique] lecture :", detail, "source=", piste.source);
 
-    // YouTube a échoué (429, bot-check, etc.) → repli SoundCloud systématique
-    if (piste.source === "youtube") {
-      const repli = await replSoundcloud(piste.titre, piste.demandePar);
+    // Une seule tentative de repli par piste (évite une boucle infinie)
+    if (!piste._repliTente) {
+      let repli = null;
+      let label = null;
+
+      if (piste.source === "youtube") {
+        repli = await replSoundcloud(piste.titre, piste.demandePar);
+        label = "SoundCloud";
+      } else if (piste.source === "soundcloud" && PLAY) {
+        // SoundCloud en 404 / indispo → on tente YouTube
+        try {
+          const r = await PLAY.search(piste.titre, { limit: 1, source: { youtube: "video" } });
+          if (r.length) {
+            repli = { titre: r[0].title.slice(0, 90), url: r[0].url,
+              duree: r[0].durationInSec, source: "youtube", demandePar: piste.demandePar };
+            label = "YouTube";
+          }
+        } catch (err) {
+          console.error("[musique] repli YT :", err?.message ?? err);
+        }
+      }
+
       if (repli) {
+        repli._repliTente = true;
         await annoncer(guild, embed({ guild, color: COLORS.warning,
-          author: { name: "🔁  Repli sur SoundCloud" },
-          description: `YouTube a refusé **${piste.titre}**${estBlocageYoutube(e) ? " (blocage hébergeur)" : ""}.\nJe le rejoue depuis SoundCloud.` }));
+          author: { name: `🔁  Repli sur ${label}` },
+          description: `**${piste.titre}** inaccessible (\`${detail}\`).\nNouvelle tentative via **${label}**.` }));
         etat.file.unshift(repli);
         return suivant(guild);
       }
-      await annoncer(guild, embed({ guild, color: COLORS.danger,
-        author: { name: "🚫  YouTube bloque le serveur" },
-        description: [
-          `**${piste.titre}**`,
-          `\`${detail}\``,
-          "",
-          "YouTube refuse souvent les IP d'hébergeurs (Railway, etc.).",
-          "",
-          "**Solutions :**",
-          "• Coller un lien **SoundCloud** ou un `.mp3` / webradio",
-          "• Ajouter la variable Railway **`YT_COOKIE`** (cookie d'un compte Google jetable)",
-          "• Optionnel : **`SOUNDCLOUD_ID`** si le repli SoundCloud échoue aussi",
-        ].join("\n") }));
-      return suivant(guild);
     }
 
+    const bloquéYt = piste.source === "youtube" && estBlocageYoutube(e);
     await annoncer(guild, embed({ guild, color: COLORS.danger,
-      author: { name: `${ICONS.no}  Impossible de lire` },
-      description: `**${piste.titre}**\n\`${detail}\`` }));
+      author: { name: bloquéYt ? "🚫  YouTube bloque le serveur" : `${ICONS.no}  Impossible de lire` },
+      description: [
+        `**${piste.titre}**`,
+        `\`${detail}\``,
+        "",
+        bloquéYt
+          ? "YouTube refuse souvent les IP d'hébergeurs (Railway).\nAjoute **`YT_COOKIE`** sur Railway, ou colle un lien SoundCloud / `.mp3`."
+          : "Aucune source audio n'a pu lire ce titre.\nEssaie un **autre nom**, un lien **SoundCloud**, ou un **`.mp3`**.",
+      ].join("\n") }));
     return suivant(guild);
   }
 }
