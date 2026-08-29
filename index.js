@@ -26,6 +26,10 @@
 //     chaque commande s'ouvre, se ferme et change de niveau requis.
 //     Les niveaux de perm s'appliquent comme au panneau.
 //
+//   BIENVENUE, PROMOTIONS, SANCTIONS ET ARRIERE-SALLE EN IMAGE
+//     Carte de bienvenue a chaque arrivee, carte de montee de grade,
+//     carte de sanction jointe au journal, resultat des coups illegaux.
+//
 //   BOUTIQUE, CLASSEMENTS ET PROFIL EN IMAGE
 //     Boutique : une vignette par article, prix, et ce qui est achetable.
 //     Classements : podium avec les avatars des trois premiers.
@@ -2312,738 +2316,7 @@ function auditChannels(guild) {
 }
 
 /* ========================================================================== */
-/*            8 - TICKETS, GIVEAWAYS, COMPTEURS, PANNEAUX PUBLICS             */
-/* ========================================================================== */
-
-// features.js — tickets, giveaways, compteurs vocaux, panneaux publics.
-
-
-/* ========================================================================== */
-/*                            LOG CENTRALISÉ                                  */
-/* ========================================================================== */
-
-async function log(guild, routeKey, e) {
-  try {
-    if (isSuspended(guild.id)) return;
-    const config = await getConfig(guild.id);
-    if (!config.logsEnabled) return;
-    const channel = resolveLogChannel(guild, routeKey, config);
-    if (!channel || !canSend(channel)) return;
-    await channel.send({ embeds: [e] });
-  } catch (err) {
-    console.error(`[log:${routeKey}]`, err.message);
-  }
-}
-
-/* ========================================================================== */
-/*                            COMPTEURS VOCAUX                                */
-/* ========================================================================== */
-
-/**
- * Met à jour les salons compteurs (vocaux verrouillés).
- *  - Membres   : humains uniquement, bots exclus
- *  - Connectés : humains non hors-ligne
- *  - Vocal     : humains actuellement en vocal, tous salons confondus
- * Les valeurs indisponibles ne sont jamais écrites (on ne remplace pas par 0).
- */
-async function computeCounts(guild) {
-  // Bots : fiables en cache (peu nombreux, reçus au démarrage).
-  const cachedBots = guild.members.cache.filter((m) => m.user.bot).size;
-  const members = Math.max(0, guild.memberCount - cachedBots);
-
-  // Vocal : on lit les états vocaux, PAS channel.members (qui dépend du cache membres).
-  let voice = 0;
-  for (const vs of guild.voiceStates.cache.values()) {
-    if (!vs.channelId) continue;
-    const m = guild.members.cache.get(vs.id);
-    if (m?.user?.bot) continue;
-    voice++;
-  }
-
-  // Connectés : nécessite l'intent Presence + le cache membres.
-  let online = null;
-  const cacheRatio = guild.memberCount > 0 ? guild.members.cache.size / guild.memberCount : 0;
-  if (cacheRatio > 0.5) {
-    let n = 0;
-    for (const m of guild.members.cache.values()) {
-      if (m.user.bot) continue;
-      if (m.presence && m.presence.status !== "offline") n++;
-    }
-    online = n > 0 ? n : null; // 0 = presences non reçues → on n'écrit rien
-  }
-
-  return { members, online, voice, cacheRatio };
-}
-
-const lastCounterValue = new Map();
-
-/**
- * Discord n'autorise que DEUX renommages par salon et par tranche de 10 minutes.
- * On tient donc un budget : tant qu'il en reste, le compteur réagit à la seconde.
- */
-const renameLog = new Map();   // channelId -> [horodatages]
-
-function renameBudget(channelId) {
-  const now = Date.now();
-  const recent = (renameLog.get(channelId) ?? []).filter((t) => now - t < 600_000);
-  renameLog.set(channelId, recent);
-  return 2 - recent.length;
-}
-
-function noteRename(channelId) {
-  const arr = renameLog.get(channelId) ?? [];
-  arr.push(Date.now());
-  renameLog.set(channelId, arr);
-}
-
-/** Quand le prochain renommage sera possible. */
-function nextRenameIn(channelId) {
-  const arr = (renameLog.get(channelId) ?? []).filter((t) => Date.now() - t < 600_000);
-  if (arr.length < 2) return 0;
-  return Math.max(0, 600_000 - (Date.now() - Math.min(...arr)));
-}
-
-async function updateCounters(guild, force = false) {
-  const config = await getConfig(guild.id);
-  const counts = await computeCounts(guild);
-  const report = [];
-
-  for (const counter of COUNTERS) {
-    const value = counts[counter.key];
-    if (value === null || value === undefined) {
-      report.push({ key: counter.key, status: "indisponible" });
-      continue;
-    }
-
-    // Salon forcé via /config compteur, sinon détection par motif "Nom :"
-    const forced = config.counters?.[counter.key];
-    let channel = forced ? guild.channels.cache.get(forced) : null;
-    if (!channel) {
-      channel = guild.channels.cache.find(
-        (c) => (c.type === ChannelType.GuildVoice || c.type === ChannelType.GuildStageVoice) && counter.test.test(c.name)
-      );
-    }
-    if (!channel) { report.push({ key: counter.key, value, status: "salon introuvable" }); continue; }
-    if (!channel.manageable) { report.push({ key: counter.key, value, status: "permission manquante" }); continue; }
-
-    // On ne remplace que le nombre : emojis, séparateurs et espaces restent intacts.
-    const next = renameWithCount(channel.name, value) ?? counter.template.replace("{n}", num(value));
-    if (channel.name === next) { report.push({ key: counter.key, value, status: "à jour" }); continue; }
-
-    const memoKey = `${guild.id}:${counter.key}`;
-    if (!force && lastCounterValue.get(memoKey) === value) { report.push({ key: counter.key, value, status: "inchangé" }); continue; }
-
-    if (renameBudget(channel.id) <= 0) {
-      const wait = Math.ceil(nextRenameIn(channel.id) / 1000);
-      report.push({ key: counter.key, value, status: `en attente ${wait}s — limite Discord de 2 renommages / 10 min` });
-      continue;
-    }
-
-    // setName peut lever de façon synchrone : le try/catch est indispensable
-    let ok = false;
-    try {
-      await channel.setName(next, "Compteur 0x");
-      ok = true;
-    } catch (e) {
-      report.push({ key: counter.key, value, status: `échec : ${String(e.message).slice(0, 60)}` });
-    }
-    if (ok) { lastCounterValue.set(memoKey, value); noteRename(channel.id); report.push({ key: counter.key, value, status: "mis à jour" }); }
-    await new Promise((r) => setTimeout(r, 600));
-  }
-
-  return { counts, report };
-}
-
-/* ========================================================================== */
-/*                          BOUTIQUE ET DROPS DE COINS                        */
-/* ========================================================================== */
-
-const activeDrops = new Map(); // messageId -> { amount, claimed }
-
-function dropComponents(id) {
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`drop:claim:${id}`).setLabel("Récupérer").setStyle(ButtonStyle.Success).setEmoji("📦")
-  )];
-}
-
-async function launchDrop(guild, channel, amount) {
-  if (!channel || !canSend(channel)) return null;
-  const config = await getConfig(guild.id);
-  const id = Math.random().toString(36).slice(2, 10);
-  const message = await channel.send({
-    embeds: [embed({
-      guild,
-      author: { name: "📦  Colis lâché" },
-      description: `Un colis de **${config.economy.currency} ${num(amount)}** vient de tomber.\nPremier arrivé, premier servi.`,
-      color: COLORS.gold,
-    })],
-    components: dropComponents(id),
-  }).catch(() => null);
-  if (!message) return null;
-  activeDrops.set(id, { amount, claimed: false, guildId: guild.id });
-  setTimeout(() => {
-    const d = activeDrops.get(id);
-    if (d && !d.claimed) {
-      activeDrops.delete(id);
-      message.edit({
-        embeds: [embed({ guild, author: { name: "📦  Colis perdu" }, description: "Personne n'a été assez rapide.", color: COLORS.neutral })],
-        components: [],
-      }).catch(() => null);
-    }
-  }, 120_000);
-  return message;
-}
-
-async function claimDrop(interaction, id) {
-  const drop = activeDrops.get(id);
-  if (!drop || drop.claimed) return interaction.reply({ content: "Ce colis a déjà été récupéré.", ...EPH });
-  drop.claimed = true;
-  activeDrops.delete(id);
-
-  const config = await getConfig(interaction.guild.id);
-  const total = await addCoins(interaction.guild.id, interaction.user.id, drop.amount);
-
-  await interaction.update({
-    embeds: [embed({
-      guild: interaction.guild,
-      author: { name: "📦  Colis récupéré" },
-      description: `${interaction.user} empoche **${config.economy.currency} ${num(drop.amount)}**.`,
-      color: COLORS.success,
-    })],
-    components: [],
-  }).catch(() => null);
-
-  await log(interaction.guild, "coins", embed({
-    guild: interaction.guild,
-    author: { name: "🪙  Colis récupéré" },
-    color: COLORS.gold,
-    fields: [
-      { name: "Membre", value: interaction.user.tag, inline: true },
-      { name: "Montant", value: num(drop.amount), inline: true },
-      { name: "Nouveau solde", value: num(total), inline: true },
-    ],
-  }));
-}
-
-/* ========================================================================== */
-/*                                 TICKETS                                    */
-/* ========================================================================== */
-
-/** Le type, avec les retouches faites depuis le panneau. */
-function ticketKind(config, id) {
-  const base = TICKET_TYPES.find((t) => t.id === id);
-  if (!base) return null;
-  return { ...base, ...(config?.ticketStyle?.[id] ?? {}) };
-}
-
-function ticketPanelComponents(guild, config) {
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId("ticket:pick")
-    .setPlaceholder("Ouvre un ticket — choisis ta catégorie");
-
-  for (const base of TICKET_TYPES) {
-    const t = ticketKind(config, base.id);
-    const option = { label: t.label.slice(0, 100), value: t.id, description: (t.desc ?? "").slice(0, 100) };
-    const e = resolveEmojiRef(guild, t.emoji);
-    if (e) option.emoji = e;
-    menu.addOptions(option);
-  }
-  return [new ActionRowBuilder().addComponents(menu)];
-}
-
-/** Devanture du centre d'aide. */
-function ticketPanel(guild, config) {
-  const lignes = TICKET_TYPES.map((base) => {
-    const t = ticketKind(config, base.id);
-    return `${t.emoji}  **${t.label}**\n　${t.desc ?? ""}`;
-  });
-  return {
-    embeds: [embed({
-      guild, color: COLORS.primary, author: { name: `${ICONS.ticket}  Centre d'aide` },
-      description: [
-        "```",
-        "  ╔═══════════════════════════════╗",
-        "  ║   O U V R I R   U N   T I C K E T   ║",
-        "  ╚═══════════════════════════════╝",
-        "```",
-        "Un salon privé s'ouvre entre toi et l'équipe concernée.",
-        "Personne d'autre n'y a accès.",
-        "",
-        lignes.join("\n\n"),
-      ].join("\n"),
-      footer: "Un seul ticket ouvert à la fois · les ouvertures abusives sont sanctionnées",
-    })],
-    components: ticketPanelComponents(guild, config),
-  };
-}
-
-async function createTicket(interaction, kindId) {
-  const guild = interaction.guild;
-  const config = await getConfig(guild.id);
-  const kind = TICKET_TYPES.find((t) => t.id === kindId);
-  if (!kind) return interaction.editReply("Type de ticket inconnu.");
-
-  const existing = await openTicketOf(guild.id, interaction.user.id, kindId);
-  if (existing && guild.channels.cache.has(existing)) {
-    return interaction.editReply(`Tu as déjà un ticket **${kind.label}** ouvert : <#${existing}>`);
-  }
-
-  const category = await ensureTicketCategory(guild, kind, config);
-  if (!category) {
-    return interaction.editReply(
-      "Impossible de préparer la catégorie de ce ticket. Donne-moi la permission « Gérer les salons »."
-    );
-  }
-
-  const staffRoleId = config.staffRoleId;
-  const overwrites = [
-    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-    {
-      id: interaction.user.id,
-      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks],
-    },
-    {
-      id: guild.members.me.id,
-      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks],
-    },
-  ];
-  if (staffRoleId && guild.roles.cache.has(staffRoleId)) {
-    overwrites.push({
-      id: staffRoleId,
-      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages, PermissionFlagsBits.AttachFiles],
-    });
-  }
-
-  const clean = interaction.user.username.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 20) || "membre";
-  const channel = await guild.channels.create({
-    name: `ticket-${clean}`,
-    type: ChannelType.GuildText,
-    parent: category.id,
-    topic: `${kind.label} — ${interaction.user.tag} (${interaction.user.id})`,
-    permissionOverwrites: overwrites,
-    reason: `Ticket ${kind.label} ouvert par ${interaction.user.tag}`,
-  }).catch((e) => { console.error("[ticket]", e.message); return null; });
-
-  if (!channel) return interaction.editReply("Création impossible — vérifie mes permissions sur la catégorie.");
-
-  await openTicketRow(guild.id, channel.id, interaction.user.id, kindId);
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("ticket:claim").setLabel("Prendre en charge").setStyle(ButtonStyle.Secondary).setEmoji("✋"),
-    new ButtonBuilder().setCustomId("ticket:close").setLabel("Fermer").setStyle(ButtonStyle.Danger).setEmoji("🔒"),
-  );
-
-  await channel.send({
-    content: `${interaction.user}${staffRoleId ? ` <@&${staffRoleId}>` : ""}`,
-    embeds: [embed({
-      title: `${kind.emoji} ${kind.label}`,
-      description: "Explique ta demande en détail (captures, pseudos, liens). Un membre du staff arrive.",
-      color: COLORS.primary,
-      footer: "Merci de rester courtois — les abus de tickets sont sanctionnés.",
-    })],
-    components: [row],
-  }).catch(() => null);
-
-  await interaction.editReply(`Ticket créé : ${channel}`);
-
-  await log(guild, "ticket", embed({
-    title: "Ticket ouvert",
-    color: COLORS.success,
-    fields: [
-      { name: "Membre", value: `${interaction.user.tag} (\`${interaction.user.id}\`)`, inline: true },
-      { name: "Type", value: kind.label, inline: true },
-      { name: "Salon", value: `${channel}`, inline: true },
-    ],
-  }));
-
-  await refreshTicketCounter(guild);
-}
-
-/**
- * Trouve la catégorie du type de ticket, ou la crée.
- * Elle est masquée à @everyone : seul le rôle staff y voit les tickets.
- */
-async function ensureTicketCategory(guild, kind, config) {
-  const known = config.ticketCategories?.[kind.id];
-  if (known) {
-    const existing = guild.channels.cache.get(known);
-    if (existing) return existing;
-  }
-
-  const found = findCategory(guild, kind.categories);
-  if (found) {
-    await updateConfig(guild.id, { ticketCategories: { ...(config.ticketCategories ?? {}), [kind.id]: found.id } });
-    return found;
-  }
-
-  if (!guild.members.me.permissions.has(PermissionFlagsBits.ManageChannels)) return null;
-
-  const overwrites = [
-    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-    { id: guild.members.me.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
-  ];
-  if (config.staffRoleId && guild.roles.cache.has(config.staffRoleId)) {
-    overwrites.push({ id: config.staffRoleId, allow: [
-      PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
-      PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] });
-  }
-
-  const created = await guild.channels.create({
-    name: kind.createName ?? `Tickets ${kind.label}`,
-    type: ChannelType.GuildCategory,
-    permissionOverwrites: overwrites,
-    reason: "Catégorie de tickets créée par 0x",
-  }).catch((e) => { console.error("[tickets] création de catégorie :", e.message); return null; });
-
-  if (created) {
-    await updateConfig(guild.id, { ticketCategories: { ...(config.ticketCategories ?? {}), [kind.id]: created.id } });
-  }
-  return created;
-}
-
-async function refreshTicketCounter(guild) {
-  const config = await getConfig(guild.id);
-  const channel = resolveFuncChannel(guild, "ticketCounter", config);
-  if (!channel || !canSend(channel)) return;
-  const s = await ticketStats(guild.id);
-  const body = embed({
-    title: "Compteur de tickets",
-    color: COLORS.primary,
-    fields: [
-      { name: "Ouverts", value: `${s.open}`, inline: true },
-      { name: "7 derniers jours", value: `${s.week}`, inline: true },
-      { name: "Total", value: `${s.total}`, inline: true },
-    ],
-  });
-  let mine = null;
-  try {
-    const recent = await channel.messages.fetch({ limit: 10 });
-    const list = typeof recent?.find === "function" ? recent : [...(recent?.values?.() ?? [])];
-    mine = list.find((m) => m.author?.id === guild.members.me.id && m.embeds?.length);
-  } catch { mine = null; }
-  if (mine) await mine.edit({ embeds: [body] }).catch(() => channel.send({ embeds: [body] }).catch(() => null));
-  else await channel.send({ embeds: [body] }).catch(() => null);
-}
-
-async function closeTicket(interaction) {
-  const channel = interaction.channel;
-  await closeTicketRow(channel.id, interaction.user.id);
-
-  const messages = await channel.messages.fetch({ limit: 100 }).catch(() => null);
-  const transcript = messages
-    ? [...messages.values()].reverse()
-        .map((m) => `[${new Date(m.createdTimestamp).toLocaleString("fr-FR")}] ${m.author.tag}: ${m.content || "(pièce jointe / embed)"}`)
-        .join("\n").slice(0, 1_900_000)
-    : "";
-
-  await log(interaction.guild, "ticket", embed({
-    title: "Ticket fermé",
-    color: COLORS.danger,
-    fields: [
-      { name: "Salon", value: channel.name, inline: true },
-      { name: "Fermé par", value: interaction.user.tag, inline: true },
-      { name: "Sujet", value: channel.topic ?? "—" },
-    ],
-  }));
-
-  if (transcript) {
-    const config = await getConfig(interaction.guild.id);
-    const logCh = resolveLogChannel(interaction.guild, "ticket", config);
-    if (logCh && canSend(logCh)) {
-      await logCh.send({
-        files: [{ attachment: Buffer.from(transcript, "utf8"), name: `${channel.name}.txt` }],
-      }).catch(() => null);
-    }
-  }
-
-  await refreshTicketCounter(interaction.guild);
-  setTimeout(() => channel.delete("Ticket fermé").catch(() => null), 5000);
-}
-
-/**
- * Relance les tickets laissés sans réponse du staff.
- * @returns {Promise<{reminded:number, details:Array}>}
- */
-async function checkStaleTickets(guild) {
-  const config = await getConfig(guild.id);
-  const conf = config.ticketReminder ?? {};
-  if (!conf.enabled) return { reminded: 0, details: [] };
-
-  const hours = Math.max(1, conf.hours ?? 6);
-  const stale = await staleTickets(guild.id, hours);
-  if (!stale.length) return { reminded: 0, details: [] };
-
-  const details = [];
-  for (const row of stale) {
-    const channel = guild.channels.cache.get(row.channel_id);
-    if (!channel) { await markTicketReminded(row.channel_id); continue; }
-    if (!canSend(channel)) continue;
-
-    const since = new Date(row.last_staff_at ?? row.opened_at);
-    const waited = Math.round((Date.now() - since.getTime()) / 36e5);
-
-    await channel.send({
-      content: config.staffRoleId ? `<@&${config.staffRoleId}>` : undefined,
-      embeds: [embed({
-        guild, color: COLORS.warning, author: { name: "⏰  Ticket sans réponse" },
-        description: `Ouvert par <@${row.user_id}> · aucune réponse du staff depuis **${waited} h**.`,
-        footer: "Ce rappel disparaît dès qu'un membre du staff écrit ici",
-      })],
-    }).catch(() => null);
-
-    await markTicketReminded(row.channel_id);
-    details.push({ channel, waited, userId: row.user_id, kind: row.kind });
-  }
-
-  // Récapitulatif pour l'équipe
-  if (details.length) {
-    const staff = resolveFuncChannel(guild, "staffChat", config);
-    if (staff && canSend(staff)) {
-      await staff.send({ embeds: [embed({
-        guild, color: COLORS.warning, author: { name: `⏰  ${details.length} ticket(s) en attente` },
-        description: details.slice(0, 15).map((d) => `${d.channel} — <@${d.userId}> · **${d.waited} h**`).join("\n"),
-        footer: `Seuil : ${hours} h sans réponse`,
-      })] }).catch(() => null);
-    }
-    await log(guild, "ticket", embed({
-      guild, color: COLORS.warning, author: { name: "⏰  Rappel de tickets" },
-      description: `${details.length} ticket(s) relancé(s) après ${hours} h sans réponse.`,
-    }));
-  }
-
-  return { reminded: details.length, details };
-}
-
-/* ========================================================================== */
-/*                                GIVEAWAYS                                   */
-/* ========================================================================== */
-
-function giveawayComponents(id, count) {
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`gw:join:${id}`).setLabel(`Participer (${count})`).setStyle(ButtonStyle.Success).setEmoji("🎉"),
-    new ButtonBuilder().setCustomId(`gw:leave:${id}`).setLabel("Retirer").setStyle(ButtonStyle.Secondary),
-  )];
-}
-
-function giveawayEmbed(g, count) {
-  return embed({
-    title: `🎉 ${g.prize}`,
-    color: COLORS.gold,
-    description: [
-      `Fin : ${ts(g.ends_at)} (${ts(g.ends_at, "f")})`,
-      `Gagnant(s) : **${g.winners}**`,
-      g.required_role ? `Rôle requis : <@&${g.required_role}>` : null,
-      `Organisé par <@${g.host_id}>`,
-    ].filter(Boolean).join("\n"),
-    footer: `${count} participant(s) · id ${g.id}`,
-  });
-}
-
-async function handleGiveawayButton(interaction, action, id) {
-  const g = await getGiveaway(Number(id));
-  if (!g || g.ended) return interaction.reply({ content: "Ce giveaway est terminé.", ...EPH });
-
-  if (action === "leave") {
-    const removed = await leaveGiveaway(g.id, interaction.user.id);
-    await refreshGiveaway(interaction.client, g);
-    return interaction.reply({ content: removed ? "Participation retirée." : "Tu ne participais pas.", ...EPH });
-  }
-
-  if (g.required_role && !interaction.member.roles.cache.has(g.required_role)) {
-    return interaction.reply({ content: `Il te faut le rôle <@&${g.required_role}> pour participer.`, ...EPH });
-  }
-
-  const added = await enterGiveaway(g.id, interaction.user.id);
-  await refreshGiveaway(interaction.client, g);
-  return interaction.reply({ content: added ? "Participation enregistrée. Bonne chance." : "Tu participes déjà.", ...EPH });
-}
-
-async function refreshGiveaway(client, g) {
-  if (!g.message_id) return;
-  const channel = await client.channels.fetch(g.channel_id).catch(() => null);
-  if (!channel) return;
-  const message = await channel.messages.fetch(g.message_id).catch(() => null);
-  if (!message) return;
-  const count = (await giveawayEntries(g.id)).length;
-  await message.edit({ embeds: [giveawayEmbed(g, count)], components: giveawayComponents(g.id, count) }).catch(() => null);
-}
-
-async function drawGiveaway(client, g, rerollCount = null) {
-  const entries = await giveawayEntries(g.id);
-  const channel = await client.channels.fetch(g.channel_id).catch(() => null);
-  const winners = [];
-  const pool = [...entries];
-  const want = rerollCount ?? g.winners;
-
-  while (winners.length < want && pool.length) {
-    winners.push(...pool.splice(Math.floor(Math.random() * pool.length), 1));
-  }
-
-  if (!rerollCount) {
-    await endGiveaway(g.id);
-    if (g.message_id && channel) {
-      const message = await channel.messages.fetch(g.message_id).catch(() => null);
-      if (message) {
-        await message.edit({
-          embeds: [embed({
-            title: `🎉 ${g.prize}`,
-            color: COLORS.neutral,
-            description: winners.length ? `Terminé — gagnant(s) : ${winners.map((w) => `<@${w}>`).join(", ")}` : "Terminé — aucun participant.",
-            footer: `${entries.length} participant(s) · id ${g.id}`,
-          })],
-          components: [],
-        }).catch(() => null);
-      }
-    }
-  }
-
-  if (channel && canSend(channel)) {
-    await channel.send({
-      content: winners.length
-        ? `${winners.map((w) => `<@${w}>`).join(" ")} — vous gagnez **${g.prize}** !`
-        : `Aucun participant pour **${g.prize}**.`,
-    }).catch(() => null);
-  }
-
-  return winners;
-}
-
-async function tickGiveaways(client) {
-  const due = await dueGiveaways();
-  for (const g of due) {
-    await drawGiveaway(client, g).catch((e) => console.error("[gw]", e.message));
-  }
-}
-
-async function postGiveaway(client, id, channel) {
-  const g = await getGiveaway(id);
-  const message = await channel.send({ embeds: [giveawayEmbed(g, 0)], components: giveawayComponents(id, 0) });
-  await setGiveawayMessage(id, message.id);
-  return message;
-}
-
-/* ========================================================================== */
-/*                                CONFESSIONS                                 */
-/* ========================================================================== */
-
-
-/* ========================================================================== */
-/*                                 ALCATRAZ                                   */
-/* ========================================================================== */
-
-async function sendToJail(guild, member, moderator, reason, durationMs) {
-  const config = await getConfig(guild.id);
-  let roleId = config.jailRoleId;
-  let role = roleId ? guild.roles.cache.get(roleId) : null;
-
-  if (!role) {
-    role = guild.roles.cache.find((r) => /alcatraz|prison|prisonnier|jail/i.test(r.name));
-  }
-  if (!role) return { ok: false, error: "Aucun rôle Alcatraz trouvé. Crée un rôle « Alcatraz » puis fais `/config alcatraz role:@Alcatraz`." };
-  if (role.position >= guild.members.me.roles.highest.position) return { ok: false, error: "Le rôle Alcatraz est au-dessus du mien." };
-
-  const saved = member.roles.cache.filter((r) => r.id !== guild.id && r.editable && !r.managed).map((r) => r.id);
-  await jailUser(guild.id, member.id, saved, durationMs ? new Date(Date.now() + durationMs) : null, reason);
-
-  await member.roles.set([role.id], `Alcatraz — ${moderator.tag} — ${reason}`).catch(() => null);
-  await addSanction(guild.id, member.id, moderator.id, "alcatraz", reason, durationMs);
-
-  await log(guild, "jail", embed({
-    title: "Envoyé en Alcatraz",
-    color: COLORS.danger,
-    fields: [
-      { name: "Membre", value: `${member.user.tag} (\`${member.id}\`)`, inline: true },
-      { name: "Durée", value: durationMs ? formatDuration(durationMs) : "Indéterminée", inline: true },
-      { name: "Modérateur", value: moderator.tag, inline: true },
-      { name: "Raison", value: reason },
-      { name: "Rôles retirés", value: `${saved.length}`, inline: true },
-    ],
-  }));
-
-  return { ok: true, roles: saved.length };
-}
-
-async function releaseFromJail(guild, member, by = "Automatique") {
-  const record = await getJail(guild.id, member.id);
-  if (!record) return { ok: false, error: "Ce membre n'est pas en Alcatraz." };
-
-  const roles = Array.isArray(record.roles) ? record.roles : [];
-  const valid = roles.filter((id) => {
-    const r = guild.roles.cache.get(id);
-    return r && r.editable && !r.managed;
-  });
-
-  await member.roles.set(valid, `Libération Alcatraz — ${by}`).catch(() => null);
-  await freeUser(guild.id, member.id);
-
-  await log(guild, "jail", embed({
-    title: "Libéré d'Alcatraz",
-    color: COLORS.success,
-    fields: [
-      { name: "Membre", value: `${member.user.tag}`, inline: true },
-      { name: "Par", value: String(by), inline: true },
-      { name: "Rôles restaurés", value: `${valid.length}`, inline: true },
-    ],
-  }));
-
-  return { ok: true, restored: valid.length };
-}
-
-
-const pbtn = (id, label, style = ButtonStyle.Secondary, emoji, disabled = false) => {
-  const btnB = new ButtonBuilder().setCustomId(id).setStyle(style).setDisabled(disabled);
-  const clean = (label ?? "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
-  if (clean) btnB.setLabel(clean.slice(0, 80));
-  if (emoji) btnB.setEmoji(emoji);
-  if (!clean && !emoji) btnB.setLabel("·");
-  return btnB;
-};
-
-/* ========================================================================== */
-/*                              PANNEAUX PUBLICS                              */
-/* ========================================================================== */
-
-function memberPanel(guild) {
-  return {
-    embeds: [embed({ guild, author: { name: "🧭  Espace membre" }, color: COLORS.primary,
-      description: "Tout ce que tu peux faire ici, sans taper une seule commande.",
-      fields: [
-        { name: `${ICONS.level} Niveau`, value: "Ta progression XP", inline: true },
-        { name: `${ICONS.coin} Solde`, value: "Tes coins", inline: true },
-        { name: "🎁 Quotidien", value: "Une fois par jour", inline: true },
-        { name: "💼 Travail", value: "Toutes les 30 min", inline: true },
-        { name: "🏆 Classement", value: "Top XP et coins", inline: true },
-        { name: "🛒 Boutique", value: "Rôles à acheter", inline: true },
-        { name: "🔗 Invitations", value: "Tes filleuls", inline: true },
-        { name: "🔊 Vocal", value: "XP et coins en parlant", inline: true },
-      ] })],
-    components: [
-      new ActionRowBuilder().addComponents(
-        pbtn("pub:rank", "Mon niveau", ButtonStyle.Primary, "📈"),
-        pbtn("pub:coins", "Mon solde", ButtonStyle.Primary, "🪙"),
-        pbtn("pub:daily", "Quotidien", ButtonStyle.Success, "🎁"),
-        pbtn("pub:work", "Travailler", ButtonStyle.Success, "💼"),
-      ),
-      new ActionRowBuilder().addComponents(
-        pbtn("pub:top:xp", "Top XP", ButtonStyle.Secondary, "🏆"),
-        pbtn("pub:top:coins", "Top coins", ButtonStyle.Secondary, "💰"),
-        pbtn("cas:open", "Casino", ButtonStyle.Danger, "🎰"),
-        pbtn("pub:shop", "Boutique", ButtonStyle.Secondary, "🛒"),
-        pbtn("pub:pay", "Envoyer des coins", ButtonStyle.Secondary, "🤝"),
-      ),
-      new ActionRowBuilder().addComponents(
-        pbtn("pub:grade", "Mon grade", ButtonStyle.Primary, "🎖️"),
-        pbtn("pub:echelle", "Les grades", ButtonStyle.Secondary, "📜"),
-        pbtn("pub:invites", "Mes invitations", ButtonStyle.Primary, "🔗"),
-        pbtn("pub:top:invites", "Top invitations", ButtonStyle.Secondary, "🏅"),
-        pbtn("pub:top:voice", "Top vocal", ButtonStyle.Secondary, "🔊"),
-      ),
-    ],
-  };
-}
-
-/* ========================================================================== */
-/*              9 - DESSIN : JEUX, FICHES, BOUTIQUE, CLASSEMENTS              */
+/*                      8 - DESSIN DE TOUTES LES IMAGES                       */
 /* ========================================================================== */
 
 // render.js — les jeux du casino dessinés en image.
@@ -4140,6 +3413,1032 @@ function renderProfile({
   return c.toBuffer("image/png");
 }
 
+
+/* ========================================================================== */
+/*                              BIENVENUE                                     */
+/* ========================================================================== */
+
+function renderWelcome({ pseudo, avatar, serveur, numero, invitePar, membres }) {
+  if (!PRET) return null;
+  const L = 1000, H = 400;
+  const { c, ctx } = scene(L, H);
+
+  // halo derrière l'avatar
+  const cx = 190, cy = 190;
+  const halo = ctx.createRadialGradient(cx, cy, 20, cx, cy, 150);
+  halo.addColorStop(0, "rgba(123,47,247,0.35)"); halo.addColorStop(1, "rgba(123,47,247,0)");
+  ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(cx, cy, 150, 0, Math.PI * 2); ctx.fill();
+
+  if (avatar) {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, 88, 0, Math.PI * 2); ctx.closePath(); ctx.clip();
+    try { ctx.drawImage(avatar, cx - 88, cy - 88, 176, 176); } catch { /* illisible */ }
+    ctx.restore();
+  } else {
+    ctx.beginPath(); ctx.arc(cx, cy, 88, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fill();
+  }
+  const anneau = ctx.createLinearGradient(cx - 88, cy - 88, cx + 88, cy + 88);
+  anneau.addColorStop(0, P.arc[0]); anneau.addColorStop(0.5, P.arc[1]); anneau.addColorStop(1, P.arc[2]);
+  ctx.beginPath(); ctx.arc(cx, cy, 88, 0, Math.PI * 2);
+  ctx.strokeStyle = anneau; ctx.lineWidth = 5; ctx.stroke();
+
+  // pastille du rang d'arrivée
+  if (numero) {
+    ctx.beginPath(); ctx.arc(cx + 66, cy + 66, 30, 0, Math.PI * 2);
+    ctx.fillStyle = P.orClair; ctx.fill();
+    ctx.fillStyle = P.fond1; ctx.font = f(numero > 999 ? 15 : 19, true);
+    ctx.textAlign = "center"; ctx.fillText(`#${nb(numero)}`, cx + 66, cy + 73);
+  }
+
+  ctx.textAlign = "left";
+  const tx = 340;
+  ctx.fillStyle = P.faible; ctx.font = f(17);
+  ctx.fillText("B I E N V E N U E   S U R", tx, 118);
+  ctx.fillStyle = P.texte; ctx.font = f(42, true);
+  ctx.fillText(propre(serveur).slice(0, 22), tx, 170);
+
+  const bandeau = ctx.createLinearGradient(tx, 0, tx + 260, 0);
+  bandeau.addColorStop(0, P.arc[1]); bandeau.addColorStop(1, P.arc[2]);
+  ctx.fillStyle = bandeau; ctx.fillRect(tx, 186, 260, 3);
+
+  ctx.fillStyle = P.orClair; ctx.font = f(32, true);
+  ctx.fillText(propre(pseudo).slice(0, 22), tx, 240);
+
+  ctx.fillStyle = P.faible; ctx.font = f(16);
+  const lignes = [];
+  if (numero) lignes.push(`${nb(numero)}ᵉ membre à nous rejoindre`);
+  if (invitePar) lignes.push(`Invité par ${propre(invitePar).slice(0, 20)}`);
+  if (membres) lignes.push(`${nb(membres)} personnes ici`);
+  lignes.slice(0, 3).forEach((l, n) => ctx.fillText(l, tx, 278 + n * 26));
+
+  ctx.textAlign = "right"; ctx.fillStyle = P.tres; ctx.font = f(12);
+  ctx.fillText("0x • NAOYA", L - 30, H - 22);
+  ctx.textAlign = "left";
+  return c.toBuffer("image/png");
+}
+
+/* ========================================================================== */
+/*                       MONTÉE DE GRADE OU DE NIVEAU                         */
+/* ========================================================================== */
+
+function renderPromotion({ pseudo, avatar, titre, ancien, nouveau, detail, teinte }) {
+  if (!PRET) return null;
+  const L = 1000, H = 320;
+  const { c, ctx } = scene(L, H);
+  const t = teinte ?? "#f5c518";
+
+  const cx = 130, cy = 160;
+  const halo = ctx.createRadialGradient(cx, cy, 10, cx, cy, 110);
+  halo.addColorStop(0, `${t}55`); halo.addColorStop(1, `${t}00`);
+  ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(cx, cy, 110, 0, Math.PI * 2); ctx.fill();
+
+  if (avatar) {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, 66, 0, Math.PI * 2); ctx.closePath(); ctx.clip();
+    try { ctx.drawImage(avatar, cx - 66, cy - 66, 132, 132); } catch { /* illisible */ }
+    ctx.restore();
+  }
+  ctx.beginPath(); ctx.arc(cx, cy, 66, 0, Math.PI * 2);
+  ctx.strokeStyle = t; ctx.lineWidth = 4; ctx.stroke();
+
+  ctx.textAlign = "left";
+  ctx.fillStyle = t; ctx.font = f(15, true);
+  ctx.fillText(propre(titre).toUpperCase().split("").join(" "), 240, 96);
+  ctx.fillStyle = P.texte; ctx.font = f(30, true);
+  ctx.fillText(propre(pseudo).slice(0, 22), 240, 136);
+
+  // ancien → nouveau
+  const y = 190;
+  if (ancien) {
+    ctx.fillStyle = P.faible; ctx.font = f(20);
+    const w = ctx.measureText(propre(ancien)).width;
+    ctx.fillText(propre(ancien).slice(0, 18), 240, y);
+    ctx.strokeStyle = P.faible; ctx.lineWidth = 2; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(252 + w, y - 7); ctx.lineTo(292 + w, y - 7);
+    ctx.lineTo(282 + w, y - 15); ctx.moveTo(292 + w, y - 7); ctx.lineTo(282 + w, y + 1);
+    ctx.stroke();
+    ctx.fillStyle = t; ctx.font = f(26, true);
+    ctx.fillText(propre(nouveau).slice(0, 20), 306 + w, y);
+  } else {
+    ctx.fillStyle = t; ctx.font = f(30, true);
+    ctx.fillText(propre(nouveau).slice(0, 24), 240, y);
+  }
+
+  if (detail) {
+    ctx.fillStyle = P.faible; ctx.font = f(16);
+    ctx.fillText(propre(detail).slice(0, 60), 240, 232);
+  }
+
+  ctx.textAlign = "right"; ctx.fillStyle = P.tres; ctx.font = f(12);
+  ctx.fillText("0x • NAOYA", L - 30, H - 22);
+  ctx.textAlign = "left";
+  return c.toBuffer("image/png");
+}
+
+/* ========================================================================== */
+/*                              SANCTION                                      */
+/* ========================================================================== */
+
+const TEINTE_SANCTION = {
+  warn: "#ffa502", timeout: "#00d4ff", kick: "#ff7f50",
+  ban: "#ff4757", jail: "#9b59b6", unban: "#3ddc84", untimeout: "#3ddc84",
+};
+const NOM_SANCTION = {
+  warn: "Avertissement", timeout: "Réduction au silence", kick: "Expulsion",
+  ban: "Bannissement", jail: "Alcatraz", unban: "Débannissement", untimeout: "Parole rendue",
+};
+
+function renderSanction({ type, pseudo, avatar, raison, moderateur, duree, total, serveur }) {
+  if (!PRET) return null;
+  const L = 1000, H = 400;
+  const { c, ctx } = scene(L, H);
+  const t = TEINTE_SANCTION[type] ?? "#ff4757";
+
+  // bande verticale colorée
+  ctx.fillStyle = t; ctx.fillRect(0, 0, 6, H);
+
+  ctx.textAlign = "left";
+  ctx.fillStyle = t; ctx.font = f(15, true);
+  ctx.fillText((NOM_SANCTION[type] ?? "Sanction").toUpperCase().split("").join(" "), 40, 52);
+  ctx.fillStyle = P.faible; ctx.font = f(14);
+  ctx.fillText(propre(serveur ?? ""), 40, 74);
+  ctx.strokeStyle = "rgba(255,255,255,0.07)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(40, 92); ctx.lineTo(L - 40, 92); ctx.stroke();
+
+  const cx = 118, cy = 200;
+  if (avatar) {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, 62, 0, Math.PI * 2); ctx.closePath(); ctx.clip();
+    try { ctx.drawImage(avatar, cx - 62, cy - 62, 124, 124); } catch { /* illisible */ }
+    ctx.restore();
+  }
+  ctx.beginPath(); ctx.arc(cx, cy, 62, 0, Math.PI * 2);
+  ctx.strokeStyle = t; ctx.lineWidth = 4; ctx.stroke();
+
+  ctx.textAlign = "center";
+  ctx.fillStyle = P.texte; ctx.font = f(20, true);
+  ctx.fillText(propre(pseudo).slice(0, 18), cx, cy + 96);
+  ctx.textAlign = "left";
+
+  const px = 240, pw = L - 240 - 40;
+  cadre(ctx, px, 120, pw, 210);
+
+  const champ = (titre, valeur, y, grand = false) => {
+    ctx.fillStyle = P.faible; ctx.font = f(12);
+    ctx.fillText(propre(titre).toUpperCase(), px + 26, y);
+    ctx.fillStyle = P.texte; ctx.font = f(grand ? 20 : 17, grand);
+    const texte = propre(valeur) || "—";
+    // repli sur deux lignes si la raison est longue
+    const max = pw - 52;
+    if (ctx.measureText(texte).width > max) {
+      const mots = texte.split(" "); let ligne = "", ly = y + 26;
+      for (const m of mots) {
+        if (ctx.measureText(`${ligne} ${m}`).width > max) { ctx.fillText(ligne, px + 26, ly); ligne = m; ly += 24; }
+        else ligne = ligne ? `${ligne} ${m}` : m;
+        if (ly > y + 52) break;
+      }
+      if (ligne) ctx.fillText(ligne, px + 26, ly);
+    } else ctx.fillText(texte, px + 26, y + 26);
+  };
+
+  champ("Raison", raison, 156, true);
+  champ("Par", moderateur, 238);
+  if (duree) {
+    ctx.fillStyle = P.faible; ctx.font = f(12);
+    ctx.fillText("DURÉE", px + pw / 2 + 20, 238);
+    ctx.fillStyle = t; ctx.font = f(17, true);
+    ctx.fillText(propre(duree), px + pw / 2 + 20, 264);
+  }
+  if (total !== undefined && total !== null) {
+    ctx.fillStyle = P.faible; ctx.font = f(12);
+    ctx.fillText("TOTAL AU CASIER", px + 26, 300);
+    ctx.fillStyle = t; ctx.font = f(17, true);
+    ctx.fillText(`${nb(total)} sanction${total > 1 ? "s" : ""}`, px + 26, 322);
+  }
+
+  ctx.textAlign = "right"; ctx.fillStyle = P.tres; ctx.font = f(12);
+  ctx.fillText("0x • NAOYA", L - 30, H - 22);
+  ctx.textAlign = "left";
+  return c.toBuffer("image/png");
+}
+
+/* ========================================================================== */
+/*                          ARRIÈRE-SALLE                                     */
+/* ========================================================================== */
+
+function renderCrime({ coup, reussi, gain, perte, solde, pression, chance, joueur, avatar, phrase }) {
+  if (!PRET) return null;
+  const L = 1000, H = 460;
+  const { c, ctx } = scene(L, H);
+  entete(ctx, L, "ARRIERE-SALLE", joueur, undefined, avatar);
+
+  const px = 40, pw = 480;
+  cadre(ctx, px, 112, pw, 300);
+  ctx.textAlign = "left";
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("LE COUP", px + 28, 150);
+  ctx.fillStyle = P.texte; ctx.font = f(30, true);
+  ctx.fillText(propre(coup).slice(0, 24), px + 28, 190);
+
+  ctx.fillStyle = "rgba(255,255,255,0.35)"; ctx.font = `italic ${f(15)}`;
+  const mots = propre(phrase ?? "").split(" ");
+  let ligne = "", ly = 230;
+  for (const m of mots) {
+    if (ctx.measureText(`${ligne} ${m}`).width > pw - 56) { ctx.fillText(ligne, px + 28, ly); ligne = m; ly += 24; }
+    else ligne = ligne ? `${ligne} ${m}` : m;
+    if (ly > 278) break;
+  }
+  if (ligne) ctx.fillText(ligne, px + 28, ly);
+
+  // jauge de pression policière
+  ctx.fillStyle = P.faible; ctx.font = f(12);
+  ctx.fillText("PRESSION POLICIÈRE", px + 28, 320);
+  ctx.textAlign = "right";
+  ctx.fillText(`${pression}/100`, px + pw - 28, 320);
+  ctx.textAlign = "left";
+  arrondi(ctx, px + 28, 332, pw - 56, 14, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fill();
+  const part = Math.max(0, Math.min(1, pression / 100));
+  if (part > 0.01) {
+    arrondi(ctx, px + 28, 332, Math.max(14, (pw - 56) * part), 14, 7);
+    ctx.fillStyle = pression > 66 ? "#ff4757" : pression > 33 ? "#ffa502" : "#3ddc84"; ctx.fill();
+  }
+  ctx.fillStyle = P.tres; ctx.font = f(12);
+  ctx.fillText(`${Math.round(chance * 100)} % de chances de t'en sortir`, px + 28, 372);
+
+  const qx = 566, qw = 384;
+  cadre(ctx, qx, 112, qw, 300);
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("RÉSULTAT", qx + 28, 150);
+
+  ctx.fillStyle = reussi ? P.vertClair : "#ff4757";
+  ctx.font = f(38, true);
+  ctx.fillText(reussi ? "RÉUSSI" : "ATTRAPÉ", qx + 28, 198);
+
+  ctx.font = f(30, true);
+  ctx.fillText(`${reussi ? "+" : "−"} ${nb(reussi ? gain : perte)}`, qx + 28, 250);
+  if (!reussi) {
+    ctx.fillStyle = P.faible; ctx.font = f(14);
+    ctx.fillText(`le double de ce que tu visais (${nb(gain)})`, qx + 28, 276);
+  }
+
+  ctx.strokeStyle = "rgba(255,255,255,0.08)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(qx + 28, 300); ctx.lineTo(qx + qw - 28, 300); ctx.stroke();
+
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText(solde < 0 ? "TU DOIS" : "SOLDE", qx + 28, 330);
+  piece(ctx, qx + 40, 362, 13);
+  ctx.fillStyle = solde < 0 ? "#ff4757" : P.texte; ctx.font = f(26, true);
+  ctx.fillText(solde < 0 ? nb(-solde) : nb(solde), qx + 62, 370);
+
+  ctx.textAlign = "right"; ctx.fillStyle = P.tres; ctx.font = f(12);
+  ctx.fillText("0x • NAOYA", L - 30, H - 22);
+  ctx.textAlign = "left";
+  return c.toBuffer("image/png");
+}
+
+/* ========================================================================== */
+/*            9 - TICKETS, GIVEAWAYS, COMPTEURS, PANNEAUX PUBLICS             */
+/* ========================================================================== */
+
+// features.js — tickets, giveaways, compteurs vocaux, panneaux publics.
+
+
+/* ========================================================================== */
+/*                            LOG CENTRALISÉ                                  */
+/* ========================================================================== */
+
+/**
+ * @param {object} [fichier] pièce jointe optionnelle, par exemple une carte
+ *   de sanction dessinée. L'embed y est lié automatiquement.
+ */
+async function log(guild, routeKey, e, fichier = null) {
+  try {
+    if (isSuspended(guild.id)) return;
+    const config = await getConfig(guild.id);
+    if (!config.logsEnabled) return;
+    const channel = resolveLogChannel(guild, routeKey, config);
+    if (!channel || !canSend(channel)) return;
+    if (fichier) {
+      e.setImage(`attachment://${fichier.name}`);
+      e.data.fields = [];
+      await channel.send({ embeds: [e], files: [fichier] });
+      return;
+    }
+    await channel.send({ embeds: [e] });
+  } catch (err) {
+    console.error(`[log:${routeKey}]`, err.message);
+  }
+}
+
+/* ========================================================================== */
+/*                            COMPTEURS VOCAUX                                */
+/* ========================================================================== */
+
+/**
+ * Met à jour les salons compteurs (vocaux verrouillés).
+ *  - Membres   : humains uniquement, bots exclus
+ *  - Connectés : humains non hors-ligne
+ *  - Vocal     : humains actuellement en vocal, tous salons confondus
+ * Les valeurs indisponibles ne sont jamais écrites (on ne remplace pas par 0).
+ */
+async function computeCounts(guild) {
+  // Bots : fiables en cache (peu nombreux, reçus au démarrage).
+  const cachedBots = guild.members.cache.filter((m) => m.user.bot).size;
+  const members = Math.max(0, guild.memberCount - cachedBots);
+
+  // Vocal : on lit les états vocaux, PAS channel.members (qui dépend du cache membres).
+  let voice = 0;
+  for (const vs of guild.voiceStates.cache.values()) {
+    if (!vs.channelId) continue;
+    const m = guild.members.cache.get(vs.id);
+    if (m?.user?.bot) continue;
+    voice++;
+  }
+
+  // Connectés : nécessite l'intent Presence + le cache membres.
+  let online = null;
+  const cacheRatio = guild.memberCount > 0 ? guild.members.cache.size / guild.memberCount : 0;
+  if (cacheRatio > 0.5) {
+    let n = 0;
+    for (const m of guild.members.cache.values()) {
+      if (m.user.bot) continue;
+      if (m.presence && m.presence.status !== "offline") n++;
+    }
+    online = n > 0 ? n : null; // 0 = presences non reçues → on n'écrit rien
+  }
+
+  return { members, online, voice, cacheRatio };
+}
+
+const lastCounterValue = new Map();
+
+/**
+ * Discord n'autorise que DEUX renommages par salon et par tranche de 10 minutes.
+ * On tient donc un budget : tant qu'il en reste, le compteur réagit à la seconde.
+ */
+const renameLog = new Map();   // channelId -> [horodatages]
+
+function renameBudget(channelId) {
+  const now = Date.now();
+  const recent = (renameLog.get(channelId) ?? []).filter((t) => now - t < 600_000);
+  renameLog.set(channelId, recent);
+  return 2 - recent.length;
+}
+
+function noteRename(channelId) {
+  const arr = renameLog.get(channelId) ?? [];
+  arr.push(Date.now());
+  renameLog.set(channelId, arr);
+}
+
+/** Quand le prochain renommage sera possible. */
+function nextRenameIn(channelId) {
+  const arr = (renameLog.get(channelId) ?? []).filter((t) => Date.now() - t < 600_000);
+  if (arr.length < 2) return 0;
+  return Math.max(0, 600_000 - (Date.now() - Math.min(...arr)));
+}
+
+async function updateCounters(guild, force = false) {
+  const config = await getConfig(guild.id);
+  const counts = await computeCounts(guild);
+  const report = [];
+
+  for (const counter of COUNTERS) {
+    const value = counts[counter.key];
+    if (value === null || value === undefined) {
+      report.push({ key: counter.key, status: "indisponible" });
+      continue;
+    }
+
+    // Salon forcé via /config compteur, sinon détection par motif "Nom :"
+    const forced = config.counters?.[counter.key];
+    let channel = forced ? guild.channels.cache.get(forced) : null;
+    if (!channel) {
+      channel = guild.channels.cache.find(
+        (c) => (c.type === ChannelType.GuildVoice || c.type === ChannelType.GuildStageVoice) && counter.test.test(c.name)
+      );
+    }
+    if (!channel) { report.push({ key: counter.key, value, status: "salon introuvable" }); continue; }
+    if (!channel.manageable) { report.push({ key: counter.key, value, status: "permission manquante" }); continue; }
+
+    // On ne remplace que le nombre : emojis, séparateurs et espaces restent intacts.
+    const next = renameWithCount(channel.name, value) ?? counter.template.replace("{n}", num(value));
+    if (channel.name === next) { report.push({ key: counter.key, value, status: "à jour" }); continue; }
+
+    const memoKey = `${guild.id}:${counter.key}`;
+    if (!force && lastCounterValue.get(memoKey) === value) { report.push({ key: counter.key, value, status: "inchangé" }); continue; }
+
+    if (renameBudget(channel.id) <= 0) {
+      const wait = Math.ceil(nextRenameIn(channel.id) / 1000);
+      report.push({ key: counter.key, value, status: `en attente ${wait}s — limite Discord de 2 renommages / 10 min` });
+      continue;
+    }
+
+    // setName peut lever de façon synchrone : le try/catch est indispensable
+    let ok = false;
+    try {
+      await channel.setName(next, "Compteur 0x");
+      ok = true;
+    } catch (e) {
+      report.push({ key: counter.key, value, status: `échec : ${String(e.message).slice(0, 60)}` });
+    }
+    if (ok) { lastCounterValue.set(memoKey, value); noteRename(channel.id); report.push({ key: counter.key, value, status: "mis à jour" }); }
+    await new Promise((r) => setTimeout(r, 600));
+  }
+
+  return { counts, report };
+}
+
+/* ========================================================================== */
+/*                          BOUTIQUE ET DROPS DE COINS                        */
+/* ========================================================================== */
+
+const activeDrops = new Map(); // messageId -> { amount, claimed }
+
+function dropComponents(id) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`drop:claim:${id}`).setLabel("Récupérer").setStyle(ButtonStyle.Success).setEmoji("📦")
+  )];
+}
+
+async function launchDrop(guild, channel, amount) {
+  if (!channel || !canSend(channel)) return null;
+  const config = await getConfig(guild.id);
+  const id = Math.random().toString(36).slice(2, 10);
+  const message = await channel.send({
+    embeds: [embed({
+      guild,
+      author: { name: "📦  Colis lâché" },
+      description: `Un colis de **${config.economy.currency} ${num(amount)}** vient de tomber.\nPremier arrivé, premier servi.`,
+      color: COLORS.gold,
+    })],
+    components: dropComponents(id),
+  }).catch(() => null);
+  if (!message) return null;
+  activeDrops.set(id, { amount, claimed: false, guildId: guild.id });
+  setTimeout(() => {
+    const d = activeDrops.get(id);
+    if (d && !d.claimed) {
+      activeDrops.delete(id);
+      message.edit({
+        embeds: [embed({ guild, author: { name: "📦  Colis perdu" }, description: "Personne n'a été assez rapide.", color: COLORS.neutral })],
+        components: [],
+      }).catch(() => null);
+    }
+  }, 120_000);
+  return message;
+}
+
+async function claimDrop(interaction, id) {
+  const drop = activeDrops.get(id);
+  if (!drop || drop.claimed) return interaction.reply({ content: "Ce colis a déjà été récupéré.", ...EPH });
+  drop.claimed = true;
+  activeDrops.delete(id);
+
+  const config = await getConfig(interaction.guild.id);
+  const total = await addCoins(interaction.guild.id, interaction.user.id, drop.amount);
+
+  await interaction.update({
+    embeds: [embed({
+      guild: interaction.guild,
+      author: { name: "📦  Colis récupéré" },
+      description: `${interaction.user} empoche **${config.economy.currency} ${num(drop.amount)}**.`,
+      color: COLORS.success,
+    })],
+    components: [],
+  }).catch(() => null);
+
+  await log(interaction.guild, "coins", embed({
+    guild: interaction.guild,
+    author: { name: "🪙  Colis récupéré" },
+    color: COLORS.gold,
+    fields: [
+      { name: "Membre", value: interaction.user.tag, inline: true },
+      { name: "Montant", value: num(drop.amount), inline: true },
+      { name: "Nouveau solde", value: num(total), inline: true },
+    ],
+  }));
+}
+
+/* ========================================================================== */
+/*                                 TICKETS                                    */
+/* ========================================================================== */
+
+/** Le type, avec les retouches faites depuis le panneau. */
+function ticketKind(config, id) {
+  const base = TICKET_TYPES.find((t) => t.id === id);
+  if (!base) return null;
+  return { ...base, ...(config?.ticketStyle?.[id] ?? {}) };
+}
+
+function ticketPanelComponents(guild, config) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("ticket:pick")
+    .setPlaceholder("Ouvre un ticket — choisis ta catégorie");
+
+  for (const base of TICKET_TYPES) {
+    const t = ticketKind(config, base.id);
+    const option = { label: t.label.slice(0, 100), value: t.id, description: (t.desc ?? "").slice(0, 100) };
+    const e = resolveEmojiRef(guild, t.emoji);
+    if (e) option.emoji = e;
+    menu.addOptions(option);
+  }
+  return [new ActionRowBuilder().addComponents(menu)];
+}
+
+/** Devanture du centre d'aide. */
+function ticketPanel(guild, config) {
+  const lignes = TICKET_TYPES.map((base) => {
+    const t = ticketKind(config, base.id);
+    return `${t.emoji}  **${t.label}**\n　${t.desc ?? ""}`;
+  });
+  return {
+    embeds: [embed({
+      guild, color: COLORS.primary, author: { name: `${ICONS.ticket}  Centre d'aide` },
+      description: [
+        "```",
+        "  ╔═══════════════════════════════╗",
+        "  ║   O U V R I R   U N   T I C K E T   ║",
+        "  ╚═══════════════════════════════╝",
+        "```",
+        "Un salon privé s'ouvre entre toi et l'équipe concernée.",
+        "Personne d'autre n'y a accès.",
+        "",
+        lignes.join("\n\n"),
+      ].join("\n"),
+      footer: "Un seul ticket ouvert à la fois · les ouvertures abusives sont sanctionnées",
+    })],
+    components: ticketPanelComponents(guild, config),
+  };
+}
+
+async function createTicket(interaction, kindId) {
+  const guild = interaction.guild;
+  const config = await getConfig(guild.id);
+  const kind = TICKET_TYPES.find((t) => t.id === kindId);
+  if (!kind) return interaction.editReply("Type de ticket inconnu.");
+
+  const existing = await openTicketOf(guild.id, interaction.user.id, kindId);
+  if (existing && guild.channels.cache.has(existing)) {
+    return interaction.editReply(`Tu as déjà un ticket **${kind.label}** ouvert : <#${existing}>`);
+  }
+
+  const category = await ensureTicketCategory(guild, kind, config);
+  if (!category) {
+    return interaction.editReply(
+      "Impossible de préparer la catégorie de ce ticket. Donne-moi la permission « Gérer les salons »."
+    );
+  }
+
+  const staffRoleId = config.staffRoleId;
+  const overwrites = [
+    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+    {
+      id: interaction.user.id,
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks],
+    },
+    {
+      id: guild.members.me.id,
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks],
+    },
+  ];
+  if (staffRoleId && guild.roles.cache.has(staffRoleId)) {
+    overwrites.push({
+      id: staffRoleId,
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages, PermissionFlagsBits.AttachFiles],
+    });
+  }
+
+  const clean = interaction.user.username.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 20) || "membre";
+  const channel = await guild.channels.create({
+    name: `ticket-${clean}`,
+    type: ChannelType.GuildText,
+    parent: category.id,
+    topic: `${kind.label} — ${interaction.user.tag} (${interaction.user.id})`,
+    permissionOverwrites: overwrites,
+    reason: `Ticket ${kind.label} ouvert par ${interaction.user.tag}`,
+  }).catch((e) => { console.error("[ticket]", e.message); return null; });
+
+  if (!channel) return interaction.editReply("Création impossible — vérifie mes permissions sur la catégorie.");
+
+  await openTicketRow(guild.id, channel.id, interaction.user.id, kindId);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("ticket:claim").setLabel("Prendre en charge").setStyle(ButtonStyle.Secondary).setEmoji("✋"),
+    new ButtonBuilder().setCustomId("ticket:close").setLabel("Fermer").setStyle(ButtonStyle.Danger).setEmoji("🔒"),
+  );
+
+  await channel.send({
+    content: `${interaction.user}${staffRoleId ? ` <@&${staffRoleId}>` : ""}`,
+    embeds: [embed({
+      title: `${kind.emoji} ${kind.label}`,
+      description: "Explique ta demande en détail (captures, pseudos, liens). Un membre du staff arrive.",
+      color: COLORS.primary,
+      footer: "Merci de rester courtois — les abus de tickets sont sanctionnés.",
+    })],
+    components: [row],
+  }).catch(() => null);
+
+  await interaction.editReply(`Ticket créé : ${channel}`);
+
+  await log(guild, "ticket", embed({
+    title: "Ticket ouvert",
+    color: COLORS.success,
+    fields: [
+      { name: "Membre", value: `${interaction.user.tag} (\`${interaction.user.id}\`)`, inline: true },
+      { name: "Type", value: kind.label, inline: true },
+      { name: "Salon", value: `${channel}`, inline: true },
+    ],
+  }));
+
+  await refreshTicketCounter(guild);
+}
+
+/**
+ * Trouve la catégorie du type de ticket, ou la crée.
+ * Elle est masquée à @everyone : seul le rôle staff y voit les tickets.
+ */
+async function ensureTicketCategory(guild, kind, config) {
+  const known = config.ticketCategories?.[kind.id];
+  if (known) {
+    const existing = guild.channels.cache.get(known);
+    if (existing) return existing;
+  }
+
+  const found = findCategory(guild, kind.categories);
+  if (found) {
+    await updateConfig(guild.id, { ticketCategories: { ...(config.ticketCategories ?? {}), [kind.id]: found.id } });
+    return found;
+  }
+
+  if (!guild.members.me.permissions.has(PermissionFlagsBits.ManageChannels)) return null;
+
+  const overwrites = [
+    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: guild.members.me.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+  ];
+  if (config.staffRoleId && guild.roles.cache.has(config.staffRoleId)) {
+    overwrites.push({ id: config.staffRoleId, allow: [
+      PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] });
+  }
+
+  const created = await guild.channels.create({
+    name: kind.createName ?? `Tickets ${kind.label}`,
+    type: ChannelType.GuildCategory,
+    permissionOverwrites: overwrites,
+    reason: "Catégorie de tickets créée par 0x",
+  }).catch((e) => { console.error("[tickets] création de catégorie :", e.message); return null; });
+
+  if (created) {
+    await updateConfig(guild.id, { ticketCategories: { ...(config.ticketCategories ?? {}), [kind.id]: created.id } });
+  }
+  return created;
+}
+
+async function refreshTicketCounter(guild) {
+  const config = await getConfig(guild.id);
+  const channel = resolveFuncChannel(guild, "ticketCounter", config);
+  if (!channel || !canSend(channel)) return;
+  const s = await ticketStats(guild.id);
+  const body = embed({
+    title: "Compteur de tickets",
+    color: COLORS.primary,
+    fields: [
+      { name: "Ouverts", value: `${s.open}`, inline: true },
+      { name: "7 derniers jours", value: `${s.week}`, inline: true },
+      { name: "Total", value: `${s.total}`, inline: true },
+    ],
+  });
+  let mine = null;
+  try {
+    const recent = await channel.messages.fetch({ limit: 10 });
+    const list = typeof recent?.find === "function" ? recent : [...(recent?.values?.() ?? [])];
+    mine = list.find((m) => m.author?.id === guild.members.me.id && m.embeds?.length);
+  } catch { mine = null; }
+  if (mine) await mine.edit({ embeds: [body] }).catch(() => channel.send({ embeds: [body] }).catch(() => null));
+  else await channel.send({ embeds: [body] }).catch(() => null);
+}
+
+async function closeTicket(interaction) {
+  const channel = interaction.channel;
+  await closeTicketRow(channel.id, interaction.user.id);
+
+  const messages = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+  const transcript = messages
+    ? [...messages.values()].reverse()
+        .map((m) => `[${new Date(m.createdTimestamp).toLocaleString("fr-FR")}] ${m.author.tag}: ${m.content || "(pièce jointe / embed)"}`)
+        .join("\n").slice(0, 1_900_000)
+    : "";
+
+  await log(interaction.guild, "ticket", embed({
+    title: "Ticket fermé",
+    color: COLORS.danger,
+    fields: [
+      { name: "Salon", value: channel.name, inline: true },
+      { name: "Fermé par", value: interaction.user.tag, inline: true },
+      { name: "Sujet", value: channel.topic ?? "—" },
+    ],
+  }));
+
+  if (transcript) {
+    const config = await getConfig(interaction.guild.id);
+    const logCh = resolveLogChannel(interaction.guild, "ticket", config);
+    if (logCh && canSend(logCh)) {
+      await logCh.send({
+        files: [{ attachment: Buffer.from(transcript, "utf8"), name: `${channel.name}.txt` }],
+      }).catch(() => null);
+    }
+  }
+
+  await refreshTicketCounter(interaction.guild);
+  setTimeout(() => channel.delete("Ticket fermé").catch(() => null), 5000);
+}
+
+/**
+ * Relance les tickets laissés sans réponse du staff.
+ * @returns {Promise<{reminded:number, details:Array}>}
+ */
+async function checkStaleTickets(guild) {
+  const config = await getConfig(guild.id);
+  const conf = config.ticketReminder ?? {};
+  if (!conf.enabled) return { reminded: 0, details: [] };
+
+  const hours = Math.max(1, conf.hours ?? 6);
+  const stale = await staleTickets(guild.id, hours);
+  if (!stale.length) return { reminded: 0, details: [] };
+
+  const details = [];
+  for (const row of stale) {
+    const channel = guild.channels.cache.get(row.channel_id);
+    if (!channel) { await markTicketReminded(row.channel_id); continue; }
+    if (!canSend(channel)) continue;
+
+    const since = new Date(row.last_staff_at ?? row.opened_at);
+    const waited = Math.round((Date.now() - since.getTime()) / 36e5);
+
+    await channel.send({
+      content: config.staffRoleId ? `<@&${config.staffRoleId}>` : undefined,
+      embeds: [embed({
+        guild, color: COLORS.warning, author: { name: "⏰  Ticket sans réponse" },
+        description: `Ouvert par <@${row.user_id}> · aucune réponse du staff depuis **${waited} h**.`,
+        footer: "Ce rappel disparaît dès qu'un membre du staff écrit ici",
+      })],
+    }).catch(() => null);
+
+    await markTicketReminded(row.channel_id);
+    details.push({ channel, waited, userId: row.user_id, kind: row.kind });
+  }
+
+  // Récapitulatif pour l'équipe
+  if (details.length) {
+    const staff = resolveFuncChannel(guild, "staffChat", config);
+    if (staff && canSend(staff)) {
+      await staff.send({ embeds: [embed({
+        guild, color: COLORS.warning, author: { name: `⏰  ${details.length} ticket(s) en attente` },
+        description: details.slice(0, 15).map((d) => `${d.channel} — <@${d.userId}> · **${d.waited} h**`).join("\n"),
+        footer: `Seuil : ${hours} h sans réponse`,
+      })] }).catch(() => null);
+    }
+    await log(guild, "ticket", embed({
+      guild, color: COLORS.warning, author: { name: "⏰  Rappel de tickets" },
+      description: `${details.length} ticket(s) relancé(s) après ${hours} h sans réponse.`,
+    }));
+  }
+
+  return { reminded: details.length, details };
+}
+
+/* ========================================================================== */
+/*                                GIVEAWAYS                                   */
+/* ========================================================================== */
+
+function giveawayComponents(id, count) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gw:join:${id}`).setLabel(`Participer (${count})`).setStyle(ButtonStyle.Success).setEmoji("🎉"),
+    new ButtonBuilder().setCustomId(`gw:leave:${id}`).setLabel("Retirer").setStyle(ButtonStyle.Secondary),
+  )];
+}
+
+function giveawayEmbed(g, count) {
+  return embed({
+    title: `🎉 ${g.prize}`,
+    color: COLORS.gold,
+    description: [
+      `Fin : ${ts(g.ends_at)} (${ts(g.ends_at, "f")})`,
+      `Gagnant(s) : **${g.winners}**`,
+      g.required_role ? `Rôle requis : <@&${g.required_role}>` : null,
+      `Organisé par <@${g.host_id}>`,
+    ].filter(Boolean).join("\n"),
+    footer: `${count} participant(s) · id ${g.id}`,
+  });
+}
+
+async function handleGiveawayButton(interaction, action, id) {
+  const g = await getGiveaway(Number(id));
+  if (!g || g.ended) return interaction.reply({ content: "Ce giveaway est terminé.", ...EPH });
+
+  if (action === "leave") {
+    const removed = await leaveGiveaway(g.id, interaction.user.id);
+    await refreshGiveaway(interaction.client, g);
+    return interaction.reply({ content: removed ? "Participation retirée." : "Tu ne participais pas.", ...EPH });
+  }
+
+  if (g.required_role && !interaction.member.roles.cache.has(g.required_role)) {
+    return interaction.reply({ content: `Il te faut le rôle <@&${g.required_role}> pour participer.`, ...EPH });
+  }
+
+  const added = await enterGiveaway(g.id, interaction.user.id);
+  await refreshGiveaway(interaction.client, g);
+  return interaction.reply({ content: added ? "Participation enregistrée. Bonne chance." : "Tu participes déjà.", ...EPH });
+}
+
+async function refreshGiveaway(client, g) {
+  if (!g.message_id) return;
+  const channel = await client.channels.fetch(g.channel_id).catch(() => null);
+  if (!channel) return;
+  const message = await channel.messages.fetch(g.message_id).catch(() => null);
+  if (!message) return;
+  const count = (await giveawayEntries(g.id)).length;
+  await message.edit({ embeds: [giveawayEmbed(g, count)], components: giveawayComponents(g.id, count) }).catch(() => null);
+}
+
+async function drawGiveaway(client, g, rerollCount = null) {
+  const entries = await giveawayEntries(g.id);
+  const channel = await client.channels.fetch(g.channel_id).catch(() => null);
+  const winners = [];
+  const pool = [...entries];
+  const want = rerollCount ?? g.winners;
+
+  while (winners.length < want && pool.length) {
+    winners.push(...pool.splice(Math.floor(Math.random() * pool.length), 1));
+  }
+
+  if (!rerollCount) {
+    await endGiveaway(g.id);
+    if (g.message_id && channel) {
+      const message = await channel.messages.fetch(g.message_id).catch(() => null);
+      if (message) {
+        await message.edit({
+          embeds: [embed({
+            title: `🎉 ${g.prize}`,
+            color: COLORS.neutral,
+            description: winners.length ? `Terminé — gagnant(s) : ${winners.map((w) => `<@${w}>`).join(", ")}` : "Terminé — aucun participant.",
+            footer: `${entries.length} participant(s) · id ${g.id}`,
+          })],
+          components: [],
+        }).catch(() => null);
+      }
+    }
+  }
+
+  if (channel && canSend(channel)) {
+    await channel.send({
+      content: winners.length
+        ? `${winners.map((w) => `<@${w}>`).join(" ")} — vous gagnez **${g.prize}** !`
+        : `Aucun participant pour **${g.prize}**.`,
+    }).catch(() => null);
+  }
+
+  return winners;
+}
+
+async function tickGiveaways(client) {
+  const due = await dueGiveaways();
+  for (const g of due) {
+    await drawGiveaway(client, g).catch((e) => console.error("[gw]", e.message));
+  }
+}
+
+async function postGiveaway(client, id, channel) {
+  const g = await getGiveaway(id);
+  const message = await channel.send({ embeds: [giveawayEmbed(g, 0)], components: giveawayComponents(id, 0) });
+  await setGiveawayMessage(id, message.id);
+  return message;
+}
+
+/* ========================================================================== */
+/*                                CONFESSIONS                                 */
+/* ========================================================================== */
+
+
+/* ========================================================================== */
+/*                                 ALCATRAZ                                   */
+/* ========================================================================== */
+
+async function sendToJail(guild, member, moderator, reason, durationMs) {
+  const config = await getConfig(guild.id);
+  let roleId = config.jailRoleId;
+  let role = roleId ? guild.roles.cache.get(roleId) : null;
+
+  if (!role) {
+    role = guild.roles.cache.find((r) => /alcatraz|prison|prisonnier|jail/i.test(r.name));
+  }
+  if (!role) return { ok: false, error: "Aucun rôle Alcatraz trouvé. Crée un rôle « Alcatraz » puis fais `/config alcatraz role:@Alcatraz`." };
+  if (role.position >= guild.members.me.roles.highest.position) return { ok: false, error: "Le rôle Alcatraz est au-dessus du mien." };
+
+  const saved = member.roles.cache.filter((r) => r.id !== guild.id && r.editable && !r.managed).map((r) => r.id);
+  await jailUser(guild.id, member.id, saved, durationMs ? new Date(Date.now() + durationMs) : null, reason);
+
+  await member.roles.set([role.id], `Alcatraz — ${moderator.tag} — ${reason}`).catch(() => null);
+  await addSanction(guild.id, member.id, moderator.id, "alcatraz", reason, durationMs);
+
+  await log(guild, "jail", embed({
+    title: "Envoyé en Alcatraz",
+    color: COLORS.danger,
+    fields: [
+      { name: "Membre", value: `${member.user.tag} (\`${member.id}\`)`, inline: true },
+      { name: "Durée", value: durationMs ? formatDuration(durationMs) : "Indéterminée", inline: true },
+      { name: "Modérateur", value: moderator.tag, inline: true },
+      { name: "Raison", value: reason },
+      { name: "Rôles retirés", value: `${saved.length}`, inline: true },
+    ],
+  }));
+
+  return { ok: true, roles: saved.length };
+}
+
+async function releaseFromJail(guild, member, by = "Automatique") {
+  const record = await getJail(guild.id, member.id);
+  if (!record) return { ok: false, error: "Ce membre n'est pas en Alcatraz." };
+
+  const roles = Array.isArray(record.roles) ? record.roles : [];
+  const valid = roles.filter((id) => {
+    const r = guild.roles.cache.get(id);
+    return r && r.editable && !r.managed;
+  });
+
+  await member.roles.set(valid, `Libération Alcatraz — ${by}`).catch(() => null);
+  await freeUser(guild.id, member.id);
+
+  await log(guild, "jail", embed({
+    title: "Libéré d'Alcatraz",
+    color: COLORS.success,
+    fields: [
+      { name: "Membre", value: `${member.user.tag}`, inline: true },
+      { name: "Par", value: String(by), inline: true },
+      { name: "Rôles restaurés", value: `${valid.length}`, inline: true },
+    ],
+  }));
+
+  return { ok: true, restored: valid.length };
+}
+
+
+const pbtn = (id, label, style = ButtonStyle.Secondary, emoji, disabled = false) => {
+  const btnB = new ButtonBuilder().setCustomId(id).setStyle(style).setDisabled(disabled);
+  const clean = (label ?? "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+  if (clean) btnB.setLabel(clean.slice(0, 80));
+  if (emoji) btnB.setEmoji(emoji);
+  if (!clean && !emoji) btnB.setLabel("·");
+  return btnB;
+};
+
+/* ========================================================================== */
+/*                              PANNEAUX PUBLICS                              */
+/* ========================================================================== */
+
+function memberPanel(guild) {
+  return {
+    embeds: [embed({ guild, author: { name: "🧭  Espace membre" }, color: COLORS.primary,
+      description: "Tout ce que tu peux faire ici, sans taper une seule commande.",
+      fields: [
+        { name: `${ICONS.level} Niveau`, value: "Ta progression XP", inline: true },
+        { name: `${ICONS.coin} Solde`, value: "Tes coins", inline: true },
+        { name: "🎁 Quotidien", value: "Une fois par jour", inline: true },
+        { name: "💼 Travail", value: "Toutes les 30 min", inline: true },
+        { name: "🏆 Classement", value: "Top XP et coins", inline: true },
+        { name: "🛒 Boutique", value: "Rôles à acheter", inline: true },
+        { name: "🔗 Invitations", value: "Tes filleuls", inline: true },
+        { name: "🔊 Vocal", value: "XP et coins en parlant", inline: true },
+      ] })],
+    components: [
+      new ActionRowBuilder().addComponents(
+        pbtn("pub:rank", "Mon niveau", ButtonStyle.Primary, "📈"),
+        pbtn("pub:coins", "Mon solde", ButtonStyle.Primary, "🪙"),
+        pbtn("pub:daily", "Quotidien", ButtonStyle.Success, "🎁"),
+        pbtn("pub:work", "Travailler", ButtonStyle.Success, "💼"),
+      ),
+      new ActionRowBuilder().addComponents(
+        pbtn("pub:top:xp", "Top XP", ButtonStyle.Secondary, "🏆"),
+        pbtn("pub:top:coins", "Top coins", ButtonStyle.Secondary, "💰"),
+        pbtn("cas:open", "Casino", ButtonStyle.Danger, "🎰"),
+        pbtn("pub:shop", "Boutique", ButtonStyle.Secondary, "🛒"),
+        pbtn("pub:pay", "Envoyer des coins", ButtonStyle.Secondary, "🤝"),
+      ),
+      new ActionRowBuilder().addComponents(
+        pbtn("pub:grade", "Mon grade", ButtonStyle.Primary, "🎖️"),
+        pbtn("pub:echelle", "Les grades", ButtonStyle.Secondary, "📜"),
+        pbtn("pub:invites", "Mes invitations", ButtonStyle.Primary, "🔗"),
+        pbtn("pub:top:invites", "Top invitations", ButtonStyle.Secondary, "🏅"),
+        pbtn("pub:top:voice", "Top vocal", ButtonStyle.Secondary, "🔊"),
+      ),
+    ],
+  };
+}
+
 /* ========================================================================== */
 /*                  10 - ARRIERE-SALLE : ACTIVITES ILLEGALES                  */
 /* ========================================================================== */
@@ -4359,7 +4658,26 @@ async function handleCrime(i) {
     }
     const r = await attempt(i.guild, i.user, jobId);
     if (!r) return reply({ content: "Ce coup n'existe pas.", embeds: [], components: [] });
-    return reply(resultView(i.guild, i.user, r, config.economy.currency));
+
+    const vue = resultView(i.guild, i.user, r, config.economy.currency);
+    if (!renderReady()) return reply(vue);
+    try {
+      const avatar = await chargerAvatar(i.user.displayAvatarURL({ extension: "png", size: 128 }));
+      const buffer = renderCrime({
+        coup: r.job.label, reussi: r.ok, gain: r.gain, perte: r.perte, solde: r.solde,
+        pression: r.heat, chance: r.chance,
+        joueur: i.member?.displayName ?? i.user.username, avatar,
+        phrase: vue.embeds[0].data.description.split("\n")[0].replace(/[_*]/g, ""),
+      });
+      if (buffer) {
+        const nom = `coup-${Date.now()}.png`;
+        vue.embeds[0].setImage(`attachment://${nom}`);
+        vue.embeds[0].data.description = undefined;
+        vue.embeds[0].data.fields = [];
+        return reply({ ...vue, files: [{ attachment: buffer, name: nom }], attachments: [] });
+      }
+    } catch (e) { console.error("[coup]", e.message); }
+    return reply(vue);
   }
 }
 
@@ -6705,6 +7023,22 @@ function checkTarget(guild, actor, target, config) {
 
 /* ================================ SANCTIONS =============================== */
 
+/**
+ * Carte de sanction envoyée au journal. Repli silencieux sur l'embed seul.
+ */
+async function carteSanction(guild, type, target, moderator, reason, duree, total) {
+  if (!renderReady()) return null;
+  try {
+    const avatar = await chargerAvatar(target.user.displayAvatarURL({ extension: "png", size: 128 }));
+    const buffer = renderSanction({
+      type, pseudo: target.displayName ?? target.user.username, avatar,
+      raison: reason, moderateur: moderator.tag ?? moderator.username ?? "—",
+      duree, total, serveur: guild.name,
+    });
+    return buffer ? { attachment: buffer, name: `sanction-${target.id}.png` } : null;
+  } catch (e) { console.error("[sanction]", e.message); return null; }
+}
+
 async function actionWarn(guild, target, moderator, reason) {
   const total = await addSanction(guild.id, target.id, moderator.id, "warn", reason);
   const config = await getConfig(guild.id);
@@ -6717,7 +7051,7 @@ async function actionWarn(guild, target, moderator, reason) {
       { name: "Modérateur", value: `<@${moderator.id}>`, inline: true },
       { name: "Raison", value: reason },
     ],
-  }));
+  }), await carteSanction(guild, "warn", target, moderator, reason, null, total));
   const esc = await applyEscalation(guild, target, config).catch(() => ({ applied: false }));
   return ok("Avertissement enregistré",
     `**${target.user.tag}** cumule **${total}** avertissement(s).${esc.applied ? `\n\n${esc.text}` : ""}`,
@@ -6738,7 +7072,8 @@ async function actionTimeout(guild, target, moderator, ms, reason) {
       { name: "Modérateur", value: `<@${moderator.id}>`, inline: true },
       { name: "Raison", value: reason },
     ],
-  }));
+  }), await carteSanction(guild, "timeout", target, moderator, reason, formatDuration(ms),
+    await countSanctions(guild.id, target.id)));
   return ok("Membre réduit au silence", `**${target.user.tag}** est muet pendant ${formatDuration(ms)}.`, COLORS.warning);
 }
 
@@ -6760,7 +7095,8 @@ async function actionKick(guild, target, moderator, reason) {
     guild, color: COLORS.warning, author: { name: `${ICONS.kick}  Expulsion` },
     description: `**${target.user.tag}**\n\`${target.id}\``,
     fields: [{ name: "Modérateur", value: `<@${moderator.id}>`, inline: true }, { name: "Raison", value: reason }],
-  }));
+  }), await carteSanction(guild, "kick", target, moderator, reason, null,
+    await countSanctions(guild.id, target.id)));
   return ok("Membre expulsé", `**${target.user.tag}** a été expulsé.`, COLORS.warning);
 }
 
@@ -6773,7 +7109,8 @@ async function actionBan(guild, target, moderator, reason, purgeDays = 0) {
     guild, color: COLORS.danger, author: { name: `${ICONS.ban}  Bannissement` },
     description: `**${target.user.tag}**\n\`${target.id}\``,
     fields: [{ name: "Modérateur", value: `<@${moderator.id}>`, inline: true }, { name: "Raison", value: reason }],
-  }));
+  }), await carteSanction(guild, "ban", target, moderator, reason, null,
+    await countSanctions(guild.id, target.id)));
   return ok("Membre banni", `**${target.user.tag}** a été banni.`, COLORS.danger);
 }
 
@@ -12502,7 +12839,24 @@ client.on(Events.GuildMemberAdd, async (member) => {
   if (config.welcomeChannelId) {
     const ch = member.guild.channels.cache.get(config.welcomeChannelId);
     if (ch && canSend(ch)) {
-      await ch.send({ embeds: [embed({ description: fill(config.welcomeMessage, member), color: COLORS.success })
+      let fichierBienvenue = null;
+      if (renderReady()) {
+        try {
+          const avatar = await chargerAvatar(member.user.displayAvatarURL({ extension: "png", size: 256 }));
+          const invitation = await getInviter(member.guild.id, member.id).catch(() => null);
+          const parrain = invitation?.inviterId
+            ? (member.guild.members.cache.get(invitation.inviterId)?.displayName ?? null) : null;
+          const buffer = renderWelcome({
+            pseudo: member.displayName ?? member.user.username, avatar,
+            serveur: member.guild.name, numero: member.guild.memberCount,
+            invitePar: parrain, membres: member.guild.memberCount,
+          });
+          if (buffer) fichierBienvenue = { attachment: buffer, name: `bienvenue-${member.id}.png` };
+        } catch (e) { console.error("[bienvenue]", e.message); }
+      }
+      await ch.send({
+        ...(fichierBienvenue ? { files: [fichierBienvenue] } : {}),
+        embeds: [embed({ description: fill(config.welcomeMessage, member), color: COLORS.success })
         .thumb(member.user.displayAvatarURL({ size: 128 }))] }).catch(() => null);
     }
   }
@@ -12693,14 +13047,31 @@ async function announceRank(guild, member, result, config) {
   if (config.ranks?.announce === false) return;
   const target = resolveFuncChannel(guild, "levelUp", config);
   if (!target || !canSend(target)) return;
-  await target.send({ embeds: [embed({
-    guild, color: COLORS.gold, author: { name: "🎖️  Montée de grade" },
-    description: `${member} atteint **${result.rank.name ?? result.role.name}** ${result.role}`,
-    fields: [
-      { name: "Temps vocal", value: `${Math.floor(result.stats.hours)} h`, inline: true },
-      { name: "Messages", value: num(result.stats.messages), inline: true },
-    ],
-  })] }).catch(() => null);
+  let fichier = null;
+  if (renderReady()) {
+    try {
+      const avatar = await chargerAvatar(member.user.displayAvatarURL({ extension: "png", size: 128 }));
+      const buffer = renderPromotion({
+        pseudo: member.displayName ?? member.user.username, avatar,
+        titre: "Montée de grade", ancien: null,
+        nouveau: result.rank.name ?? result.role.name,
+        detail: `${Math.floor(result.stats.hours)} h de vocal et ${num(result.stats.messages)} messages`,
+        teinte: "#f5c518",
+      });
+      if (buffer) fichier = { attachment: buffer, name: `grade-${member.id}.png` };
+    } catch (e) { console.error("[grade]", e.message); }
+  }
+  await target.send({
+    ...(fichier ? { files: [fichier] } : {}),
+    embeds: [embed({
+      guild, color: COLORS.gold, author: { name: "🎖️  Montée de grade" },
+      description: `${member} atteint **${result.rank.name ?? result.role.name}** ${result.role}`,
+      fields: fichier ? [] : [
+        { name: "Temps vocal", value: `${Math.floor(result.stats.hours)} h`, inline: true },
+        { name: "Messages", value: num(result.stats.messages), inline: true },
+      ],
+    })],
+  }).catch(() => null);
 }
 
 client.on(Events.MessageDelete, async (message) => {
