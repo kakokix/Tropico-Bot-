@@ -4150,10 +4150,59 @@ async function annoncer(guild, e) {
 /* ========================================================================== */
 
 const estURL = (s) => /^https?:\/\/\S+$/i.test(s);
+const estLienSoundcloud = (s) => /(?:^https?:\/\/)?(?:[\w-]+\.)?soundcloud\.com\//i.test(s)
+  || /on\.soundcloud\.com\//i.test(s);
+
+/** Suit les redirections (liens courts on.soundcloud.com → page complète). */
+async function resoudreRedirection(url) {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    const r = await fetch(url, { method: "HEAD", redirect: "follow", signal: ctrl.signal });
+    clearTimeout(t);
+    return r.url || url;
+  } catch {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 8000);
+      const r = await fetch(url, { method: "GET", redirect: "follow", signal: ctrl.signal,
+        headers: { Range: "bytes=0-0" } });
+      clearTimeout(t);
+      return r.url || url;
+    } catch { return url; }
+  }
+}
+
+/** Interprète un lien SoundCloud (court ou long) en piste jouable. */
+async function resoudreSoundcloud(url, demandePar) {
+  if (!PLAY) return { erreur: "SoundCloud est indisponible sur cet hébergement." };
+  let finalUrl = url;
+  if (/on\.soundcloud\.com/i.test(url)) {
+    finalUrl = await resoudreRedirection(url);
+  }
+  try {
+    // play-dl accepte l'URL finale ; on retente avec l'URL d'origine si besoin
+    let info = null;
+    try { info = await PLAY.soundcloud(finalUrl); }
+    catch { if (finalUrl !== url) info = await PLAY.soundcloud(url); }
+    if (!info) return { erreur: "Ce lien SoundCloud n'a pas pu être lu." };
+    const trackUrl = info.url || info.permalink || finalUrl;
+    return {
+      titre: String(info.name ?? info.title ?? "SoundCloud").slice(0, 90),
+      url: trackUrl,
+      duree: Math.round((info.durationInMs ?? info.duration ?? 0) / 1000) || null,
+      source: "soundcloud",
+      demandePar,
+    };
+  } catch (e) {
+    console.error("[musique] SoundCloud lien :", e?.message ?? e);
+    return { erreur: `Lien SoundCloud illisible : \`${String(e?.message ?? e).slice(0, 80)}\`` };
+  }
+}
 
 /**
  * Transforme une demande en piste jouable.
- * Un lien direct passe tel quel ; sinon on cherche sur YouTube.
+ * Un lien direct passe tel quel ; sinon on cherche sur YouTube / SoundCloud.
  * @returns {Promise<{titre, url, duree, source}|{erreur:string}>}
  */
 async function resoudre(requete, demandePar) {
@@ -4166,7 +4215,12 @@ async function resoudre(requete, demandePar) {
       url: q, duree: null, source: "direct", demandePar };
   }
 
-  // 2. Lien Deezer : catalogue, puis on va chercher le son ailleurs
+  // 2. Lien SoundCloud (y compris on.soundcloud.com) — AVANT YouTube
+  if (estURL(q) && estLienSoundcloud(q)) {
+    return resoudreSoundcloud(q, demandePar);
+  }
+
+  // 3. Lien Deezer : catalogue, puis on va chercher le son ailleurs
   if (estURL(q) && /deezer\.com/i.test(q)) {
     const meta = await pisteDeezer(q);
     if (!meta) return { erreur: "Ce lien Deezer n'a pas pu être lu." };
@@ -4175,7 +4229,7 @@ async function resoudre(requete, demandePar) {
     return { ...audio, titre: `${meta.artiste} — ${meta.titre}`.slice(0, 90), via: "Deezer" };
   }
 
-  // 3. Lien Spotify : idem, catalogue seulement
+  // 4. Lien Spotify : idem, catalogue seulement
   if (estURL(q) && /open\.spotify\.com/i.test(q)) {
     if (!SPOTIFY) return { erreur: "Spotify n'est pas configuré. Ajoute `SPOTIFY_ID` et `SPOTIFY_SECRET` sur Railway." };
     const meta = await pisteSpotify(q);
@@ -4196,7 +4250,7 @@ async function resoudre(requete, demandePar) {
     return { ...audio, titre: `${meta.artiste} — ${meta.titre}`.slice(0, 90), via: "Spotify" };
   }
 
-  // 4. YouTube
+  // 5. YouTube + recherche texte
   if (PLAY) {
     try {
       if (estURL(q)) {
@@ -4214,12 +4268,6 @@ async function resoudre(requete, demandePar) {
             titre: v.title.slice(0, 90), url: v.url, duree: v.durationInSec, source: "youtube", demandePar })) };
         }
       }
-      // Lien SoundCloud direct
-      if (estURL(q) && /soundcloud\.com/i.test(q)) {
-        const info = await PLAY.soundcloud(q);
-        return { titre: String(info.name ?? "SoundCloud").slice(0, 90), url: q,
-          duree: Math.round((info.durationInMs ?? 0) / 1000) || null, source: "soundcloud", demandePar };
-      }
 
       // Recherche par nom : SoundCloud d'abord sans cookie, YouTube si cookie
       const audio = await trouverAudio(q, demandePar);
@@ -4227,7 +4275,9 @@ async function resoudre(requete, demandePar) {
       return { erreur: "Aucun résultat audio pour cette recherche. Essaie un autre titre ou un lien SoundCloud / .mp3." };
     } catch (e) {
       console.error("[musique] recherche :", e?.message ?? e);
-      if (estURL(q)) return { titre: q.slice(0, 90), url: q, duree: null, source: "direct", demandePar };
+      if (estURL(q) && !estLienSoundcloud(q)) {
+        return { titre: q.slice(0, 90), url: q, duree: null, source: "direct", demandePar };
+      }
 
       const repli = await replSoundcloud(q, demandePar);
       if (repli) return repli;
@@ -4276,13 +4326,39 @@ function estBlocageYoutube(err) {
   return /confirm you.?re not a bot|sign in to confirm|429|403|consent|too many requests|login_required|bot.?check/i.test(message);
 }
 
+async function rafraichirSoundcloudId() {
+  if (!PLAY) return false;
+  try {
+    const id = process.env.SOUNDCLOUD_ID ?? await PLAY.getFreeClientID();
+    if (!id) return false;
+    await PLAY.setToken({ soundcloud: { client_id: id } });
+    SOUND = true;
+    return true;
+  } catch (e) {
+    console.warn("[musique] refresh SoundCloud :", e?.message ?? e);
+    return false;
+  }
+}
+
 async function fabriquerRessource(piste, volume) {
   const inline = volume !== 100;
 
   // YouTube et SoundCloud passent par play-dl (extraction du vrai flux audio)
   if (PLAY && (piste.source === "youtube" || piste.source === "soundcloud")) {
-    const flux = await PLAY.stream(piste.url, { quality: 2, discordPlayerCompatibility: false });
-    return VOICE.createAudioResource(flux.stream, { inputType: flux.type, inlineVolume: inline });
+    try {
+      const flux = await PLAY.stream(piste.url, { quality: 2, discordPlayerCompatibility: true });
+      return VOICE.createAudioResource(flux.stream, { inputType: flux.type, inlineVolume: inline });
+    } catch (e) {
+      // Client SoundCloud expiré / invalide → on en prend un nouveau et on retente une fois
+      if (piste.source === "soundcloud") {
+        console.warn("[musique] stream SC échoué, refresh client_id :", e?.message ?? e);
+        if (await rafraichirSoundcloudId()) {
+          const flux = await PLAY.stream(piste.url, { quality: 2, discordPlayerCompatibility: true });
+          return VOICE.createAudioResource(flux.stream, { inputType: flux.type, inlineVolume: inline });
+        }
+      }
+      throw e;
+    }
   }
 
   // Lien direct / webradio : ffmpeg s'en charge
