@@ -103,11 +103,18 @@
 //     Desactivable avec la variable Railway SUSPEND_WITHOUT_OWNER=false
 //
 //   LECTEUR AUDIO
-//     !play, !skip, !leave, !queue, !pause, !resume, !volume
+//     Prefixe dedie « + » : +play, +skip, +leave, +queue, +pause,
+//     +resume, +volume, +setup. Fonctionne aussi avec le prefixe general.
+//     Une recherche par titre propose 5 resultats du catalogue Deezer et
+//     laisse choisir. Deezer et Spotify ne fournissent QUE le catalogue :
+//     l'audio vient toujours de YouTube ou SoundCloud.
 //     Uniquement dans le CHAT D'UN SALON VOCAL, et seulement si tu es
 //     connecte a ce vocal. YouTube en premier, repli sur lien direct.
-//     Bibliotheques facultatives : si elles manquent, les commandes le
-//     disent au lieu de faire tomber le bot.
+//     YouTube bloque les adresses IP d'hebergeur. Deux parades :
+//       YT_COOKIE       cookie d'un compte Google jetable
+//       SOUNDCLOUD_ID   sinon obtenu automatiquement
+//     Sans cookie, une recherche YouTube qui echoue bascule seule sur
+//     SoundCloud. Les liens directs et webradios marchent toujours.
 //
 //   UNE ACTION A LA FOIS PAR PERSONNE
 //     Deux clics simultanes permettaient d'etre paye deux fois (quotidien,
@@ -1018,6 +1025,15 @@ const DEFAULT_CONFIG = {
   },
 
   brandColor: null,   // couleur d'accent du serveur (entier), null = bleu Discord
+  // Lecteur audio — préfixe dédié pour ne pas encombrer les commandes texte
+  musique: {
+    prefixe: "+",
+    volumeDefaut: 100,
+    quitterVideSec: 60,
+    quitterInactifSec: 300,
+    proposerChoix: true,   // proposer plusieurs titres au lieu de jouer le premier
+  },
+
   roleMenus: [],   // [{ id, title, emoji, desc, max, roleIds }]
 
   // Commandes à préfixe : !ban, ?kick, *mute…
@@ -3904,6 +3920,98 @@ let VOICE = null;   // @discordjs/voice
 let PLAY = null;    // play-dl
 let AUDIO_PRET = false;
 let AUDIO_CAUSE = "non initialisé";
+let COOKIE = false;   // un cookie YouTube est-il fourni ?
+let SOUND = false;    // SoundCloud est-il utilisable ?
+let SPOTIFY = false;  // les clés Spotify sont-elles fournies ?
+
+const sourcesDispo = () => ({
+  youtube: !!PLAY, cookie: COOKIE, soundcloud: SOUND, spotify: SPOTIFY, deezer: true,
+});
+
+/* ========================================================================== */
+/*                      CATALOGUE : DEEZER ET SPOTIFY                         */
+/* ========================================================================== */
+
+/**
+ * Deezer et Spotify ne laissent PAS diffuser leur audio : c'est verrouillé
+ * côté plateforme. On s'en sert donc comme catalogue — pour trouver le titre
+ * et l'artiste exacts — puis on va chercher le son sur YouTube ou SoundCloud.
+ *
+ * L'API publique de Deezer ne demande aucune clé et ne filtre pas les
+ * hébergeurs : c'est notre moteur de recherche principal.
+ */
+async function chercherDeezer(requete, limite = 5) {
+  try {
+    const url = `https://api.deezer.com/search?q=${encodeURIComponent(requete)}&limit=${limite}`;
+    const ctrl = new AbortController();
+    const minuterie = setTimeout(() => ctrl.abort(), 6000);
+    const r = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(minuterie);
+    if (!r.ok) return [];
+    const data = await r.json();
+    return (data?.data ?? []).slice(0, limite).map((p) => ({
+      titre: String(p.title ?? "").slice(0, 80),
+      artiste: String(p.artist?.name ?? "").slice(0, 60),
+      album: String(p.album?.title ?? "").slice(0, 60),
+      duree: p.duration ?? null,
+      pochette: p.album?.cover_medium ?? null,
+    })).filter((x) => x.titre);
+  } catch { return []; }
+}
+
+/** Un lien Deezer précis : on en tire le titre et l'artiste. */
+async function pisteDeezer(url) {
+  const id = url.match(/deezer\.com\/(?:[a-z]{2}\/)?track\/(\d+)/i)?.[1];
+  if (!id) return null;
+  try {
+    const r = await fetch(`https://api.deezer.com/track/${id}`);
+    if (!r.ok) return null;
+    const p = await r.json();
+    return { titre: String(p.title ?? "").slice(0, 80), artiste: String(p.artist?.name ?? "").slice(0, 60),
+      duree: p.duration ?? null };
+  } catch { return null; }
+}
+
+/** Un lien Spotify : nécessite SPOTIFY_ID et SPOTIFY_SECRET sur Railway. */
+async function pisteSpotify(url) {
+  if (!PLAY || !SPOTIFY) return null;
+  try {
+    if (PLAY.is_expired && PLAY.is_expired()) await PLAY.refreshToken();
+    const info = await PLAY.spotify(url);
+    if (info.type === "track") {
+      return { titre: String(info.name ?? "").slice(0, 80),
+        artiste: String(info.artists?.[0]?.name ?? "").slice(0, 60),
+        duree: Math.round((info.durationInMs ?? 0) / 1000) || null };
+    }
+    if (info.type === "playlist" || info.type === "album") {
+      const pistes = await info.all_tracks();
+      return { liste: pistes.slice(0, 50).map((p) => ({
+        titre: String(p.name ?? "").slice(0, 80),
+        artiste: String(p.artists?.[0]?.name ?? "").slice(0, 60),
+        duree: Math.round((p.durationInMs ?? 0) / 1000) || null })) };
+    }
+  } catch (e) { console.error("[musique] Spotify :", e.message); }
+  return null;
+}
+
+/**
+ * Trouve le son d'un titre : YouTube d'abord, SoundCloud ensuite.
+ * C'est l'étape qui fournit réellement l'audio.
+ */
+async function trouverAudio(recherche, demandePar) {
+  if (PLAY) {
+    try {
+      const r = await PLAY.search(recherche, { limit: 1, source: { youtube: "video" } });
+      if (r.length) {
+        return { titre: r[0].title.slice(0, 90), url: r[0].url,
+          duree: r[0].durationInSec, source: "youtube", demandePar };
+      }
+    } catch (e) {
+      if (!estBlocageYoutube(e.message)) console.error("[musique] YouTube :", e.message);
+    }
+  }
+  return replSoundcloud(recherche, demandePar);
+}
 
 /** Extensions qu'ffmpeg lit sans aucune extraction. */
 const EXT_DIRECTES = /\.(mp3|m4a|aac|ogg|opus|wav|flac|webm|mp4)(\?|$)/i;
@@ -3925,11 +4033,44 @@ async function initMusique() {
 
     VOICE = await import("@discordjs/voice");
 
-    try { PLAY = await import("play-dl"); }
-    catch { PLAY = null; console.warn("[musique] play-dl absent : YouTube indisponible, liens directs seulement"); }
+    try {
+      PLAY = await import("play-dl");
+
+      // YouTube bloque les adresses IP d'hébergeur. Un cookie de compte
+      // fait passer la requête pour celle d'un visiteur ordinaire.
+      if (process.env.YT_COOKIE) {
+        try {
+          await PLAY.setToken({ youtube: { cookie: process.env.YT_COOKIE } });
+          COOKIE = true;
+          console.log("[musique] cookie YouTube chargé");
+        } catch (e) { console.warn("[musique] cookie YouTube refusé :", e.message); }
+      }
+
+      // Spotify : catalogue seulement, jamais d'audio
+      if (process.env.SPOTIFY_ID && process.env.SPOTIFY_SECRET) {
+        try {
+          await PLAY.setToken({ spotify: {
+            client_id: process.env.SPOTIFY_ID,
+            client_secret: process.env.SPOTIFY_SECRET,
+            refresh_token: process.env.SPOTIFY_REFRESH ?? "",
+            market: "FR" } });
+          SPOTIFY = true;
+        } catch (e) { console.warn("[musique] Spotify refusé :", e.message); }
+      }
+
+      // SoundCloud ne filtre pas les hébergeurs : c'est notre filet de secours
+      try {
+        const id = process.env.SOUNDCLOUD_ID ?? await PLAY.getFreeClientID();
+        if (id) { await PLAY.setToken({ soundcloud: { client_id: id } }); SOUND = true; }
+      } catch (e) { console.warn("[musique] SoundCloud indisponible :", e.message); }
+    } catch {
+      PLAY = null;
+      console.warn("[musique] play-dl absent : liens directs seulement");
+    }
 
     AUDIO_PRET = true;
-    console.log(`[musique] lecteur prêt · YouTube ${PLAY ? "disponible" : "indisponible"}`);
+    console.log(`[musique] lecteur prêt · YouTube ${PLAY ? (COOKIE ? "avec cookie" : "sans cookie") : "indisponible"}`
+      + ` · SoundCloud ${SOUND ? "disponible" : "indisponible"}`);
     try {
       const rapport = VOICE.generateDependencyReport();
       const ligne = (motif) => (rapport.match(motif)?.[0] ?? "absent").trim();
@@ -3967,6 +4108,7 @@ function creerFile(guild, salonVocal, salonTexte) {
     file: [], joueur, connexion: null, courant: null,
     volume: 100, salonTexte: salonTexte.id, salonVocal: salonVocal.id,
     minuterie: null, ressource: null,
+    quitterVideSec: 60, quitterInactifSec: 300,
   };
   files.set(guild.id, etat);
 
@@ -4010,7 +4152,37 @@ async function resoudre(requete, demandePar) {
       url: q, duree: null, source: "direct", demandePar };
   }
 
-  // 2. YouTube
+  // 2. Lien Deezer : catalogue, puis on va chercher le son ailleurs
+  if (estURL(q) && /deezer\.com/i.test(q)) {
+    const meta = await pisteDeezer(q);
+    if (!meta) return { erreur: "Ce lien Deezer n'a pas pu être lu." };
+    const audio = await trouverAudio(`${meta.artiste} ${meta.titre}`, demandePar);
+    if (!audio) return { erreur: `**${meta.artiste} — ${meta.titre}** est introuvable en audio.` };
+    return { ...audio, titre: `${meta.artiste} — ${meta.titre}`.slice(0, 90), via: "Deezer" };
+  }
+
+  // 3. Lien Spotify : idem, catalogue seulement
+  if (estURL(q) && /open\.spotify\.com/i.test(q)) {
+    if (!SPOTIFY) return { erreur: "Spotify n'est pas configuré. Ajoute `SPOTIFY_ID` et `SPOTIFY_SECRET` sur Railway." };
+    const meta = await pisteSpotify(q);
+    if (!meta) return { erreur: "Ce lien Spotify n'a pas pu être lu." };
+
+    if (meta.liste) {
+      const pistes = [];
+      for (const p of meta.liste.slice(0, 25)) {
+        const a = await trouverAudio(`${p.artiste} ${p.titre}`, demandePar);
+        if (a) pistes.push({ ...a, titre: `${p.artiste} — ${p.titre}`.slice(0, 90), via: "Spotify" });
+      }
+      if (!pistes.length) return { erreur: "Aucun titre de cette playlist n'a pu être trouvé en audio." };
+      return { playlist: pistes };
+    }
+
+    const audio = await trouverAudio(`${meta.artiste} ${meta.titre}`, demandePar);
+    if (!audio) return { erreur: `**${meta.artiste} — ${meta.titre}** est introuvable en audio.` };
+    return { ...audio, titre: `${meta.artiste} — ${meta.titre}`.slice(0, 90), via: "Spotify" };
+  }
+
+  // 4. YouTube
   if (PLAY) {
     try {
       if (estURL(q)) {
@@ -4028,15 +4200,27 @@ async function resoudre(requete, demandePar) {
             titre: v.title.slice(0, 90), url: v.url, duree: v.durationInSec, source: "youtube", demandePar })) };
         }
       }
+      // Lien SoundCloud direct
+      if (estURL(q) && /soundcloud\.com/i.test(q)) {
+        const info = await PLAY.soundcloud(q);
+        return { titre: String(info.name ?? "SoundCloud").slice(0, 90), url: q,
+          duree: Math.round((info.durationInMs ?? 0) / 1000) || null, source: "soundcloud", demandePar };
+      }
+
       const res = await PLAY.search(q, { limit: 1, source: { youtube: "video" } });
       if (!res.length) return { erreur: "Aucun résultat pour cette recherche." };
       const v = res[0];
       return { titre: v.title.slice(0, 90), url: v.url, duree: v.durationInSec, source: "youtube", demandePar };
     } catch (e) {
       console.error("[musique] recherche :", e.message);
-      // 3. Repli : si ça ressemble à une adresse, on tente quand même en direct
       if (estURL(q)) return { titre: q.slice(0, 90), url: q, duree: null, source: "direct", demandePar };
-      return { erreur: "YouTube ne répond pas. Colle un lien audio direct à la place." };
+
+      const repli = await replSoundcloud(q, demandePar);
+      if (repli) return repli;
+
+      return { erreur: estBlocageYoutube(e.message)
+        ? "YouTube bloque l'adresse de l'hébergeur. Colle un lien SoundCloud, un lien `.mp3` ou une webradio."
+        : "YouTube ne répond pas. Colle un lien audio direct à la place." };
     }
   }
 
@@ -4047,6 +4231,33 @@ async function resoudre(requete, demandePar) {
 /* ========================================================================== */
 /*                              LECTURE                                       */
 /* ========================================================================== */
+
+/**
+ * Propose plusieurs titres du catalogue Deezer, pour que la personne
+ * choisisse elle-même lequel jouer.
+ * @returns {Promise<Array<{titre, artiste, duree, recherche}>>}
+ */
+async function propositions(requete, limite = 5) {
+  const r = await chercherDeezer(requete, limite);
+  return r.map((p) => ({ ...p, recherche: `${p.artiste} ${p.titre}` }));
+}
+
+/** Cherche la même chose sur SoundCloud, quand YouTube se ferme. */
+async function replSoundcloud(titre, demandePar) {
+  if (!SOUND) return null;
+  try {
+    const res = await PLAY.search(titre, { limit: 1, source: { soundcloud: "tracks" } });
+    if (!res.length) return null;
+    const t = res[0];
+    return { titre: String(t.name ?? titre).slice(0, 90), url: t.url,
+      duree: Math.round((t.durationInMs ?? 0) / 1000) || null, source: "soundcloud", demandePar };
+  } catch { return null; }
+}
+
+/** Le blocage anti-robot de YouTube, reconnu à son message. */
+function estBlocageYoutube(message) {
+  return /confirm you.?re not a bot|sign in to confirm|429|403|consent/i.test(String(message ?? ""));
+}
 
 async function fabriquerRessource(piste, volume) {
   const inline = volume !== 100;
@@ -4078,7 +4289,7 @@ async function suivant(guild) {
   const piste = etat.file.shift();
   if (!piste) {
     etat.courant = null;
-    programmerDepart(guild, 5 * 60_000, "Plus rien à jouer");
+    programmerDepart(guild, (etat.quitterInactifSec ?? 300) * 1000, "Plus rien à jouer");
     return;
   }
 
@@ -4100,6 +4311,33 @@ async function suivant(guild) {
       ] }));
   } catch (e) {
     console.error("[musique] lecture :", e.message);
+
+    // YouTube refuse l'hébergeur : on retente la même piste sur SoundCloud
+    if (piste.source === "youtube" && estBlocageYoutube(e.message)) {
+      const repli = await replSoundcloud(piste.titre, piste.demandePar);
+      if (repli) {
+        await annoncer(guild, embed({ guild, color: COLORS.warning,
+          author: { name: "🔁  Repli sur SoundCloud" },
+          description: `YouTube a refusé **${piste.titre}**.\nJe le rejoue depuis SoundCloud.` }));
+        etat.file.unshift(repli);
+        return suivant(guild);
+      }
+      await annoncer(guild, embed({ guild, color: COLORS.danger,
+        author: { name: "🚫  YouTube bloque le serveur" },
+        description: [
+          `**${piste.titre}**`,
+          "",
+          "YouTube refuse les adresses d'hébergeur et demande une connexion.",
+          "",
+          "**Ce qui marche à la place :**",
+          "• un lien SoundCloud",
+          "• un lien audio direct (`.mp3`, `.m4a`) ou une webradio",
+          "",
+          "_Pour débloquer YouTube, le propriétaire peut fournir un cookie — voir `YT_COOKIE`._",
+        ].join("\n") }));
+      return suivant(guild);
+    }
+
     await annoncer(guild, embed({ guild, color: COLORS.danger,
       author: { name: `${ICONS.no}  Impossible de lire` },
       description: `**${piste.titre}**\n\`${e.message.slice(0, 120)}\`` }));
@@ -4136,6 +4374,15 @@ function annulerDepart(etat) {
 async function connecter(guild, salonVocal, salonTexte) {
   let etat = files.get(guild.id);
   if (!etat) etat = creerFile(guild, salonVocal, salonTexte);
+
+  // On reprend les réglages du serveur à chaque connexion
+  try {
+    const m = (await getConfig(guild.id)).musique ?? {};
+    etat.quitterVideSec = m.quitterVideSec ?? 60;
+    etat.quitterInactifSec = m.quitterInactifSec ?? 300;
+    if (!etat.courant) etat.volume = m.volumeDefaut ?? 100;
+  } catch { /* réglages par défaut */ }
+
   etat.salonTexte = salonTexte.id;
   etat.salonVocal = salonVocal.id;
 
@@ -4187,7 +4434,7 @@ function surVocalVide(guild, salonId) {
     const m = guild.members.cache.get(vs.id);
     if (!m?.user?.bot) humains++;
   }
-  if (humains === 0) programmerDepart(guild, 60_000, "Le salon s'est vidé.");
+  if (humains === 0) programmerDepart(guild, (etat.quitterVideSec ?? 60) * 1000, "Le salon s'est vidé.");
   else annulerDepart(etat);
 }
 
@@ -4285,6 +4532,192 @@ function fileEmbed(guild) {
     description: `**En cours :** ${etat.courant.titre}\n${dureeTexte(etat.courant.duree)} · demandé par <@${etat.courant.demandePar}>`,
     fields: [{ name: `À suivre (${etat.file.length})`, value: suite || "_rien_" }],
     footer: `Volume ${etat.volume} %` });
+}
+
+
+/* ========================================================================== */
+/*                    CHOIX PARMI PLUSIEURS TITRES                            */
+/* ========================================================================== */
+
+
+/** Propositions en attente : "guild:user" -> { liste, salonVocal, salonTexte } */
+const attentes = new Map();
+const cleChoix = (guildId, userId) => `${guildId}:${userId}`;
+
+setInterval(() => {
+  const t = Date.now();
+  for (const [k, v] of attentes) if (t - v.a > 3 * 60_000) attentes.delete(k);
+}, 60_000).unref();
+
+/** Affiche les titres trouvés et laisse la personne trancher. */
+function vueChoix(guild, liste, requete) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("mus:choix")
+    .setPlaceholder("Lequel veux-tu écouter ?")
+    .addOptions(liste.slice(0, 5).map((p, n) => ({
+      label: `${p.artiste} — ${p.titre}`.slice(0, 100),
+      value: String(n),
+      description: `${p.album ? p.album.slice(0, 60) + " · " : ""}${dureeTexte(p.duree)}`.slice(0, 100),
+    })));
+
+  return {
+    embeds: [embed({
+      guild, color: COLORS.primary, author: { name: "🎵  Plusieurs titres trouvés" },
+      description: [
+        `Recherche : **${String(requete).slice(0, 80)}**`,
+        "",
+        ...liste.slice(0, 5).map((p, n) => `\`${n + 1}.\` **${p.artiste}** — ${p.titre}  ·  ${dureeTexte(p.duree)}`),
+      ].join("\n"),
+      footer: "Catalogue Deezer · le son vient de YouTube ou SoundCloud",
+    })],
+    components: [
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("mus:annuler").setLabel("Annuler")
+          .setStyle(ButtonStyle.Secondary).setEmoji("✖️")),
+    ],
+  };
+}
+
+function memoriserChoix(guildId, userId, donnees) {
+  attentes.set(cleChoix(guildId, userId), { ...donnees, a: Date.now() });
+}
+
+function reprendreChoix(guildId, userId) {
+  const v = attentes.get(cleChoix(guildId, userId));
+  if (v) attentes.delete(cleChoix(guildId, userId));
+  return v ?? null;
+}
+
+/* ========================================================================== */
+/*                          PANNEAU DU LECTEUR                                */
+/* ========================================================================== */
+
+/** Ce que montre « +setup » : l'état réel de chaque source. */
+function vueReglages(guild, config) {
+  const s = sourcesDispo();
+  const m = config.musique ?? {};
+  const etat = files.get(guild.id);
+
+  const ligne = (ok, nom, detail) => `${ok ? "🟢" : "🔴"} **${nom}** — ${detail}`;
+
+  return {
+    embeds: [embed({
+      guild, color: AUDIO_PRET ? COLORS.success : COLORS.danger,
+      author: { name: "🎛️  Réglages du lecteur" },
+      description: [
+        ligne(AUDIO_PRET, "Moteur audio", AUDIO_PRET ? "prêt" : AUDIO_CAUSE),
+        ligne(s.deezer, "Deezer", "catalogue de recherche, aucune clé requise"),
+        ligne(s.youtube && s.cookie, "YouTube", s.cookie ? "cookie fourni" : "sans cookie — l'hébergeur est souvent bloqué"),
+        ligne(s.soundcloud, "SoundCloud", s.soundcloud ? "disponible en repli" : "indisponible"),
+        ligne(s.spotify, "Spotify", s.spotify ? "catalogue disponible" : "clés absentes — `SPOTIFY_ID` et `SPOTIFY_SECRET`"),
+        "",
+        "_Les liens directs et webradios marchent toujours, quoi qu'il arrive._",
+      ].join("\n"),
+      fields: [
+        { name: "Préfixe", value: `\`${m.prefixe ?? "+"}\``, inline: true },
+        { name: "Volume par défaut", value: `${m.volumeDefaut ?? 100} %`, inline: true },
+        { name: "En cours", value: etat?.courant ? etat.courant.titre.slice(0, 40) : "rien", inline: true },
+        { name: "Départ automatique", value:
+          `${m.quitterVideSec ?? 60} s si le salon se vide · ${Math.round((m.quitterInactifSec ?? 300) / 60)} min sans musique`, inline: false },
+      ],
+      footer: "Seul le propriétaire peut modifier ces réglages",
+    })],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("mus:prefixe").setLabel("Changer le préfixe").setStyle(ButtonStyle.Primary).setEmoji("⌨️"),
+        new ButtonBuilder().setCustomId("mus:volume").setLabel("Volume par défaut").setStyle(ButtonStyle.Primary).setEmoji("🔊"),
+        new ButtonBuilder().setCustomId("mus:choixauto")
+          .setLabel((config.musique?.proposerChoix ?? true) ? "Proposer plusieurs titres" : "Jouer le premier trouvé")
+          .setStyle(ButtonStyle.Secondary).setEmoji("🎯"),
+      ),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("mus:test").setLabel("Tester le son").setStyle(ButtonStyle.Success).setEmoji("📻"),
+        new ButtonBuilder().setCustomId("mus:setup").setLabel("Actualiser").setStyle(ButtonStyle.Secondary).setEmoji("🔄"),
+      ),
+    ],
+  };
+}
+
+/** Webradio publique utilisée par le bouton de test. */
+const RADIO_TEST = "https://icecast.radiofrance.fr/fip-midfi.mp3";
+
+
+/* ========================================================================== */
+/*                     BOUTONS ET MENUS DU LECTEUR                            */
+/* ========================================================================== */
+
+/** Traite tout ce qui commence par « mus: ». */
+async function handleMusique(i, config, estProprio) {
+  const action = i.customId.split(":")[1];
+  const repondre = async (p) => (i.replied || i.deferred ? i.editReply(p) : i.update(p).catch(() => i.reply({ ...p, ...EPH })));
+
+  /* --- choix d'un titre parmi les propositions --- */
+  if (action === "choix") {
+    const attente = reprendreChoix(i.guildId, i.user.id);
+    if (!attente) return repondre({ content: "Cette recherche a expiré, relance la commande.", embeds: [], components: [] });
+
+    const choisi = attente.liste[Number(i.values[0])];
+    if (!choisi) return repondre({ content: "Ce titre n'existe plus.", embeds: [], components: [] });
+
+    await repondre({ embeds: [embed({ guild: i.guild, color: COLORS.primary,
+      author: { name: "🔎  Recherche du son" },
+      description: `**${choisi.artiste} — ${choisi.titre}**\nJe cherche l'audio…` })], components: [] });
+
+    const audio = await trouverAudio(choisi.recherche, i.user.id);
+    if (!audio) {
+      return i.editReply({ embeds: [embed({ guild: i.guild, color: COLORS.danger,
+        author: { name: `${ICONS.no}  Audio introuvable` },
+        description: `**${choisi.artiste} — ${choisi.titre}** est au catalogue, mais je n'ai pas réussi à en récupérer le son.\nEssaie un lien direct ou SoundCloud.` })] });
+    }
+
+    audio.titre = `${choisi.artiste} — ${choisi.titre}`.slice(0, 90);
+    const r = await lancerPiste(i.guild, i.member, attente.salonVocal, attente.salonTexte, audio);
+    return i.editReply(r);
+  }
+
+  if (action === "annuler") {
+    reprendreChoix(i.guildId, i.user.id);
+    return repondre({ embeds: [embed({ guild: i.guild, color: COLORS.neutral,
+      author: { name: "Recherche annulée" } })], components: [] });
+  }
+
+  /* --- panneau de réglages, propriétaire seulement --- */
+  if (!estProprio) {
+    return i.reply({ content: "Seul le propriétaire du bot peut modifier ces réglages.", ...EPH }).catch(() => null);
+  }
+
+  if (action === "setup") return repondre(vueReglages(i.guild, config));
+
+  if (action === "test") {
+    const v = verifierSalon({ guild: i.guild, channel: i.channel, member: i.member, author: i.user });
+    if (!v.ok) return i.reply({ content: v.raison, ...EPH }).catch(() => null);
+    await i.deferUpdate().catch(() => null);
+    const piste = { titre: "FIP — webradio de test", url: RADIO_TEST, duree: null, source: "direct", demandePar: i.user.id };
+    const r = await lancerPiste(i.guild, i.member, v.salonVocal, i.channel, piste);
+    return i.followUp({ ...r, ...EPH }).catch(() => null);
+  }
+
+  return null;   // le reste est traité par le panneau appelant
+}
+
+/**
+ * Met une piste en file et démarre si rien ne joue.
+ * Réutilisé par la commande, le menu de choix et le bouton de test.
+ */
+async function lancerPiste(guild, membre, salonVocal, salonTexte, piste) {
+  const etat = await connecter(guild, salonVocal, salonTexte);
+  etat.file.push(piste);
+  annulerDepart(etat);
+
+  if (etat.courant) {
+    return { embeds: [embed({ guild, color: COLORS.primary,
+      author: { name: "➕  Ajouté à la file" },
+      description: `**${piste.titre}**\nPosition : **${etat.file.length}**` })], components: [] };
+  }
+  await suivant(guild);
+  return { embeds: [embed({ guild, color: COLORS.success,
+    author: { name: "▶️  C'est parti" }, description: `**${piste.titre}**` })], components: [] };
 }
 
 /* ========================================================================== */
@@ -8251,11 +8684,36 @@ const PREFIX_COMMANDS = {
     },
   },
   /* ------------------------------- MUSIQUE ------------------------------ */
+  setup: {
+    aliases: ["reglages", "config"], level: 0, usage: "",
+    desc: "Réglages du lecteur audio",
+    embedOnly: true,
+    run: async ({ message, config }) => {
+      await message.channel.send(vueReglages(message.guild, config)).catch(() => null);
+      return { envoye: true };
+    },
+  },
+
   play: {
     aliases: ["p", "jouer"], level: 0, voiceOnly: true, usage: "<lien ou titre>",
     desc: "Joue une piste, ou l'ajoute à la file",
-    run: async ({ message, rest }) => {
+    run: async ({ message, rest, config }) => {
       if (!rest) return pNo("Donne un lien ou un titre à chercher.");
+
+      // Un lien part directement ; un titre passe par le catalogue Deezer
+      const estLien = /^https?:\/\/\S+$/i.test(rest);
+      if (!estLien && (config.musique?.proposerChoix ?? true)) {
+        const v = verifierSalon(message);
+        if (!v.ok) return pNo(v.raison);
+        const liste = await propositions(rest, 5);
+        if (liste.length > 1) {
+          memoriserChoix(message.guild.id, message.author.id,
+            { liste, salonVocal: v.salonVocal, salonTexte: message.channel });
+          await message.channel.send(vueChoix(message.guild, liste, rest)).catch(() => null);
+          return { envoye: true };
+        }
+      }
+
       const r = await jouer(message, rest);
       if (!r) return null;                       // le message de lecture est déjà parti
       return r.ok ? pOk(r.titre, r.texte, COLORS.primary) : pNo(r.texte);
@@ -8355,17 +8813,25 @@ function findCommand(word) {
  */
 async function handlePrefix(message, config) {
   const conf = config.prefix ?? {};
-  if (!conf.enabled) return false;
+  const pMusique = config.musique?.prefixe || "+";
   const p = conf.char || "!";
-  if (!message.content.startsWith(p)) return false;
 
-  const parts = message.content.slice(p.length).trim().split(/\s+/);
+  // Deux préfixes cohabitent : « ! » pour tout, « + » réservé au lecteur.
+  let prefixeUtilise = null;
+  let musiqueSeule = false;
+  if (message.content.startsWith(pMusique)) { prefixeUtilise = pMusique; musiqueSeule = true; }
+  else if (conf.enabled && message.content.startsWith(p)) { prefixeUtilise = p; }
+  if (!prefixeUtilise) return false;
+
+  const parts = message.content.slice(prefixeUtilise.length).trim().split(/\s+/);
   const word = parts.shift() ?? "";
   if (!word) return false;
 
   const [name, cmd] = findCommand(word);
   if (!cmd) return false;
   if ((conf.disabled ?? []).includes(name)) return false;
+  // Le préfixe musique ne donne accès qu'au lecteur
+  if (musiqueSeule && !cmd.voiceOnly && name !== "setup") return false;
 
   const level = permLevel(message.member, config);
   const need = prefixRequiredLevel(name, cmd, config);
@@ -8424,6 +8890,7 @@ async function handlePrefix(message, config) {
     const r = await cmd.run({ message, args: parts, rest, target, config, level });
     if (!r) { await envoyer({ embeds: [embed({ guild: message.guild, color: COLORS.success,
       author: { name: `${ICONS.ok}  Fait` } })] }); return true; }
+    if (r.envoye) { if (conf.deleteInvocation) await message.delete().catch(() => null); return true; }
     if (r.embed) { await envoyer({ embeds: [r.embed] }); return true; }
     await envoyer({ embeds: [embed({ guild: message.guild, color: r.color ?? COLORS.success,
       author: { name: `${r.ok === false ? ICONS.no : ICONS.ok}  ${r.title ?? "Fait"}` },
@@ -13423,6 +13890,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
     if (i.isStringSelectMenu() || i.isUserSelectMenu()) {
       if (i.customId?.startsWith("tv:")) return handleTempVoice(i);
+      if (i.customId?.startsWith("mus:")) return handleMusique(i, await getConfig(i.guildId), isOwner(i.user.id));
     }
 
     if (i.isModalSubmit() && i.customId?.startsWith("tvm:")) return handleTempVoiceModal(i);
@@ -13460,6 +13928,7 @@ client.on(Events.InteractionCreate, async (i) => {
       if (ns === "tv") return handleTempVoice(i);
       if (ns === "cas") return handleCasino(i);
       if (ns === "cr") return handleCrime(i);
+      if (ns === "mus") return handleMusique(i, await getConfig(i.guildId), isOwner(i.user.id));
       return;
     }
   } catch (err) {
@@ -13721,8 +14190,9 @@ client.on(Events.MessageCreate, async (message) => {
     }
   }
 
-  // Commandes à préfixe : !ban, ?kick, *mute…
-  if (config.prefix?.enabled && message.content.startsWith(config.prefix.char || "!")) {
+  // Commandes à préfixe : « ! » pour tout, « + » pour le lecteur audio
+  const prefixes = [config.prefix?.char || "!", config.musique?.prefixe || "+"];
+  if (prefixes.some((p) => message.content.startsWith(p))) {
     const pris = await handlePrefix(message, config).catch((e) => { console.error("[prefixe]", e.message); return false; });
     if (pris) return;
   }
