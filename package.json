@@ -12,15 +12,13 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "discord.js": "^14.27.0",
-    "pg": "^8.13.1"
-  },
-  "optionalDependencies": {
     "@discordjs/voice": "^0.19.0",
     "@napi-rs/canvas": "^1.0.8",
+    "discord.js": "^14.27.0",
     "ffmpeg-static": "^5.2.0",
     "libsodium-wrappers": "^0.7.15",
     "opusscript": "^0.1.1",
+    "pg": "^8.13.1",
     "play-dl": "^1.9.7"
   }
 }

@@ -3915,20 +3915,28 @@ const EXT_DIRECTES = /\.(mp3|m4a|aac|ogg|opus|wav|flac|webm|mp4)(\?|$)/i;
 async function initMusique() {
   if (AUDIO_PRET) return true;
   try {
-    VOICE = await import("@discordjs/voice");
-
-    // ffmpeg fourni par le paquet : évite d'en installer un sur le serveur
+    // L'emplacement d'ffmpeg doit être connu AVANT le chargement de la
+    // bibliothèque vocale : elle le résout et le met en cache au premier usage.
     try {
       const ff = await import("ffmpeg-static");
       const chemin = ff.default ?? ff;
       if (chemin) process.env.FFMPEG_PATH = chemin;
     } catch { /* on tentera l'ffmpeg du système */ }
 
+    VOICE = await import("@discordjs/voice");
+
     try { PLAY = await import("play-dl"); }
     catch { PLAY = null; console.warn("[musique] play-dl absent : YouTube indisponible, liens directs seulement"); }
 
     AUDIO_PRET = true;
     console.log(`[musique] lecteur prêt · YouTube ${PLAY ? "disponible" : "indisponible"}`);
+    try {
+      const rapport = VOICE.generateDependencyReport();
+      const ligne = (motif) => (rapport.match(motif)?.[0] ?? "absent").trim();
+      console.log(`[musique] ffmpeg ${ligne(/- version: [^\n]+/)?.replace("- version: ", "") ?? "?"}`);
+      console.log(`[musique] opus ${/opusscript: (?!not found)/.test(rapport) ? "opusscript" : "@discordjs/opus"}`
+        + ` · chiffrement ${/aes-256-gcm: yes/.test(rapport) ? "natif" : "libsodium"}`);
+    } catch { /* rapport indisponible, sans conséquence */ }
     return true;
   } catch (e) {
     AUDIO_CAUSE = e.message;
