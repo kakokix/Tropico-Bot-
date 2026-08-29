@@ -26,6 +26,11 @@
 //     chaque commande s'ouvre, se ferme et change de niveau requis.
 //     Les niveaux de perm s'appliquent comme au panneau.
 //
+//   BOUTIQUE, CLASSEMENTS ET PROFIL EN IMAGE
+//     Boutique : une vignette par article, prix, et ce qui est achetable.
+//     Classements : podium avec les avatars des trois premiers.
+//     Profil : grade actuel, jauges vers le grade suivant, barre d'XP.
+//
 //   FICHE DE MODERATION EN IMAGE
 //     Le menu contextuel et le panneau affichent tout sur un membre en une
 //     image : avatar, rang, grade, coins, niveau, vocal, messages,
@@ -92,6 +97,12 @@
 //     Une verification incertaine (reseau, coupure) ne declenche jamais la
 //     veille : seul un "membre inconnu" confirme par Discord la provoque.
 //     Desactivable avec la variable Railway SUSPEND_WITHOUT_OWNER=false
+//
+//   CODE DE SECURITE
+//     Toute action qui MODIFIE le bot demande un code. Naviguer reste libre.
+//     Une fois saisi, il ouvre 15 minutes de modifications.
+//     3 essais ratés = 10 minutes de blocage. Comparaison a duree constante.
+//     Variables Railway : OWNER_CODE et OWNER_CODE_MINUTES.
 //
 //   VERROU PROPRIETAIRE
 //     Toute la configuration de 0x est reservee a l'identifiant
@@ -734,7 +745,144 @@ function canActOn(actorLevel, targetMember, config) {
 }
 
 /* ========================================================================== */
-/*                    3 - STOCKAGE (POSTGRESQL / MEMOIRE)                     */
+/*                            3 - CODE DE SECURITE                            */
+/* ========================================================================== */
+
+// verrou.js — code de sécurité exigé avant toute modification du bot.
+//
+// Naviguer dans le panneau reste libre. Dès qu'une action écrit quelque
+// chose, le code est demandé. Une fois saisi, il ouvre une fenêtre de
+// quelques minutes pour éviter de le retaper à chaque clic.
+
+/**
+ * Le code se règle sur Railway avec la variable OWNER_CODE.
+ * La valeur inscrite ici n'est qu'un repli : si ton dépôt GitHub est
+ * public, n'importe qui peut la lire. Mets-la en variable d'environnement.
+ */
+const CODE = process.env.OWNER_CODE || "Gddjkjoufg#@9";
+
+const DUREE_MIN = Number(process.env.OWNER_CODE_MINUTES ?? 15);
+const ESSAIS_MAX = 3;
+const BLOCAGE_MIN = 10;
+
+const ouverts = new Map();   // "guild:user" -> instant d'expiration
+const essais = new Map();    // "guild:user" -> { n, bloqueJusqua }
+
+const cleVerrou = (g, u) => `${g}:${u}`;
+
+/* ========================================================================== */
+/*                          OUVERTURE ET FERMETURE                            */
+/* ========================================================================== */
+
+function estOuvert(guildId, userId) {
+  const fin = ouverts.get(cleVerrou(guildId, userId));
+  if (!fin) return false;
+  if (Date.now() > fin) { ouverts.delete(cleVerrou(guildId, userId)); return false; }
+  return true;
+}
+
+/** Minutes restantes avant re-verrouillage, arrondies au supérieur. */
+function tempsRestant(guildId, userId) {
+  const fin = ouverts.get(cleVerrou(guildId, userId));
+  if (!fin) return 0;
+  return Math.max(0, Math.ceil((fin - Date.now()) / 60_000));
+}
+
+function ouvrir(guildId, userId, minutes = DUREE_MIN) {
+  ouverts.set(cleVerrou(guildId, userId), Date.now() + minutes * 60_000);
+  essais.delete(cleVerrou(guildId, userId));
+  return minutes;
+}
+
+function fermer(guildId, userId) {
+  ouverts.delete(cleVerrou(guildId, userId));
+}
+
+/* ========================================================================== */
+/*                              VÉRIFICATION                                  */
+/* ========================================================================== */
+
+/** Comparaison à durée constante : le temps de réponse ne trahit rien. */
+function memeChaine(a, b) {
+  const x = String(a ?? ""), y = String(b ?? "");
+  let diff = x.length ^ y.length;
+  for (let n = 0; n < Math.max(x.length, y.length); n++) {
+    diff |= (x.charCodeAt(n) || 0) ^ (y.charCodeAt(n) || 0);
+  }
+  return diff === 0;
+}
+
+/**
+ * @returns {{ok:boolean, restants?:number, bloqueMin?:number, minutes?:number}}
+ */
+function verifier(guildId, userId, saisi) {
+  const k = cleVerrou(guildId, userId);
+  const e = essais.get(k) ?? { n: 0, bloqueJusqua: 0 };
+
+  if (e.bloqueJusqua > Date.now()) {
+    return { ok: false, bloqueMin: Math.ceil((e.bloqueJusqua - Date.now()) / 60_000) };
+  }
+
+  if (memeChaine(saisi.trim(), CODE)) {
+    const minutes = ouvrir(guildId, userId);
+    return { ok: true, minutes };
+  }
+
+  e.n += 1;
+  if (e.n >= ESSAIS_MAX) {
+    e.n = 0;
+    e.bloqueJusqua = Date.now() + BLOCAGE_MIN * 60_000;
+    essais.set(k, e);
+    return { ok: false, bloqueMin: BLOCAGE_MIN };
+  }
+  essais.set(k, e);
+  return { ok: false, restants: ESSAIS_MAX - e.n };
+}
+
+/* ========================================================================== */
+/*                        CE QUI EXIGE LE CODE                                */
+/* ========================================================================== */
+
+/** Sections dont les actions modifient le bot lui-même. */
+const SECTIONS_PROTEGEES = new Set([
+  "config", "logs", "protect", "perms", "prefix", "automod", "escalation",
+  "eco", "money", "voice", "ranks", "dest", "tickets", "channels",
+  "rolemenus", "look", "counters", "levels", "setup", "gw", "publish",
+]);
+
+/** Actions sensibles même en dehors de ces sections. */
+const ACTIONS_PROTEGEES = new Set([
+  "mass", "mpsel", "mpcat", "mpall", "mpprot", "mplevel", "mplvlset", "mprun",
+]);
+
+/**
+ * Faut-il le code pour ce clic ?
+ * La navigation reste libre : seules les actions qui écrivent sont bloquées.
+ */
+function exigeCode(section, action, arg) {
+  if (!action) return false;                        // ouverture d'une section
+  if (action === "page") return false;              // changement de page
+  if (section === "home") return false;
+  if (ACTIONS_PROTEGEES.has(action)) return true;
+  if (section === "mod") return ACTIONS_PROTEGEES.has(action) || arg === "mass";
+  return SECTIONS_PROTEGEES.has(section);
+}
+
+/** Résumé affiché sur l'accueil du panneau. */
+function etatVerrou(guildId, userId) {
+  return estOuvert(guildId, userId)
+    ? { ouvert: true, minutes: tempsRestant(guildId, userId) }
+    : { ouvert: false, minutes: 0 };
+}
+
+setInterval(() => {
+  const t = Date.now();
+  for (const [k, fin] of ouverts) if (fin < t) ouverts.delete(k);
+  for (const [k, e] of essais) if (e.bloqueJusqua && e.bloqueJusqua < t && e.n === 0) essais.delete(k);
+}, 5 * 60_000).unref();
+
+/* ========================================================================== */
+/*                    4 - STOCKAGE (POSTGRESQL / MEMOIRE)                     */
 /* ========================================================================== */
 
 // db.js — PostgreSQL avec repli mémoire.
@@ -1621,7 +1769,7 @@ async function listAbsences(guildId) {
 }
 
 /* ========================================================================== */
-/*                   4 - VEILLE : PRESENCE DU PROPRIETAIRE                    */
+/*                   5 - VEILLE : PRESENCE DU PROPRIETAIRE                    */
 /* ========================================================================== */
 
 // owner.js — surveillance de la présence du propriétaire de 0x.
@@ -1760,7 +1908,7 @@ async function watchOwner(guild, { announce = true } = {}) {
 }
 
 /* ========================================================================== */
-/*                     5 - AUTOMOD, ANTI-RAID, ANTI-NUKE                      */
+/*                     6 - AUTOMOD, ANTI-RAID, ANTI-NUKE                      */
 /* ========================================================================== */
 
 // guard.js — automod, anti-raid, anti-nuke.
@@ -1996,7 +2144,7 @@ async function lockAllChannels(guild, lock, reason) {
 }
 
 /* ========================================================================== */
-/*                           6 - DROITS DES SALONS                            */
+/*                           7 - DROITS DES SALONS                            */
 /* ========================================================================== */
 
 // channels.js — qui peut voir, écrire et parler, salon par salon.
@@ -2164,7 +2312,7 @@ function auditChannels(guild) {
 }
 
 /* ========================================================================== */
-/*            7 - TICKETS, GIVEAWAYS, COMPTEURS, PANNEAUX PUBLICS             */
+/*            8 - TICKETS, GIVEAWAYS, COMPTEURS, PANNEAUX PUBLICS             */
 /* ========================================================================== */
 
 // features.js — tickets, giveaways, compteurs vocaux, panneaux publics.
@@ -2895,7 +3043,7 @@ function memberPanel(guild) {
 }
 
 /* ========================================================================== */
-/*                     8 - DESSIN DES JEUX ET DES FICHES                      */
+/*              9 - DESSIN : JEUX, FICHES, BOUTIQUE, CLASSEMENTS              */
 /* ========================================================================== */
 
 // render.js — les jeux du casino dessinés en image.
@@ -3721,8 +3869,279 @@ function renderMemberCard({
   return c.toBuffer("image/png");
 }
 
+
 /* ========================================================================== */
-/*                  9 - ARRIERE-SALLE : ACTIVITES ILLEGALES                   */
+/*                              BOUTIQUE                                      */
+/* ========================================================================== */
+
+/** Pictogramme dessiné pour chaque type d'article. */
+function iconeArticle(ctx, type, cx, cy, r) {
+  ctx.save(); ctx.translate(cx, cy);
+  if (type === "pardon") {
+    ctx.fillStyle = "#8ec7ff";
+    ctx.beginPath();
+    ctx.moveTo(0, -r * 0.5); ctx.quadraticCurveTo(r * 0.7, -r * 0.1, 0, r * 0.6);
+    ctx.quadraticCurveTo(-r * 0.7, -r * 0.1, 0, -r * 0.5);
+    ctx.closePath(); ctx.fill();
+  } else if (type === "xp") {
+    ctx.strokeStyle = "#7b2ff7"; ctx.lineWidth = r * 0.24; ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(-r * 0.55, r * 0.4); ctx.lineTo(-r * 0.15, -r * 0.1);
+    ctx.lineTo(r * 0.15, r * 0.15); ctx.lineTo(r * 0.6, -r * 0.5);
+    ctx.stroke();
+  } else if (type === "multiplier") {
+    ctx.fillStyle = "#ff7f50";
+    ctx.beginPath();
+    ctx.moveTo(0, -r * 0.65); ctx.lineTo(r * 0.4, r * 0.05);
+    ctx.lineTo(r * 0.14, r * 0.05); ctx.lineTo(r * 0.2, r * 0.65);
+    ctx.lineTo(-r * 0.4, -r * 0.05); ctx.lineTo(-r * 0.12, -r * 0.05);
+    ctx.closePath(); ctx.fill();
+  } else if (type === "customrole") {
+    etoile(ctx, 0, 0, r * 0.62, "#ff2d95");
+  } else {
+    ctx.fillStyle = "#3ddc84";
+    ctx.beginPath(); ctx.arc(0, -r * 0.18, r * 0.34, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(0, r * 0.55, r * 0.58, r * 0.36, 0, Math.PI, 0); ctx.fill();
+  }
+  ctx.restore();
+}
+
+const NOM_TYPE = { pardon: "Pardon", xp: "Expérience", multiplier: "Multiplicateur",
+                   customrole: "Rôle personnalisé", role: "Rôle du serveur" };
+
+function renderShop({ articles, solde, joueur, avatar, serveur, monnaie }) {
+  if (!PRET) return null;
+  const lignes = Math.ceil(Math.min(articles.length, 8) / 2) || 1;
+  const L = 1000, H = 150 + lignes * 108 + 40;
+  const { c, ctx } = scene(L, H);
+  entete(ctx, L, "BOUTIQUE", joueur, undefined, avatar);
+
+  // solde en haut à droite
+  const bx = L - 230;
+  arrondi(ctx, bx, 28, 190, 34, 17);
+  ctx.fillStyle = "rgba(212,175,55,0.16)"; ctx.fill();
+  piece(ctx, bx + 22, 45, 11);
+  ctx.fillStyle = solde < 0 ? "#ff4757" : P.orClair; ctx.font = f(15, true);
+  ctx.textAlign = "left";
+  ctx.fillText(solde < 0 ? `− ${nb(-solde)}` : nb(solde), bx + 40, 51);
+
+  if (!articles.length) {
+    ctx.fillStyle = P.faible; ctx.font = f(18); ctx.textAlign = "center";
+    ctx.fillText("La boutique est vide pour le moment.", L / 2, H / 2);
+    ctx.textAlign = "left";
+    return c.toBuffer("image/png");
+  }
+
+  const cw = 450, ch = 96, gx = 40, gy = 118, gap = 20;
+  articles.slice(0, 8).forEach((a, n) => {
+    const x = gx + (n % 2) * (cw + gap), y = gy + Math.floor(n / 2) * (ch + 12);
+    const abordable = solde >= a.prix;
+
+    arrondi(ctx, x, y, cw, ch, 16);
+    ctx.fillStyle = abordable ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.02)"; ctx.fill();
+    ctx.strokeStyle = abordable ? P.bord : "rgba(255,255,255,0.05)"; ctx.lineWidth = 1.5; ctx.stroke();
+
+    // vignette du type
+    arrondi(ctx, x + 14, y + 16, 64, 64, 14);
+    ctx.fillStyle = abordable ? "rgba(255,255,255,0.06)" : "rgba(255,255,255,0.03)"; ctx.fill();
+    ctx.globalAlpha = abordable ? 1 : 0.4;
+    iconeArticle(ctx, a.type, x + 46, y + 48, 22);
+    ctx.globalAlpha = 1;
+
+    ctx.textAlign = "left";
+    ctx.fillStyle = abordable ? P.texte : "rgba(255,255,255,0.4)"; ctx.font = f(19, true);
+    ctx.fillText(propre(a.nom).slice(0, 26), x + 92, y + 40);
+    ctx.fillStyle = P.faible; ctx.font = f(13);
+    ctx.fillText(NOM_TYPE[a.type] ?? "Article", x + 92, y + 62);
+
+    // prix
+    ctx.textAlign = "right";
+    ctx.fillStyle = abordable ? P.orClair : "#8a6f2a"; ctx.font = f(21, true);
+    ctx.fillText(nb(a.prix), x + cw - 20, y + 46);
+    ctx.fillStyle = abordable ? "rgba(61,220,132,0.8)" : "rgba(255,71,87,0.75)"; ctx.font = f(12, true);
+    ctx.fillText(abordable ? "ACHETABLE" : `IL MANQUE ${nb(a.prix - solde)}`, x + cw - 20, y + 68);
+    ctx.textAlign = "left";
+  });
+
+  if (articles.length > 8) {
+    ctx.fillStyle = P.tres; ctx.font = f(13); ctx.textAlign = "center";
+    ctx.fillText(`… et ${articles.length - 8} autre(s) article(s) dans le menu`, L / 2, H - 26);
+    ctx.textAlign = "left";
+  }
+  ctx.textAlign = "right"; ctx.fillStyle = P.tres; ctx.font = f(12);
+  ctx.fillText(`0x • ${propre(serveur ?? "")}`, L - 30, H - 20);
+  ctx.textAlign = "left";
+  return c.toBuffer("image/png");
+}
+
+/* ========================================================================== */
+/*                             CLASSEMENT                                     */
+/* ========================================================================== */
+
+/**
+ * Podium pour les trois premiers, puis les suivants en lignes.
+ * `entrees` : [{ nom, valeur, avatar }]
+ */
+function renderLeaderboard({ titre, unite, entrees, serveur, moi }) {
+  if (!PRET) return null;
+  const suite = entrees.slice(3, 10);
+  // 288 pour le podium, 76 avant la première ligne, 46 par ligne, 46 de pied
+  const L = 1000, H = 288 + 76 + Math.max(1, suite.length) * 46 + 46;
+  const { c, ctx } = scene(L, H);
+
+  ctx.textAlign = "left";
+  ctx.fillStyle = P.texte; ctx.font = f(26, true);
+  ctx.fillText(propre(titre).split("").join(" "), 40, 50);
+  ctx.fillStyle = P.faible; ctx.font = f(14);
+  ctx.fillText(propre(serveur ?? ""), 40, 72);
+  ctx.strokeStyle = "rgba(255,255,255,0.07)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(40, 88); ctx.lineTo(L - 40, 88); ctx.stroke();
+
+  const podium = [
+    { i: 1, x: 500, h: 128, teinte: "#f5c518", r: 52 },
+    { i: 0, x: 340, h: 96,  teinte: "#c0c6d4", r: 44 },
+    { i: 2, x: 660, h: 74,  teinte: "#cd7f32", r: 44 },
+  ];
+  const sol = 288;
+  for (const { i: idx, x, h, teinte, r } of podium) {
+    const e = entrees[idx === 1 ? 0 : idx === 0 ? 1 : 2];
+    if (!e) continue;
+    const rang = idx === 1 ? 1 : idx === 0 ? 2 : 3;
+
+    arrondi(ctx, x - 66, sol - h, 132, h, 10);
+    const g = ctx.createLinearGradient(x, sol - h, x, sol);
+    g.addColorStop(0, `${teinte}44`); g.addColorStop(1, "rgba(255,255,255,0.03)");
+    ctx.fillStyle = g; ctx.fill();
+    ctx.strokeStyle = `${teinte}88`; ctx.lineWidth = 1.5; ctx.stroke();
+
+    ctx.textAlign = "center";
+    ctx.fillStyle = teinte; ctx.font = f(30, true);
+    ctx.fillText(String(rang), x, sol - h / 2 + 12);
+
+    const ay = sol - h - r - 14;
+    if (e.avatar) {
+      ctx.save();
+      ctx.beginPath(); ctx.arc(x, ay, r, 0, Math.PI * 2); ctx.closePath(); ctx.clip();
+      try { ctx.drawImage(e.avatar, x - r, ay - r, r * 2, r * 2); } catch { /* illisible */ }
+      ctx.restore();
+    } else {
+      ctx.beginPath(); ctx.arc(x, ay, r, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fill();
+    }
+    ctx.beginPath(); ctx.arc(x, ay, r, 0, Math.PI * 2);
+    ctx.strokeStyle = teinte; ctx.lineWidth = 3.5; ctx.stroke();
+
+    ctx.fillStyle = P.texte; ctx.font = f(16, true);
+    ctx.fillText(propre(e.nom).slice(0, 16), x, sol + 26);
+    ctx.fillStyle = teinte; ctx.font = f(17, true);
+    ctx.fillText(`${nb(e.valeur)} ${propre(unite)}`, x, sol + 48);
+  }
+  ctx.textAlign = "left";
+
+  let y = sol + 76;
+  suite.forEach((e, n) => {
+    const rang = n + 4;
+    const moiCest = moi && e.nom === moi;
+    arrondi(ctx, 40, y, L - 80, 38, 10);
+    ctx.fillStyle = moiCest ? "rgba(123,47,247,0.18)" : "rgba(255,255,255,0.035)"; ctx.fill();
+    if (moiCest) { ctx.strokeStyle = "#7b2ff7"; ctx.lineWidth = 1.5; ctx.stroke(); }
+    ctx.fillStyle = P.faible; ctx.font = f(15, true);
+    ctx.fillText(`${rang}.`, 58, y + 25);
+    ctx.fillStyle = P.texte; ctx.font = f(15);
+    ctx.fillText(propre(e.nom).slice(0, 34), 96, y + 25);
+    ctx.textAlign = "right";
+    ctx.fillStyle = P.orClair; ctx.font = f(16, true);
+    ctx.fillText(`${nb(e.valeur)} ${propre(unite)}`, L - 58, y + 25);
+    ctx.textAlign = "left";
+    y += 46;
+  });
+
+  ctx.textAlign = "right"; ctx.fillStyle = P.tres; ctx.font = f(12);
+  ctx.fillText("0x • NAOYA", L - 30, H - 20);
+  ctx.textAlign = "left";
+  return c.toBuffer("image/png");
+}
+
+/* ========================================================================== */
+/*                          PROFIL PUBLIC                                     */
+/* ========================================================================== */
+
+/** Barre de progression avec son étiquette. */
+function jauge(ctx, x, y, w, valeur, total, teinte, gauche, droite) {
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.textAlign = "left"; ctx.fillText(propre(gauche), x, y - 10);
+  ctx.textAlign = "right"; ctx.fillText(propre(droite), x + w, y - 10);
+  ctx.textAlign = "left";
+  arrondi(ctx, x, y, w, 14, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fill();
+  const part = total > 0 ? Math.max(0, Math.min(1, valeur / total)) : 0;
+  if (part > 0.01) {
+    arrondi(ctx, x, y, Math.max(14, w * part), 14, 7);
+    ctx.fillStyle = teinte; ctx.fill();
+  }
+}
+
+function renderProfile({
+  pseudo, avatar, grade, gradeSuivant, heures, heuresCible, messages, messagesCible,
+  coins, niveau, xp, xpNiveau, xpSuivant, rang, serveur, monnaie,
+}) {
+  if (!PRET) return null;
+  const L = 1000, H = 480;
+  const { c, ctx } = scene(L, H);
+  entete(ctx, L, "PROFIL", pseudo, undefined, avatar);
+
+  arrondi(ctx, 40, 112, 280, 150, 16);
+  ctx.fillStyle = "rgba(255,255,255,0.045)"; ctx.fill();
+  ctx.strokeStyle = P.bord; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.textAlign = "center";
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText("GRADE ACTUEL", 180, 140);
+  ctx.fillStyle = P.orClair; ctx.font = f(24, true);
+  ctx.fillText(propre(grade ?? "aucun").slice(0, 20), 180, 176);
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText(rang ? `${rang} au classement` : "", 180, 202);
+  piece(ctx, 128, 232, 13);
+  ctx.textAlign = "left";
+  ctx.fillStyle = coins < 0 ? "#ff4757" : P.texte; ctx.font = f(20, true);
+  ctx.fillText(coins < 0 ? `− ${nb(-coins)}` : nb(coins), 148, 239);
+
+  const px = 350, pw = L - 350 - 40;
+  arrondi(ctx, px, 112, pw, 150, 16);
+  ctx.fillStyle = "rgba(255,255,255,0.045)"; ctx.fill();
+  ctx.strokeStyle = P.bord; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText(gradeSuivant ? `PROCHAIN GRADE — ${propre(gradeSuivant).toUpperCase()}` : "SOMMET DE L'ÉCHELLE ATTEINT", px + 24, 140);
+
+  if (gradeSuivant) {
+    jauge(ctx, px + 24, 174, pw - 48, heures, heuresCible, "#00d4ff",
+      "Temps vocal", `${Math.floor(heures)} h / ${heuresCible} h`);
+    jauge(ctx, px + 24, 226, pw - 48, messages, messagesCible, "#3ddc84",
+      "Messages", `${nb(messages)} / ${nb(messagesCible)}`);
+  } else {
+    ctx.fillStyle = P.orClair; ctx.font = f(22, true);
+    ctx.fillText("Rien au-dessus.", px + 24, 200);
+  }
+
+  arrondi(ctx, 40, 288, L - 80, 120, 16);
+  ctx.fillStyle = "rgba(255,255,255,0.045)"; ctx.fill();
+  ctx.strokeStyle = P.bord; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = P.faible; ctx.font = f(13);
+  ctx.fillText(`NIVEAU ${niveau}`, 64, 318);
+  ctx.textAlign = "right";
+  ctx.fillStyle = P.texte; ctx.font = f(14);
+  ctx.fillText(`${nb(xp)} XP au total`, L - 64, 318);
+  ctx.textAlign = "left";
+  jauge(ctx, 64, 350, L - 128, xpNiveau, xpSuivant, "#7b2ff7",
+    "Progression du niveau", `${nb(xpNiveau)} / ${nb(xpSuivant)} XP`);
+
+  ctx.textAlign = "right"; ctx.fillStyle = P.tres; ctx.font = f(12);
+  ctx.fillText(`0x • ${propre(serveur ?? "")}`, L - 30, H - 20);
+  ctx.textAlign = "left";
+  return c.toBuffer("image/png");
+}
+
+/* ========================================================================== */
+/*                  10 - ARRIERE-SALLE : ACTIVITES ILLEGALES                  */
 /* ========================================================================== */
 
 // crime.js — le quartier illégal. Réussi, tu gardes tout.
@@ -3955,7 +4374,7 @@ async function blockedByDebt(guildId, userId) {
 }
 
 /* ========================================================================== */
-/*                                10 - CASINO                                 */
+/*                                11 - CASINO                                 */
 /* ========================================================================== */
 
 // casino.js — le casino : jeux réels, probabilités et gains calculés.
@@ -4874,7 +5293,7 @@ async function startMines(i, mines) {
 }
 
 /* ========================================================================== */
-/*                            11 - PURGE DE MASSE                             */
+/*                            12 - PURGE DE MASSE                             */
 /* ========================================================================== */
 
 // masspurge.js — purge de masse : plusieurs salons d'un coup, sans les supprimer.
@@ -5032,7 +5451,7 @@ function previewEmbed(guild, plan, label) {
 }
 
 /* ========================================================================== */
-/*                          12 - VOCAUX TEMPORAIRES                           */
+/*                          13 - VOCAUX TEMPORAIRES                           */
 /* ========================================================================== */
 
 // tempvoice.js — « Créer ton vocal » : salons vocaux temporaires.
@@ -5364,7 +5783,7 @@ async function handleTempVoiceModal(i) {
 }
 
 /* ========================================================================== */
-/*                          13 - RECOMPENSES VOCALES                          */
+/*                          14 - RECOMPENSES VOCALES                          */
 /* ========================================================================== */
 
 // voice.js — récompenses vocales : XP et coins gagnés en restant en vocal.
@@ -5458,7 +5877,7 @@ function voiceSummary(config) {
 }
 
 /* ========================================================================== */
-/*                            14 - MENUS DE ROLES                             */
+/*                            15 - MENUS DE ROLES                             */
 /* ========================================================================== */
 
 // rolemenus.js — panneaux de rôles à choisir soi-même, groupés par catégorie.
@@ -5690,7 +6109,7 @@ async function handleRoleMenuSelect(i) {
 }
 
 /* ========================================================================== */
-/*                                15 - GRADES                                 */
+/*                                16 - GRADES                                 */
 /* ========================================================================== */
 
 // ranks.js — grades gagnés à l'heure de vocal et au message.
@@ -5884,7 +6303,7 @@ function ladderEmbed(guild, config, stats = null) {
 }
 
 /* ========================================================================== */
-/*                      16 - CREATEUR D EMBED ET PALETTE                      */
+/*                      17 - CREATEUR D EMBED ET PALETTE                      */
 /* ========================================================================== */
 
 // embedbuilder.js — créateur d'embed et palette de couleurs du serveur.
@@ -6008,7 +6427,7 @@ async function sendDraft(guild, channel, d) {
 }
 
 /* ========================================================================== */
-/*                   17 - INVITATIONS ET ROLE DE CONFIANCE                    */
+/*                   18 - INVITATIONS ET ROLE DE CONFIANCE                    */
 /* ========================================================================== */
 
 // invites.js — suivi des invitations et rôle de confiance « Like ».
@@ -6238,7 +6657,7 @@ function isTrusted(member, config) {
 }
 
 /* ========================================================================== */
-/*                      18 - ACTIONS, ARTICLES, ESCALADE                      */
+/*                      19 - ACTIONS, ARTICLES, ESCALADE                      */
 /* ========================================================================== */
 
 // actions.js — la logique métier, appelable depuis n'importe quelle interface.
@@ -6662,7 +7081,7 @@ async function actionGrantCoins(guild, target, amount, moderator, reason) {
 }
 
 /* ========================================================================== */
-/*                          19 - COMMANDES A PREFIXE                          */
+/*                          20 - COMMANDES A PREFIXE                          */
 /* ========================================================================== */
 
 // prefix.js — commandes à préfixe. Le caractère et la liste se règlent au panneau.
@@ -6968,7 +7387,7 @@ async function handlePrefix(message, config) {
 }
 
 /* ========================================================================== */
-/*                 20 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
+/*                 21 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
 /* ========================================================================== */
 
 // coinsspace.js — remplissage complet de la catégorie ESPACE COINS.
@@ -7237,7 +7656,7 @@ async function setupCoinsSpace(guild, memberPanelFactory) {
 }
 
 /* ========================================================================== */
-/*                21 - AFFECTATION ET VERIFICATION DES SALONS                 */
+/*                22 - AFFECTATION ET VERIFICATION DES SALONS                 */
 /* ========================================================================== */
 
 // destinations.js — la table d'affectation : quel panneau, quelle fonction, quel salon.
@@ -7551,7 +7970,7 @@ function summarizeIssues(results) {
 }
 
 /* ========================================================================== */
-/*                       22 - INSTALLATION AUTOMATIQUE                        */
+/*                       23 - INSTALLATION AUTOMATIQUE                        */
 /* ========================================================================== */
 
 // setup.js — installation automatique. Un bouton, tout est branché.
@@ -7818,7 +8237,7 @@ function setupReport(guild, result) {
 }
 
 /* ========================================================================== */
-/*             23 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
+/*             24 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
 /* ========================================================================== */
 
 // panel.js — l'interface complète. Tout réglage du bot est atteignable ici.
@@ -7992,12 +8411,14 @@ async function homeView(i, config) {
   const checks = owner ? await diagnose(i.guild, config) : [];
   const counts = await computeCounts(i.guild);
   const problems = checks.filter((c) => !c.ok);
+  const verrou = etatVerrou(i.guildId, i.user.id);
 
   const etat = [
     `${dot(config.automod.enabled)} Automod`, `${dot(config.antiraid.enabled)} Anti-raid`,
     `${dot(config.antinuke.enabled)} Anti-nuke`, `${dot(config.logsEnabled)} Journaux`,
     `${dot(config.levelsEnabled)} Niveaux`, `${dot(config.economy.enabled)} Économie`,
-  ].join("  ·  ");
+  ].join("  ·  ")
+    + `\n${verrou.ouvert ? `🔓 Modifications ouvertes — ${verrou.minutes} min restantes` : "🔒 Code exigé pour toute modification"}`;
 
   const main = embed({
     guild: i.guild,
@@ -8023,6 +8444,8 @@ async function homeView(i, config) {
     components.push(row(
       btn("p:setup:run", "Tout installer", ButtonStyle.Success, "⚡"),
       btn("p:setup:publish", "Mettre à jour les panneaux", ButtonStyle.Primary, "🔄"),
+      btn("p:verrou:basculer", verrou.ouvert ? `Verrouiller (${verrou.minutes} min)` : "Déverrouiller",
+        verrou.ouvert ? ButtonStyle.Success : ButtonStyle.Secondary, verrou.ouvert ? "🔓" : "🔒"),
       btn("p:setup:defaults", "Réglages recommandés", ButtonStyle.Secondary, "🎚️"),
       btn("p:home", "Rafraîchir", ButtonStyle.Secondary, "🔄"),
     ));
@@ -9160,6 +9583,56 @@ async function buildSection(id, i, config, page = null) {
   return homeView(i, config);
 }
 
+/**
+ * Attache une image au message. Repli silencieux sur le texte si le dessin
+ * est éteint ou si le rendu échoue.
+ */
+async function avecVisuel(payload, fabriquer) {
+  if (!renderReady()) return payload;
+  try {
+    const buffer = await fabriquer();
+    if (!buffer) return payload;
+    const nom = `0x-${Date.now()}.png`;
+    const e = payload.embeds?.[0];
+    if (e?.setImage) {
+      e.setImage(`attachment://${nom}`);
+      e.data.description = undefined;
+      e.data.fields = [];
+    }
+    return { ...payload, files: [{ attachment: buffer, name: nom }], attachments: [] };
+  } catch (err) {
+    console.error("[visuel]", err.message);
+    return payload;
+  }
+}
+
+/** Récupère jusqu'à trois avatars pour le podium d'un classement. */
+async function avatarsPodium(guild, ids) {
+  const out = [];
+  for (const id of ids.slice(0, 3)) {
+    const m = guild.members.cache.get(id) ?? await guild.members.fetch(id).catch(() => null);
+    out.push(m ? await chargerAvatar(m.user.displayAvatarURL({ extension: "png", size: 128 })) : null);
+  }
+  return out;
+}
+
+/** Nom affichable d'un membre, même s'il a quitté. */
+async function nomDe(guild, id) {
+  const m = guild.members.cache.get(id) ?? await guild.members.fetch(id).catch(() => null);
+  return m?.displayName ?? m?.user?.username ?? "Parti du serveur";
+}
+
+/** Classement en image, avec repli texte. */
+async function classementVisuel(i, titre, unite, brut, valeurDe) {
+  const entrees = [];
+  for (const x of brut.slice(0, 10)) entrees.push({ nom: await nomDe(i.guild, x.userId), valeur: valeurDe(x) });
+  const avatars = await avatarsPodium(i.guild, brut.map((x) => x.userId));
+  entrees.forEach((e, n) => { if (n < 3) e.avatar = avatars[n]; });
+  const moi = await nomDe(i.guild, i.user.id);
+  return (payload) => avecVisuel(payload, () =>
+    renderLeaderboard({ titre, unite, entrees, serveur: i.guild.name, moi }));
+}
+
 /** Fiche des droits d'un rôle sur un salon. */
 function roleView(guild, ch, roleId, label) {
   const list = permsFor(ch);
@@ -9297,8 +9770,20 @@ async function handlePanel(i) {
   if (id === "p:home") return respond(i, await buildSection("home", i, config));
   if (id === "p:go") return respond(i, await buildSection(i.values[0], i, config));
 
+  /* ---- code de sécurité avant toute écriture dans la configuration ---- */
+  if (exigeCode(parts[1], parts[2], parts[3]) && !estOuvert(i.guildId, i.user.id)) {
+    return i.showModal(modal(`pm:verrou:ouvrir:${parts[1]}`, "Code de sécurité", [
+      { id: "code", label: "Entre le code pour modifier le bot", required: true, max: 60 },
+    ])).catch(() => null);
+  }
+
   /* -------- installation, interrupteurs : propriétaire uniquement -------- */
   if (parts[1] === "setup" || parts[1] === "sw") {
+    if (isOwner(i.user.id) && !estOuvert(i.guildId, i.user.id)) {
+      return i.showModal(modal("pm:verrou:ouvrir:home", "Code de sécurité", [
+        { id: "code", label: "Entre le code pour modifier le bot", required: true, max: 60 },
+      ])).catch(() => null);
+    }
     if (!isOwner(i.user.id)) return respond(i, { embeds: [embed({ guild: i.guild, color: COLORS.danger,
       author: { name: "🔒  Verrouillé" }, description: `Seul <@${OWNER_ID}> peut modifier la configuration de 0x.` })],
       components: [backRow()] });
@@ -10123,6 +10608,19 @@ async function handlePanel(i) {
   }
 
   /* -------------------------------- APPARENCE ---------------------------- */
+  if (section === "verrou") {
+    if (action === "basculer") {
+      if (estOuvert(i.guildId, i.user.id)) {
+        fermer(i.guildId, i.user.id);
+        return feedback(i, { ok: true, title: "🔒  Verrouillé",
+          text: "Le code sera redemandé à la prochaine modification." }, "home");
+      }
+      return i.showModal(modal("pm:verrou:ouvrir:home", "Code de sécurité", [
+        { id: "code", label: "Entre le code pour modifier le bot", required: true, max: 60 },
+      ]));
+    }
+  }
+
   if (section === "look") {
     if (action === "couleur") {
       if (i.values[0] === "custom") return i.showModal(modal("pm:look:brand", "Couleur personnalisée",
@@ -10909,6 +11407,21 @@ async function handleModal(i, parts, config, level) {
     }
   }
 
+  if (section === "verrou") {
+    const r = verifier(i.guildId, i.user.id, f("code"));
+    if (r.ok) {
+      return feedback(i, { ok: true, title: "🔓  Déverrouillé",
+        text: `Tu peux modifier le bot pendant **${r.minutes} minutes**.\nRelance l'action que tu voulais faire.` },
+        arg || "home");
+    }
+    if (r.bloqueMin) {
+      return feedback(i, { ok: false, title: "🔒  Trop d'essais",
+        text: `Attends **${r.bloqueMin} minutes** avant de réessayer.`, color: COLORS.danger }, "home");
+    }
+    return feedback(i, { ok: false, title: "🔒  Code incorrect",
+      text: `Il te reste **${r.restants}** essai(s).`, color: COLORS.danger }, arg || "home");
+  }
+
   if (section === "look") {
     if (action === "brand") {
       const c = parseColor(f("hex"));
@@ -11296,7 +11809,23 @@ async function handlePublic(i, parts, config) {
 
   if (action === "grade") {
     const stats = await memberStats(i.guildId, i.user.id);
-    return reply({ embeds: [progressEmbed(i.guild, i.user, config, stats)] });
+    const base = { embeds: [progressEmbed(i.guild, i.user, config, stats)] };
+    const place = situate(config, stats);
+    const niv = await getUserLevel(i.guildId, i.user.id);
+    const w2 = await getWallet(i.guildId, i.user.id);
+    return reply(await avecVisuel(base, async () => renderProfile({
+      pseudo: i.member?.displayName ?? i.user.username,
+      avatar: await chargerAvatar(i.user.displayAvatarURL({ extension: "png", size: 128 })),
+      serveur: i.guild.name, monnaie: config.economy.currency,
+      grade: place.current?.name ?? null,
+      gradeSuivant: place.next?.name ?? null,
+      heures: stats.hours, heuresCible: place.next?.hours ?? 0,
+      messages: stats.messages, messagesCible: place.next?.messages ?? 0,
+      coins: w2.coins, niveau: niv.level, xp: niv.xp,
+      xpNiveau: niv.xp - xpForLevel(niv.level),
+      xpSuivant: xpForLevel(niv.level + 1) - xpForLevel(niv.level),
+      rang: niv.rank ? `${niv.rank}ᵉ` : null,
+    })));
   }
 
   if (action === "echelle") {
@@ -11347,8 +11876,9 @@ async function handlePublic(i, parts, config) {
       const r = await topVoice(i.guildId, 10);
       if (!r.length) return reply({ content: "Aucun temps vocal enregistré pour l'instant." });
       const fmt = (m) => (m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`);
-      return reply({ embeds: [embed({ guild: i.guild, author: { name: "🔊  Top temps vocal" },
-        description: r.map((x, n) => `${medals[n] ?? `**${n + 1}.**`} <@${x.userId}> — ${fmt(x.minutes)}`).join("\n") })] });
+      const habiller = await classementVisuel(i, "TOP VOCAL", "min", r, (x) => x.minutes);
+      return reply(await habiller({ embeds: [embed({ guild: i.guild, author: { name: "🔊  Top temps vocal" },
+        description: r.map((x, n) => `${medals[n] ?? `**${n + 1}.**`} <@${x.userId}> — ${fmt(x.minutes)}`).join("\n") })] }));
     }
     if (arg === "invites") {
       const r = (await topInviters(i.guildId, 25))
@@ -11361,19 +11891,21 @@ async function handlePublic(i, parts, config) {
     if (arg === "coins") {
       const r = await topCoins(i.guildId, 10);
       if (!r.length) return reply({ content: "Personne n'a encore de coins." });
-      return reply({ embeds: [embed({ guild: i.guild, color: COLORS.gold, author: { name: "💰  Top coins" },
-        description: r.map((x, n) => `${medals[n] ?? `**${n + 1}.**`} <@${x.userId}> — ${config.economy.currency} **${num(x.coins)}**`).join("\n") })] });
+      const habillerC = await classementVisuel(i, "TOP COINS", "coins", r, (x) => x.coins);
+      return reply(await habillerC({ embeds: [embed({ guild: i.guild, color: COLORS.gold, author: { name: "💰  Top coins" },
+        description: r.map((x, n) => `${medals[n] ?? `**${n + 1}.**`} <@${x.userId}> — ${config.economy.currency} **${num(x.coins)}**`).join("\n") })] }));
     }
     const r = await topLevels(i.guildId, 10);
     if (!r.length) return reply({ content: "Personne n'a encore d'XP." });
-    return reply({ embeds: [embed({ guild: i.guild, author: { name: "🏆  Top niveaux" },
-      description: r.map((x, n) => `${medals[n] ?? `**${n + 1}.**`} <@${x.userId}> — niveau **${x.level}** · ${num(x.xp)} XP`).join("\n") })] });
+    const habillerN = await classementVisuel(i, "TOP NIVEAUX", "XP", r, (x) => x.xp);
+    return reply(await habillerN({ embeds: [embed({ guild: i.guild, author: { name: "🏆  Top niveaux" },
+      description: r.map((x, n) => `${medals[n] ?? `**${n + 1}.**`} <@${x.userId}> — niveau **${x.level}** · ${num(x.xp)} XP`).join("\n") })] }));
   }
   if (action === "shop") {
     const shop = config.economy.shop;
     if (!shop.length) return reply({ content: "La boutique est vide pour le moment." });
     const w = await getWallet(i.guildId, i.user.id);
-    return reply({ embeds: [embed({ guild: i.guild, color: COLORS.gold, author: { name: "🛒  Boutique" },
+    const vitrine = { embeds: [embed({ guild: i.guild, color: COLORS.gold, author: { name: "🛒  Boutique" },
       description: shop.map((x) => {
         const ty = ITEM_TYPES[x.type ?? "role"];
         const what = (x.type ?? "role") === "role" ? `<@&${x.roleId}>`
@@ -11387,7 +11919,14 @@ async function handlePublic(i, parts, config) {
       components: [row(new StringSelectMenuBuilder().setCustomId("pub:buy").setPlaceholder("Acheter un article…")
         .addOptions(shop.slice(0, 25).map((x) => ({ label: x.name.slice(0, 100), value: x.id,
           emoji: ITEM_TYPES[x.type ?? "role"]?.emoji,
-          description: `${num(x.price)} coins${x.stock != null ? ` · stock ${x.stock}` : ""}`.slice(0, 100) }))))] });
+          description: `${num(x.price)} coins${x.stock != null ? ` · stock ${x.stock}` : ""}`.slice(0, 100) }))))] };
+
+    return reply(await avecVisuel(vitrine, async () => renderShop({
+      joueur: i.member?.displayName ?? i.user.username,
+      avatar: await chargerAvatar(i.user.displayAvatarURL({ extension: "png", size: 128 })),
+      serveur: i.guild.name, solde: w.coins, monnaie: config.economy.currency,
+      articles: shop.map((x) => ({ nom: x.name, type: x.type ?? "role", prix: x.price })),
+    })));
   }
   if (action === "buy") {
     const item = config.economy.shop.find((x) => x.id === i.values[0]);
@@ -11404,7 +11943,7 @@ async function handlePublic(i, parts, config) {
 }
 
 /* ========================================================================== */
-/*                    24 - COMMANDES ET MENUS CONTEXTUELS                     */
+/*                    25 - COMMANDES ET MENUS CONTEXTUELS                     */
 /* ========================================================================== */
 
 // commands.js — trois commandes seulement. Tout le reste passe par /panel.
@@ -11567,6 +12106,11 @@ def(new SlashCommandBuilder().setName("logs").setDescription("Journalisation : o
       return i.reply({ content: `Indexé : **${r.channels}** salons et **${r.categories}** catégories. **${found}/${keys.length}** types de logs routés.`, ...EPH });
     }
 
+    // Les sous-commandes qui écrivent exigent le code de sécurité
+    if (["set", "reset", "actif"].includes(sub) && !estOuvert(i.guildId, i.user.id)) {
+      return i.reply({ content: "🔒 Ouvre d'abord les modifications : `/panel` → bouton **Déverrouiller**.", ...EPH });
+    }
+
     if (sub === "set") {
       const type = i.options.getString("type");
       if (!LOG_ROUTES[type]) return i.reply({ content: "Type inconnu — utilise l'autocomplétion.", ...EPH });
@@ -11611,7 +12155,7 @@ const contextMenus = [
 ];
 
 /* ========================================================================== */
-/*                     25 - CLIENT, EVENEMENTS, DEMARRAGE                     */
+/*                     26 - CLIENT, EVENEMENTS, DEMARRAGE                     */
 /* ========================================================================== */
 
 // index.js — client, événements, démarrage.
