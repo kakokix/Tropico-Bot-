@@ -3995,36 +3995,73 @@ async function pisteSpotify(url) {
 }
 
 /**
- * Trouve le son d'un titre.
- * - Avec cookie YouTube (YT_COOKIE) : YouTube d'abord, SoundCloud en secours.
- * - Sans cookie : SoundCloud d'abord (les IP d'hébergeur sont souvent en 429 sur YT),
- *   puis YouTube en secours.
+ * Trouve le son d'un titre : YouTube d'abord, SoundCloud ensuite.
+ * C'est l'étape qui fournit réellement l'audio.
  */
 async function trouverAudio(recherche, demandePar) {
   if (!PLAY) return replSoundcloud(recherche, demandePar);
 
   const viaYoutube = async () => {
+    if (ytAuRepos()) return null;
     try {
       const r = await PLAY.search(recherche, { limit: 1, source: { youtube: "video" } });
       if (r.length) {
+        ytSignalerSucces();
         return { titre: r[0].title.slice(0, 90), url: r[0].url,
           duree: r[0].durationInSec, source: "youtube", demandePar };
       }
     } catch (e) {
-      if (!estBlocageYoutube(e)) console.error("[musique] YouTube :", e?.message ?? e);
+      if (estBlocageYoutube(e)) ytSignalerBlocage();
+      else console.error("[musique] YouTube :", e?.message ?? e);
     }
     return null;
   };
 
-  // Cookie présent → YouTube fiable en premier
-  if (COOKIE) {
-    return (await viaYoutube()) ?? (await replSoundcloud(recherche, demandePar));
-  }
+  // Avec cookie, YouTube est fiable : on le prend en premier.
+  // Sans cookie, les hébergeurs se prennent un 429 quasi systématique,
+  // donc on interroge SoundCloud d'abord.
+  if (COOKIE) return (await viaYoutube()) ?? (await replSoundcloud(recherche, demandePar));
+  return (await replSoundcloud(recherche, demandePar)) ?? (await viaYoutube());
+}
 
-  // Pas de cookie → SoundCloud d'abord pour éviter le 429 quasi systématique
-  const sc = await replSoundcloud(recherche, demandePar);
-  if (sc) return sc;
-  return viaYoutube();
+/** Reconnaît un lien SoundCloud, y compris les liens courts de partage. */
+const estLienSoundcloud = (s) => /(?:^https?:\/\/)?(?:[\w-]+\.)?soundcloud\.com\//i.test(s)
+  || /on\.soundcloud\.com\//i.test(s);
+
+/** Suit les redirections : on.soundcloud.com → la vraie page du titre. */
+async function resoudreRedirection(url) {
+  for (const methode of ["HEAD", "GET"]) {
+    try {
+      const ctrl = new AbortController();
+      const minuterie = setTimeout(() => ctrl.abort(), 8000);
+      const r = await fetch(url, { method: methode, redirect: "follow", signal: ctrl.signal,
+        headers: methode === "GET" ? { Range: "bytes=0-0" } : undefined });
+      clearTimeout(minuterie);
+      if (r.url) return r.url;
+    } catch { /* on tente la méthode suivante */ }
+  }
+  return url;
+}
+
+/** Interprète un lien SoundCloud, court ou long, en piste jouable. */
+async function resoudreSoundcloud(url, demandePar) {
+  if (!PLAY) return { erreur: "SoundCloud est indisponible sur cet hébergement." };
+  const complet = /on\.soundcloud\.com/i.test(url) ? await resoudreRedirection(url) : url;
+  try {
+    let info = null;
+    try { info = await PLAY.soundcloud(complet); }
+    catch { if (complet !== url) info = await PLAY.soundcloud(url); }
+    if (!info) return { erreur: "Ce lien SoundCloud n'a pas pu être lu." };
+    return {
+      titre: String(info.name ?? info.title ?? "SoundCloud").slice(0, 90),
+      url: info.url || info.permalink || complet,
+      duree: Math.round((info.durationInMs ?? info.duration ?? 0) / 1000) || null,
+      source: "soundcloud", demandePar,
+    };
+  } catch (e) {
+    console.error("[musique] lien SoundCloud :", e?.message ?? e);
+    return { erreur: `Lien SoundCloud illisible : \`${String(e?.message ?? e).slice(0, 80)}\`` };
+  }
 }
 
 /** Extensions qu'ffmpeg lit sans aucune extraction. */
@@ -4123,16 +4160,31 @@ function creerFile(guild, salonVocal, salonTexte) {
     volume: 100, salonTexte: salonTexte.id, salonVocal: salonVocal.id,
     minuterie: null, ressource: null,
     quitterVideSec: 60, quitterInactifSec: 300,
+    numeroLecture: 0,        // identifiant de la lecture courante
+    lectureEnCours: null,    // numéro attendu par les événements
+    enchainement: false,     // un enchaînement est-il déjà en route ?
+    echecs: 0,               // échecs consécutifs
+    boucle: "off",           // off · piste · file
   };
   files.set(guild.id, etat);
 
-  joueur.on(VOICE.AudioPlayerStatus.Idle, () => { suivant(guild).catch(() => null); });
+  // « error » et « Idle » se déclenchent tous les deux pour un même échec.
+  // Sans jeton, la piste s'enchaînait deux fois en parallèle et semblait
+  // tourner en boucle. On identifie donc chaque lecture par un numéro.
+  joueur.on(VOICE.AudioPlayerStatus.Idle, () => {
+    if (etat.lectureEnCours !== etat.numeroLecture) return;   // événement périmé
+    etat.lectureEnCours = null;
+    enchainer(guild).catch(() => null);
+  });
+
   joueur.on("error", (err) => {
     console.error("[musique]", err.message);
+    if (etat.lectureEnCours !== etat.numeroLecture) return;
+    etat.lectureEnCours = null;
     annoncer(guild, embed({ guild, color: COLORS.danger,
       author: { name: `${ICONS.no}  Lecture interrompue` },
-      description: `**${etat.courant?.titre ?? "La piste"}** n'a pas pu être lue jusqu'au bout.\nJe passe à la suivante.` }));
-    suivant(guild).catch(() => null);
+      description: `**${etat.courant?.titre ?? "La piste"}** s'est arrêtée en cours de route.` }));
+    enchainer(guild).catch(() => null);
   });
 
   return etat;
@@ -4150,59 +4202,10 @@ async function annoncer(guild, e) {
 /* ========================================================================== */
 
 const estURL = (s) => /^https?:\/\/\S+$/i.test(s);
-const estLienSoundcloud = (s) => /(?:^https?:\/\/)?(?:[\w-]+\.)?soundcloud\.com\//i.test(s)
-  || /on\.soundcloud\.com\//i.test(s);
-
-/** Suit les redirections (liens courts on.soundcloud.com → page complète). */
-async function resoudreRedirection(url) {
-  try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 8000);
-    const r = await fetch(url, { method: "HEAD", redirect: "follow", signal: ctrl.signal });
-    clearTimeout(t);
-    return r.url || url;
-  } catch {
-    try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 8000);
-      const r = await fetch(url, { method: "GET", redirect: "follow", signal: ctrl.signal,
-        headers: { Range: "bytes=0-0" } });
-      clearTimeout(t);
-      return r.url || url;
-    } catch { return url; }
-  }
-}
-
-/** Interprète un lien SoundCloud (court ou long) en piste jouable. */
-async function resoudreSoundcloud(url, demandePar) {
-  if (!PLAY) return { erreur: "SoundCloud est indisponible sur cet hébergement." };
-  let finalUrl = url;
-  if (/on\.soundcloud\.com/i.test(url)) {
-    finalUrl = await resoudreRedirection(url);
-  }
-  try {
-    // play-dl accepte l'URL finale ; on retente avec l'URL d'origine si besoin
-    let info = null;
-    try { info = await PLAY.soundcloud(finalUrl); }
-    catch { if (finalUrl !== url) info = await PLAY.soundcloud(url); }
-    if (!info) return { erreur: "Ce lien SoundCloud n'a pas pu être lu." };
-    const trackUrl = info.url || info.permalink || finalUrl;
-    return {
-      titre: String(info.name ?? info.title ?? "SoundCloud").slice(0, 90),
-      url: trackUrl,
-      duree: Math.round((info.durationInMs ?? info.duration ?? 0) / 1000) || null,
-      source: "soundcloud",
-      demandePar,
-    };
-  } catch (e) {
-    console.error("[musique] SoundCloud lien :", e?.message ?? e);
-    return { erreur: `Lien SoundCloud illisible : \`${String(e?.message ?? e).slice(0, 80)}\`` };
-  }
-}
 
 /**
  * Transforme une demande en piste jouable.
- * Un lien direct passe tel quel ; sinon on cherche sur YouTube / SoundCloud.
+ * Un lien direct passe tel quel ; sinon on cherche sur YouTube.
  * @returns {Promise<{titre, url, duree, source}|{erreur:string}>}
  */
 async function resoudre(requete, demandePar) {
@@ -4215,10 +4218,8 @@ async function resoudre(requete, demandePar) {
       url: q, duree: null, source: "direct", demandePar };
   }
 
-  // 2. Lien SoundCloud (y compris on.soundcloud.com) — AVANT YouTube
-  if (estURL(q) && estLienSoundcloud(q)) {
-    return resoudreSoundcloud(q, demandePar);
-  }
+  // 2. Lien SoundCloud — traité avant YouTube, il ne bloque jamais
+  if (estURL(q) && estLienSoundcloud(q)) return resoudreSoundcloud(q, demandePar);
 
   // 3. Lien Deezer : catalogue, puis on va chercher le son ailleurs
   if (estURL(q) && /deezer\.com/i.test(q)) {
@@ -4229,7 +4230,7 @@ async function resoudre(requete, demandePar) {
     return { ...audio, titre: `${meta.artiste} — ${meta.titre}`.slice(0, 90), via: "Deezer" };
   }
 
-  // 4. Lien Spotify : idem, catalogue seulement
+  // 3. Lien Spotify : idem, catalogue seulement
   if (estURL(q) && /open\.spotify\.com/i.test(q)) {
     if (!SPOTIFY) return { erreur: "Spotify n'est pas configuré. Ajoute `SPOTIFY_ID` et `SPOTIFY_SECRET` sur Railway." };
     const meta = await pisteSpotify(q);
@@ -4250,7 +4251,7 @@ async function resoudre(requete, demandePar) {
     return { ...audio, titre: `${meta.artiste} — ${meta.titre}`.slice(0, 90), via: "Spotify" };
   }
 
-  // 5. YouTube + recherche texte
+  // 4. YouTube
   if (PLAY) {
     try {
       if (estURL(q)) {
@@ -4268,11 +4269,9 @@ async function resoudre(requete, demandePar) {
             titre: v.title.slice(0, 90), url: v.url, duree: v.durationInSec, source: "youtube", demandePar })) };
         }
       }
-
-      // Recherche par nom : SoundCloud d'abord sans cookie, YouTube si cookie
       const audio = await trouverAudio(q, demandePar);
       if (audio) return audio;
-      return { erreur: "Aucun résultat audio pour cette recherche. Essaie un autre titre ou un lien SoundCloud / .mp3." };
+      return { erreur: "Aucune source n'a le son de ce titre. Essaie un lien SoundCloud ou `.mp3`." };
     } catch (e) {
       console.error("[musique] recherche :", e?.message ?? e);
       if (estURL(q) && !estLienSoundcloud(q)) {
@@ -4284,12 +4283,12 @@ async function resoudre(requete, demandePar) {
 
       return { erreur: estBlocageYoutube(e)
         ? "YouTube bloque l'adresse de l'hébergeur. Colle un lien SoundCloud, un lien `.mp3` ou une webradio."
-        : "Aucune source audio n'a répondu. Colle un lien SoundCloud ou `.mp3`." };
+        : "YouTube ne répond pas. Colle un lien audio direct à la place." };
     }
   }
 
   if (estURL(q)) return { titre: q.slice(0, 90), url: q, duree: null, source: "direct", demandePar };
-  return { erreur: "La recherche audio est indisponible. Colle un lien SoundCloud ou `.mp3`." };
+  return { erreur: "La recherche YouTube est indisponible. Colle un lien audio direct." };
 }
 
 /* ========================================================================== */
@@ -4318,14 +4317,19 @@ async function replSoundcloud(titre, demandePar) {
   } catch { return null; }
 }
 
-/** Le blocage anti-robot de YouTube, reconnu à son message ou code HTTP. */
+/**
+ * Le blocage de YouTube, reconnu à son message ou à son code HTTP.
+ * 429 = trop de requêtes, 403 = interdit, 404 = flux introuvable parce que
+ * l'extraction a été refusée. Les trois viennent du même filtrage.
+ */
 function estBlocageYoutube(err) {
   const message = typeof err === "string" ? err : (err?.message ?? String(err ?? ""));
-  const status = err?.statusCode ?? err?.status ?? err?.code;
-  if (status === 429 || status === 403 || status === "429" || status === "403") return true;
-  return /confirm you.?re not a bot|sign in to confirm|429|403|consent|too many requests|login_required|bot.?check/i.test(message);
+  const code = err?.statusCode ?? err?.status ?? err?.code;
+  if ([429, 403, 404, "429", "403", "404"].includes(code)) return true;
+  return /confirm you.?re not a bot|sign in to confirm|\b(429|403|404)\b|consent|too many requests|login_required|bot.?check|could not extract|unable to extract/i.test(message);
 }
 
+/** Un client SoundCloud expire : on en reprend un et on retente. */
 async function rafraichirSoundcloudId() {
   if (!PLAY) return false;
   try {
@@ -4335,33 +4339,60 @@ async function rafraichirSoundcloudId() {
     SOUND = true;
     return true;
   } catch (e) {
-    console.warn("[musique] refresh SoundCloud :", e?.message ?? e);
+    console.warn("[musique] client SoundCloud :", e?.message ?? e);
     return false;
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/*            MISE AU REPOS DE YOUTUBE APRÈS DES BLOCAGES RÉPÉTÉS             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Insister après un 429 aggrave le blocage. Au bout de deux refus,
+ * on laisse YouTube tranquille dix minutes et on passe par SoundCloud.
+ */
+let ytBlocages = 0;
+let ytReposJusqua = 0;
+
+const ytAuRepos = () => Date.now() < ytReposJusqua;
+
+function ytSignalerBlocage() {
+  ytBlocages += 1;
+  if (ytBlocages >= 2) {
+    ytReposJusqua = Date.now() + 10 * 60_000;
+    ytBlocages = 0;
+    console.warn("[musique] YouTube mis au repos 10 minutes après des blocages répétés");
+  }
+}
+
+function ytSignalerSucces() { ytBlocages = 0; ytReposJusqua = 0; }
+
+/** Minutes restantes avant de retenter YouTube. */
+const ytReposRestant = () => Math.max(0, Math.ceil((ytReposJusqua - Date.now()) / 60_000));
+
 async function fabriquerRessource(piste, volume) {
   const inline = volume !== 100;
 
-  // YouTube et SoundCloud passent par play-dl (extraction du vrai flux audio)
+  // YouTube et SoundCloud passent par play-dl, qui extrait le vrai flux audio
   if (PLAY && (piste.source === "youtube" || piste.source === "soundcloud")) {
     try {
       const flux = await PLAY.stream(piste.url, { quality: 2, discordPlayerCompatibility: true });
+      if (piste.source === "youtube") ytSignalerSucces();
       return VOICE.createAudioResource(flux.stream, { inputType: flux.type, inlineVolume: inline });
     } catch (e) {
-      // Client SoundCloud expiré / invalide → on en prend un nouveau et on retente une fois
-      if (piste.source === "soundcloud") {
-        console.warn("[musique] stream SC échoué, refresh client_id :", e?.message ?? e);
-        if (await rafraichirSoundcloudId()) {
-          const flux = await PLAY.stream(piste.url, { quality: 2, discordPlayerCompatibility: true });
-          return VOICE.createAudioResource(flux.stream, { inputType: flux.type, inlineVolume: inline });
-        }
+      if (piste.source === "youtube" && estBlocageYoutube(e)) ytSignalerBlocage();
+
+      // Client SoundCloud périmé : on en prend un neuf et on retente une fois
+      if (piste.source === "soundcloud" && await rafraichirSoundcloudId()) {
+        const flux = await PLAY.stream(piste.url, { quality: 2, discordPlayerCompatibility: true });
+        return VOICE.createAudioResource(flux.stream, { inputType: flux.type, inlineVolume: inline });
       }
       throw e;
     }
   }
 
-  // Lien direct / webradio : ffmpeg s'en charge
+  // Lien direct ou webradio : ffmpeg s'en charge
   const { stream, type } = await VOICE.demuxProbe(await fluxHttp(piste.url)).catch(() => ({ stream: null, type: null }));
   if (stream) return VOICE.createAudioResource(stream, { inputType: type, inlineVolume: inline });
   return VOICE.createAudioResource(piste.url, { inputType: VOICE.StreamType.Arbitrary, inlineVolume: inline });
@@ -4375,21 +4406,66 @@ async function fluxHttp(url) {
   return Readable.fromWeb(r.body);
 }
 
-/** Passe à la piste suivante, ou programme la déconnexion. */
-async function suivant(guild) {
+/**
+ * Enchaîne sur la piste suivante.
+ *
+ * Trois protections, apprises d'un vrai bug : un seul enchaînement à la fois,
+ * pas de récursion (une boucle bornée), et un compteur d'échecs qui arrête
+ * tout au bout de cinq tentatives ratées d'affilée.
+ */
+async function enchainer(guild) {
   const etat = files.get(guild.id);
   if (!etat) return;
+  if (etat.enchainement) return;          // déjà en route
+  etat.enchainement = true;
 
-  const piste = etat.file.shift();
-  if (!piste) {
-    etat.courant = null;
-    programmerDepart(guild, (etat.quitterInactifSec ?? 300) * 1000, "Plus rien à jouer");
-    return;
+  try {
+    for (let tentative = 0; tentative < 6; tentative++) {
+      // Mode boucle : on remet la piste avant de prendre la suivante
+      if (etat.courant && etat.boucle === "piste") etat.file.unshift(etat.courant);
+      else if (etat.courant && etat.boucle === "file") etat.file.push(etat.courant);
+
+      const piste = etat.file.shift();
+      if (!piste) {
+        etat.courant = null;
+        etat.echecs = 0;
+        programmerDepart(guild, (etat.quitterInactifSec ?? 300) * 1000, "Plus rien à jouer.");
+        return;
+      }
+
+      const resultat = await lireUne(guild, etat, piste);
+      if (resultat === "ok") { etat.echecs = 0; return; }
+
+      // Échec : on ne rejoue jamais la même piste en boucle
+      etat.courant = null;
+      etat.echecs += 1;
+      if (etat.echecs >= 5) {
+        await annoncer(guild, embed({ guild, color: COLORS.danger,
+          author: { name: "⏹️  Lecture arrêtée" },
+          description: "Cinq pistes de suite n'ont pas pu être lues. J'arrête pour ne pas tourner en rond.\n\nEssaie un lien direct ou une webradio pour vérifier que le son sort." }));
+        etat.file.length = 0;
+        etat.echecs = 0;
+        programmerDepart(guild, 30_000, "Trop d'échecs d'affilée.");
+        return;
+      }
+    }
+  } finally {
+    etat.enchainement = false;
   }
+}
 
+/**
+ * Tente une piste. Ne relance jamais l'enchaînement elle-même :
+ * c'est ce qui provoquait la répétition.
+ * @returns {Promise<"ok"|"echec">}
+ */
+async function lireUne(guild, etat, piste) {
   try {
     const ressource = await fabriquerRessource(piste, etat.volume);
     if (ressource.volume) ressource.volume.setVolume(etat.volume / 100);
+
+    etat.numeroLecture += 1;
+    etat.lectureEnCours = etat.numeroLecture;
     etat.ressource = ressource;
     etat.courant = piste;
     etat.joueur.play(ressource);
@@ -4402,55 +4478,43 @@ async function suivant(guild) {
         { name: "Durée", value: piste.duree ? dureeTexte(piste.duree) : "flux continu", inline: true },
         { name: "Demandé par", value: `<@${piste.demandePar}>`, inline: true },
         { name: "En attente", value: `${etat.file.length}`, inline: true },
+        ...(etat.boucle !== "off" ? [{ name: "Boucle", value: etat.boucle === "piste" ? "cette piste" : "la file", inline: true }] : []),
       ] }));
+    return "ok";
   } catch (e) {
-    const detail = String(e?.message ?? e ?? "erreur inconnue").slice(0, 120);
-    console.error("[musique] lecture :", detail, "source=", piste.source);
+    console.error("[musique] lecture :", e.message);
 
-    // Une seule tentative de repli par piste (évite une boucle infinie)
-    if (!piste._repliTente) {
-      let repli = null;
-      let label = null;
-
-      if (piste.source === "youtube") {
-        repli = await replSoundcloud(piste.titre, piste.demandePar);
-        label = "SoundCloud";
-      } else if (piste.source === "soundcloud" && PLAY) {
-        // SoundCloud en 404 / indispo → on tente YouTube
-        try {
-          const r = await PLAY.search(piste.titre, { limit: 1, source: { youtube: "video" } });
-          if (r.length) {
-            repli = { titre: r[0].title.slice(0, 90), url: r[0].url,
-              duree: r[0].durationInSec, source: "youtube", demandePar: piste.demandePar };
-            label = "YouTube";
-          }
-        } catch (err) {
-          console.error("[musique] repli YT :", err?.message ?? err);
-        }
-      }
-
+    // YouTube refuse l'hébergeur : on tente le même titre sur SoundCloud,
+    // une seule fois, et sans repasser par la piste d'origine.
+    if (piste.source === "youtube" && estBlocageYoutube(e.message)) {
+      const repli = await replSoundcloud(piste.titre, piste.demandePar);
       if (repli) {
-        repli._repliTente = true;
         await annoncer(guild, embed({ guild, color: COLORS.warning,
-          author: { name: `🔁  Repli sur ${label}` },
-          description: `**${piste.titre}** inaccessible (\`${detail}\`).\nNouvelle tentative via **${label}**.` }));
-        etat.file.unshift(repli);
-        return suivant(guild);
+          author: { name: "🔁  Repli sur SoundCloud" },
+          description: `YouTube a refusé **${piste.titre}**.\nJe le rejoue depuis SoundCloud.` }));
+        return lireUne(guild, etat, repli);
       }
+      await annoncer(guild, embed({ guild, color: COLORS.danger,
+        author: { name: "🚫  YouTube bloque le serveur" },
+        description: [
+          `**${piste.titre}**`,
+          "",
+          "YouTube refuse les adresses d'hébergeur et demande une connexion.",
+          "",
+          "**Ce qui marche à la place :**",
+          "• un lien SoundCloud",
+          "• un lien audio direct (`.mp3`, `.m4a`) ou une webradio",
+          "",
+          "_Pour débloquer YouTube, ajoute la variable `YT_COOKIE` sur Railway._",
+          ytAuRepos() ? `\n⏸️ YouTube est mis au repos ${ytReposRestant()} min pour ne pas aggraver le blocage.` : "",
+        ].join("\n") }));
+      return "echec";
     }
 
-    const bloquéYt = piste.source === "youtube" && estBlocageYoutube(e);
     await annoncer(guild, embed({ guild, color: COLORS.danger,
-      author: { name: bloquéYt ? "🚫  YouTube bloque le serveur" : `${ICONS.no}  Impossible de lire` },
-      description: [
-        `**${piste.titre}**`,
-        `\`${detail}\``,
-        "",
-        bloquéYt
-          ? "YouTube refuse souvent les IP d'hébergeurs (Railway).\nAjoute **`YT_COOKIE`** sur Railway, ou colle un lien SoundCloud / `.mp3`."
-          : "Aucune source audio n'a pu lire ce titre.\nEssaie un **autre nom**, un lien **SoundCloud**, ou un **`.mp3`**.",
-      ].join("\n") }));
-    return suivant(guild);
+      author: { name: `${ICONS.no}  Impossible de lire` },
+      description: `**${piste.titre}**\n\`${String(e.message).slice(0, 120)}\`` }));
+    return "echec";
   }
 }
 
@@ -4587,7 +4651,7 @@ async function jouer(message, requete) {
   annulerDepart(etat);
 
   const enCours = etat.courant !== null;
-  if (!enCours) await suivant(message.guild);
+  if (!enCours) await enchainer(message.guild);
 
   if (r.playlist) {
     return { ok: true, titre: `${pistes.length} pistes ajoutées`,
@@ -4604,8 +4668,22 @@ function passer(guildId) {
   const etat = files.get(guildId);
   if (!etat?.courant) return { ok: false, texte: "Rien n'est en cours." };
   const titre = etat.courant.titre;
-  etat.joueur.stop(true);        // déclenche « Idle » donc la suivante
+  // Passer doit vraiment passer, même en mode boucle sur la piste
+  const boucle = etat.boucle;
+  etat.boucle = "off";
+  etat.joueur.stop(true);
+  setTimeout(() => { const e = files.get(guildId); if (e) e.boucle = boucle; }, 500);
   return { ok: true, titre: "Piste passée", texte: `**${titre}** a été passée.` };
+}
+
+/** Bascule le mode boucle : aucune · la piste · la file entière. */
+function basculerBoucle(guildId, mode) {
+  const etat = files.get(guildId);
+  if (!etat) return { ok: false, texte: "Rien n'est en cours." };
+  const suite = { off: "piste", piste: "file", file: "off" };
+  etat.boucle = mode ?? suite[etat.boucle] ?? "off";
+  const mots = { off: "Boucle désactivée", piste: "La piste se répète", file: "La file tourne en rond" };
+  return { ok: true, titre: "🔁  Boucle", texte: mots[etat.boucle] };
 }
 
 function mettreEnPause(guildId, reprendre = false) {
@@ -4717,7 +4795,10 @@ function vueReglages(guild, config) {
       description: [
         ligne(AUDIO_PRET, "Moteur audio", AUDIO_PRET ? "prêt" : AUDIO_CAUSE),
         ligne(s.deezer, "Deezer", "catalogue de recherche, aucune clé requise"),
-        ligne(s.youtube && s.cookie, "YouTube", s.cookie ? "cookie fourni" : "sans cookie — l'hébergeur est souvent bloqué"),
+        ligne(s.youtube && s.cookie && !ytAuRepos(), "YouTube",
+          ytAuRepos() ? `au repos ${ytReposRestant()} min — trop de refus`
+            : s.cookie ? "cookie fourni, interrogé en premier"
+            : "sans cookie — interrogé en dernier, l'hébergeur est souvent bloqué"),
         ligne(s.soundcloud, "SoundCloud", s.soundcloud ? "disponible en repli" : "indisponible"),
         ligne(s.spotify, "Spotify", s.spotify ? "catalogue disponible" : "clés absentes — `SPOTIFY_ID` et `SPOTIFY_SECRET`"),
         "",
@@ -4824,15 +4905,9 @@ async function lancerPiste(guild, membre, salonVocal, salonTexte, piste) {
       author: { name: "➕  Ajouté à la file" },
       description: `**${piste.titre}**\nPosition : **${etat.file.length}**` })], components: [] };
   }
-  await suivant(guild);
-  // suivant a déjà annoncé succès ou erreur ; on ne ment pas si la lecture a échoué
-  if (!etat.courant) {
-    return { embeds: [embed({ guild, color: COLORS.warning,
-      author: { name: "⚠️  Lecture non démarrée" },
-      description: `**${piste.titre}**\nVoir le message d'erreur ci-dessus. Un cookie \`YT_COOKIE\` débloque souvent YouTube.` })], components: [] };
-  }
+  await enchainer(guild);
   return { embeds: [embed({ guild, color: COLORS.success,
-    author: { name: "▶️  C'est parti" }, description: `**${etat.courant.titre}**` })], components: [] };
+    author: { name: "▶️  C'est parti" }, description: `**${piste.titre}**` })], components: [] };
 }
 
 /* ========================================================================== */
@@ -8865,6 +8940,14 @@ const PREFIX_COMMANDS = {
     desc: "Reprend la lecture",
     run: ({ message }) => { const r = mettreEnPause(message.guild.id, true); return r.ok ? pOk(r.titre, r.texte) : pNo(r.texte); },
   },
+  loop: {
+    aliases: ["boucle", "repeat"], level: 0, voiceOnly: true, usage: "",
+    desc: "Répète la piste, puis la file, puis rien",
+    run: ({ message }) => {
+      const r = basculerBoucle(message.guild.id);
+      return r.ok ? pOk(r.titre, r.texte) : pNo(r.texte);
+    },
+  },
   volume: {
     aliases: ["vol"], level: 1, voiceOnly: true, usage: "<0 à 200>",
     desc: "Règle le volume",
@@ -8931,22 +9014,11 @@ async function handlePrefix(message, config) {
   const pMusique = config.musique?.prefixe || "+";
   const p = conf.char || "!";
 
-  // Deux préfixes cohabitent : général pour tout, musique réservé au lecteur.
-  // S'ils sont identiques, les deux familles de commandes sont acceptées.
+  // Deux préfixes cohabitent : « ! » pour tout, « + » réservé au lecteur.
   let prefixeUtilise = null;
   let musiqueSeule = false;
-  const startsMus = message.content.startsWith(pMusique);
-  const startsGen = conf.enabled !== false && message.content.startsWith(p);
-
-  if (startsMus && startsGen && pMusique === p) {
-    prefixeUtilise = p;
-    musiqueSeule = false;
-  } else if (startsMus) {
-    prefixeUtilise = pMusique;
-    musiqueSeule = true;
-  } else if (startsGen) {
-    prefixeUtilise = p;
-  }
+  if (message.content.startsWith(pMusique)) { prefixeUtilise = pMusique; musiqueSeule = true; }
+  else if (conf.enabled && message.content.startsWith(p)) { prefixeUtilise = p; }
   if (!prefixeUtilise) return false;
 
   const parts = message.content.slice(prefixeUtilise.length).trim().split(/\s+/);
