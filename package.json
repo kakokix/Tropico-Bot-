@@ -16,6 +16,11 @@
     "pg": "^8.13.1"
   },
   "optionalDependencies": {
-    "@napi-rs/canvas": "^1.0.8"
+    "@discordjs/voice": "^0.19.0",
+    "@napi-rs/canvas": "^1.0.8",
+    "ffmpeg-static": "^5.2.0",
+    "libsodium-wrappers": "^0.7.15",
+    "opusscript": "^0.1.1",
+    "play-dl": "^1.9.7"
   }
 }

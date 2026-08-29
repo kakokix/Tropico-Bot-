@@ -102,6 +102,13 @@
 //     veille : seul un "membre inconnu" confirme par Discord la provoque.
 //     Desactivable avec la variable Railway SUSPEND_WITHOUT_OWNER=false
 //
+//   LECTEUR AUDIO
+//     !play, !skip, !leave, !queue, !pause, !resume, !volume
+//     Uniquement dans le CHAT D'UN SALON VOCAL, et seulement si tu es
+//     connecte a ce vocal. YouTube en premier, repli sur lien direct.
+//     Bibliotheques facultatives : si elles manquent, les commandes le
+//     disent au lieu de faire tomber le bot.
+//
 //   UNE ACTION A LA FOIS PAR PERSONNE
 //     Deux clics simultanes permettaient d'etre paye deux fois (quotidien,
 //     travail, encaissement au demineur). Chaque personne ne peut plus
@@ -3757,8 +3764,523 @@ function renderCrime({ coup, reussi, gain, perte, solde, pression, chance, joueu
   return c.toBuffer("image/png");
 }
 
+
 /* ========================================================================== */
-/*            9 - TICKETS, GIVEAWAYS, COMPTEURS, PANNEAUX PUBLICS             */
+/*                      DEVANTURE DE L'ARRIÈRE-SALLE                          */
+/* ========================================================================== */
+
+/** Pictogramme dessiné pour chaque coup. */
+function iconeCoup(ctx, id, cx, cy, r) {
+  ctx.save(); ctx.translate(cx, cy);
+  if (id === "pickpocket") {
+    ctx.fillStyle = "#b07a4a";
+    ctx.beginPath();
+    ctx.moveTo(-r * 0.5, -r * 0.1);
+    ctx.quadraticCurveTo(-r * 0.62, r * 0.62, 0, r * 0.62);
+    ctx.quadraticCurveTo(r * 0.62, r * 0.62, r * 0.5, -r * 0.1);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = "#8a5a2f"; ctx.lineWidth = r * 0.14;
+    ctx.beginPath(); ctx.arc(0, -r * 0.15, r * 0.34, Math.PI, 0); ctx.stroke();
+  } else if (id === "trafic") {
+    ctx.fillStyle = "#e8574a";
+    arrondi(ctx, -r * 0.55, -r * 0.34, r * 1.1, r * 0.68, r * 0.16); ctx.fill();
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.beginPath(); ctx.arc(0, 0, r * 0.2, 0, Math.PI * 2); ctx.fill();
+  } else if (id === "cambriolage") {
+    ctx.fillStyle = "#7f8ba3";
+    arrondi(ctx, -r * 0.56, -r * 0.46, r * 1.12, r * 0.92, r * 0.12); ctx.fill();
+    ctx.strokeStyle = "#4a5468"; ctx.lineWidth = r * 0.12;
+    ctx.beginPath(); ctx.arc(r * 0.08, 0, r * 0.26, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(r * 0.08, 0); ctx.lineTo(r * 0.08, -r * 0.3); ctx.stroke();
+  } else if (id === "truquer") {
+    ctx.strokeStyle = "#c9cee0"; ctx.lineWidth = r * 0.24; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(-r * 0.42, r * 0.42); ctx.lineTo(r * 0.24, -r * 0.24); ctx.stroke();
+    ctx.fillStyle = "#c9cee0";
+    ctx.beginPath(); ctx.arc(r * 0.36, -r * 0.36, r * 0.28, 0.6, 5.2); ctx.fill();
+  } else {
+    ctx.fillStyle = "#3ddc84";
+    ctx.beginPath();
+    ctx.moveTo(-r * 0.34, -r * 0.34);
+    ctx.quadraticCurveTo(-r * 0.66, r * 0.6, 0, r * 0.6);
+    ctx.quadraticCurveTo(r * 0.66, r * 0.6, r * 0.34, -r * 0.34);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#1a0f2e"; ctx.font = f(Math.round(r * 0.6), true);
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("€", 0, r * 0.18);
+    ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = "#2aa565"; ctx.fillRect(-r * 0.36, -r * 0.42, r * 0.72, r * 0.1);
+  }
+  ctx.restore();
+}
+
+/**
+ * Le hall de l'arrière-salle : les coups possibles, leurs cotes du moment,
+ * la pression policière et l'état du portefeuille.
+ */
+function renderCrimeLobby({ coups, solde, pression, joueur, avatar, monnaie }) {
+  if (!PRET) return null;
+  const L = 1000, H = 200 + coups.length * 78 + 40;
+  const { c, ctx } = scene(L, H);
+  entete(ctx, L, "ARRIERE-SALLE", joueur, undefined, avatar);
+
+  // état du portefeuille, en haut à droite
+  const bx = L - 250;
+  arrondi(ctx, bx, 28, 210, 34, 17);
+  ctx.fillStyle = solde < 0 ? "rgba(255,71,87,0.18)" : "rgba(212,175,55,0.16)"; ctx.fill();
+  piece(ctx, bx + 22, 45, 11);
+  ctx.textAlign = "left";
+  ctx.fillStyle = solde < 0 ? "#ff4757" : P.orClair; ctx.font = f(15, true);
+  ctx.fillText(solde < 0 ? `dette ${nb(-solde)}` : nb(solde), bx + 40, 51);
+
+  // jauge de pression
+  ctx.fillStyle = P.faible; ctx.font = f(12);
+  ctx.fillText("PRESSION POLICIÈRE", 40, 118);
+  ctx.textAlign = "right";
+  ctx.fillText(`${pression}/100`, 520, 118);
+  ctx.textAlign = "left";
+  arrondi(ctx, 40, 128, 480, 12, 6);
+  ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fill();
+  const part = Math.max(0, Math.min(1, pression / 100));
+  if (part > 0.01) {
+    arrondi(ctx, 40, 128, Math.max(12, 480 * part), 12, 6);
+    ctx.fillStyle = pression > 66 ? "#ff4757" : pression > 33 ? "#ffa502" : "#3ddc84"; ctx.fill();
+  }
+  ctx.fillStyle = P.tres; ctx.font = f(12);
+  ctx.textAlign = "right";
+  ctx.fillText("Attrapé, tu rembourses le DOUBLE de ce que tu visais", L - 40, 136);
+  ctx.textAlign = "left";
+
+  // un coup par ligne
+  coups.forEach((k, n) => {
+    const y = 164 + n * 78;
+    arrondi(ctx, 40, y, L - 80, 66, 14);
+    ctx.fillStyle = "rgba(255,255,255,0.04)"; ctx.fill();
+    ctx.strokeStyle = P.bord; ctx.lineWidth = 1; ctx.stroke();
+
+    const teinte = k.chance >= 0.55 ? "#3ddc84" : k.chance >= 0.4 ? "#ffa502" : "#ff4757";
+    ctx.fillStyle = teinte; ctx.fillRect(40, y + 10, 3, 46);
+
+    arrondi(ctx, 58, y + 13, 40, 40, 10);
+    ctx.fillStyle = "rgba(255,255,255,0.06)"; ctx.fill();
+    iconeCoup(ctx, k.id, 78, y + 33, 15);
+
+    ctx.fillStyle = P.texte; ctx.font = f(19, true);
+    ctx.fillText(propre(k.nom).slice(0, 26), 116, y + 30);
+    ctx.fillStyle = P.faible; ctx.font = f(13);
+    ctx.fillText(`butin ${nb(k.min)} à ${nb(k.max)}`, 116, y + 50);
+
+    // barre de réussite
+    const jx = 470, jw = 300;
+    ctx.fillStyle = P.faible; ctx.font = f(12);
+    ctx.fillText("CHANCES DE T'EN SORTIR", jx, y + 24);
+    arrondi(ctx, jx, y + 32, jw, 12, 6);
+    ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fill();
+    arrondi(ctx, jx, y + 32, Math.max(12, jw * k.chance), 12, 6);
+    ctx.fillStyle = teinte; ctx.fill();
+
+    ctx.textAlign = "right";
+    ctx.fillStyle = teinte; ctx.font = f(24, true);
+    ctx.fillText(`${Math.round(k.chance * 100)} %`, L - 60, y + 42);
+    ctx.textAlign = "left";
+  });
+
+  ctx.textAlign = "right"; ctx.fillStyle = P.tres; ctx.font = f(12);
+  ctx.fillText("0x • NAOYA", L - 30, H - 18);
+  ctx.textAlign = "left";
+  return c.toBuffer("image/png");
+}
+
+/* ========================================================================== */
+/*                             9 - LECTEUR AUDIO                              */
+/* ========================================================================== */
+
+// musique.js — lecteur audio : YouTube, liens directs et webradios.
+//
+// Tout est chargé à la demande : si les bibliothèques audio manquent,
+// les commandes répondent poliment au lieu de faire tomber le bot.
+
+
+let VOICE = null;   // @discordjs/voice
+let PLAY = null;    // play-dl
+let AUDIO_PRET = false;
+let AUDIO_CAUSE = "non initialisé";
+
+/** Extensions qu'ffmpeg lit sans aucune extraction. */
+const EXT_DIRECTES = /\.(mp3|m4a|aac|ogg|opus|wav|flac|webm|mp4)(\?|$)/i;
+
+/* ========================================================================== */
+/*                              DÉMARRAGE                                     */
+/* ========================================================================== */
+
+async function initMusique() {
+  if (AUDIO_PRET) return true;
+  try {
+    VOICE = await import("@discordjs/voice");
+
+    // ffmpeg fourni par le paquet : évite d'en installer un sur le serveur
+    try {
+      const ff = await import("ffmpeg-static");
+      const chemin = ff.default ?? ff;
+      if (chemin) process.env.FFMPEG_PATH = chemin;
+    } catch { /* on tentera l'ffmpeg du système */ }
+
+    try { PLAY = await import("play-dl"); }
+    catch { PLAY = null; console.warn("[musique] play-dl absent : YouTube indisponible, liens directs seulement"); }
+
+    AUDIO_PRET = true;
+    console.log(`[musique] lecteur prêt · YouTube ${PLAY ? "disponible" : "indisponible"}`);
+    return true;
+  } catch (e) {
+    AUDIO_CAUSE = e.message;
+    console.warn("[musique] indisponible :", e.message);
+    AUDIO_PRET = false;
+    return false;
+  }
+}
+
+const musiqueReady = () => AUDIO_PRET;
+const musiqueCause = () => AUDIO_CAUSE;
+
+/* ========================================================================== */
+/*                            FILES D'ATTENTE                                 */
+/* ========================================================================== */
+
+/** guildId -> { file, joueur, connexion, courant, volume, salonTexte, minuterie } */
+const files = new Map();
+
+function fileDe(guildId) { return files.get(guildId) ?? null; }
+
+function creerFile(guild, salonVocal, salonTexte) {
+  const joueur = VOICE.createAudioPlayer({
+    behaviors: { noSubscriber: VOICE.NoSubscriberBehavior.Pause },
+  });
+
+  const etat = {
+    file: [], joueur, connexion: null, courant: null,
+    volume: 100, salonTexte: salonTexte.id, salonVocal: salonVocal.id,
+    minuterie: null, ressource: null,
+  };
+  files.set(guild.id, etat);
+
+  joueur.on(VOICE.AudioPlayerStatus.Idle, () => { suivant(guild).catch(() => null); });
+  joueur.on("error", (err) => {
+    console.error("[musique]", err.message);
+    annoncer(guild, embed({ guild, color: COLORS.danger,
+      author: { name: `${ICONS.no}  Lecture interrompue` },
+      description: `**${etat.courant?.titre ?? "La piste"}** n'a pas pu être lue jusqu'au bout.\nJe passe à la suivante.` }));
+    suivant(guild).catch(() => null);
+  });
+
+  return etat;
+}
+
+async function annoncer(guild, e) {
+  const etat = files.get(guild.id);
+  if (!etat) return;
+  const ch = guild.channels.cache.get(etat.salonTexte);
+  if (ch && canSend(ch)) await ch.send({ embeds: [e] }).catch(() => null);
+}
+
+/* ========================================================================== */
+/*                          RÉSOLUTION D'UNE PISTE                            */
+/* ========================================================================== */
+
+const estURL = (s) => /^https?:\/\/\S+$/i.test(s);
+
+/**
+ * Transforme une demande en piste jouable.
+ * Un lien direct passe tel quel ; sinon on cherche sur YouTube.
+ * @returns {Promise<{titre, url, duree, source}|{erreur:string}>}
+ */
+async function resoudre(requete, demandePar) {
+  const q = String(requete ?? "").trim();
+  if (!q) return { erreur: "Donne un lien ou un titre à chercher." };
+
+  // 1. Lien direct — le plus fiable, aucune extraction
+  if (estURL(q) && EXT_DIRECTES.test(q)) {
+    return { titre: decodeURIComponent(q.split("/").pop().split("?")[0]).slice(0, 90),
+      url: q, duree: null, source: "direct", demandePar };
+  }
+
+  // 2. YouTube
+  if (PLAY) {
+    try {
+      if (estURL(q)) {
+        const type = PLAY.yt_validate(q);
+        if (type === "video") {
+          const info = await PLAY.video_basic_info(q);
+          const d = info.video_details;
+          return { titre: d.title.slice(0, 90), url: d.url, duree: d.durationInSec, source: "youtube", demandePar };
+        }
+        if (type === "playlist") {
+          const liste = await PLAY.playlist_info(q, { incomplete: true });
+          const videos = await liste.all_videos();
+          if (!videos.length) return { erreur: "Cette playlist est vide ou privée." };
+          return { playlist: videos.slice(0, 50).map((v) => ({
+            titre: v.title.slice(0, 90), url: v.url, duree: v.durationInSec, source: "youtube", demandePar })) };
+        }
+      }
+      const res = await PLAY.search(q, { limit: 1, source: { youtube: "video" } });
+      if (!res.length) return { erreur: "Aucun résultat pour cette recherche." };
+      const v = res[0];
+      return { titre: v.title.slice(0, 90), url: v.url, duree: v.durationInSec, source: "youtube", demandePar };
+    } catch (e) {
+      console.error("[musique] recherche :", e.message);
+      // 3. Repli : si ça ressemble à une adresse, on tente quand même en direct
+      if (estURL(q)) return { titre: q.slice(0, 90), url: q, duree: null, source: "direct", demandePar };
+      return { erreur: "YouTube ne répond pas. Colle un lien audio direct à la place." };
+    }
+  }
+
+  if (estURL(q)) return { titre: q.slice(0, 90), url: q, duree: null, source: "direct", demandePar };
+  return { erreur: "La recherche YouTube est indisponible. Colle un lien audio direct." };
+}
+
+/* ========================================================================== */
+/*                              LECTURE                                       */
+/* ========================================================================== */
+
+async function fabriquerRessource(piste, volume) {
+  const inline = volume !== 100;
+
+  if (piste.source === "youtube") {
+    const flux = await PLAY.stream(piste.url, { quality: 2, discordPlayerCompatibility: false });
+    return VOICE.createAudioResource(flux.stream, { inputType: flux.type, inlineVolume: inline });
+  }
+
+  // Lien direct : ffmpeg s'en charge, on laisse le type se détecter
+  const { stream, type } = await VOICE.demuxProbe(await fluxHttp(piste.url)).catch(() => ({ stream: null, type: null }));
+  if (stream) return VOICE.createAudioResource(stream, { inputType: type, inlineVolume: inline });
+  return VOICE.createAudioResource(piste.url, { inputType: VOICE.StreamType.Arbitrary, inlineVolume: inline });
+}
+
+/** Ouvre un flux HTTP lisible, en suivant les redirections. */
+async function fluxHttp(url) {
+  const r = await fetch(url, { redirect: "follow" });
+  if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+  const { Readable } = await import("node:stream");
+  return Readable.fromWeb(r.body);
+}
+
+/** Passe à la piste suivante, ou programme la déconnexion. */
+async function suivant(guild) {
+  const etat = files.get(guild.id);
+  if (!etat) return;
+
+  const piste = etat.file.shift();
+  if (!piste) {
+    etat.courant = null;
+    programmerDepart(guild, 5 * 60_000, "Plus rien à jouer");
+    return;
+  }
+
+  try {
+    const ressource = await fabriquerRessource(piste, etat.volume);
+    if (ressource.volume) ressource.volume.setVolume(etat.volume / 100);
+    etat.ressource = ressource;
+    etat.courant = piste;
+    etat.joueur.play(ressource);
+    annulerDepart(etat);
+
+    await annoncer(guild, embed({ guild, color: COLORS.primary,
+      author: { name: "🎵  Lecture en cours" },
+      description: `**${piste.titre}**`,
+      fields: [
+        { name: "Durée", value: piste.duree ? dureeTexte(piste.duree) : "flux continu", inline: true },
+        { name: "Demandé par", value: `<@${piste.demandePar}>`, inline: true },
+        { name: "En attente", value: `${etat.file.length}`, inline: true },
+      ] }));
+  } catch (e) {
+    console.error("[musique] lecture :", e.message);
+    await annoncer(guild, embed({ guild, color: COLORS.danger,
+      author: { name: `${ICONS.no}  Impossible de lire` },
+      description: `**${piste.titre}**\n\`${e.message.slice(0, 120)}\`` }));
+    return suivant(guild);
+  }
+}
+
+const dureeTexte = (s) => {
+  if (!s) return "—";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+  return h ? `${h}:${String(m).padStart(2, "0")}:${String(x).padStart(2, "0")}`
+           : `${m}:${String(x).padStart(2, "0")}`;
+};
+
+/* ========================================================================== */
+/*                            CONNEXION VOCALE                                */
+/* ========================================================================== */
+
+function programmerDepart(guild, delai, raison) {
+  const etat = files.get(guild.id);
+  if (!etat) return;
+  annulerDepart(etat);
+  etat.minuterie = setTimeout(() => {
+    annoncer(guild, embed({ guild, color: COLORS.neutral,
+      author: { name: "👋  Je quitte le vocal" }, description: raison }));
+    quitter(guild.id);
+  }, delai);
+}
+
+function annulerDepart(etat) {
+  if (etat?.minuterie) { clearTimeout(etat.minuterie); etat.minuterie = null; }
+}
+
+async function connecter(guild, salonVocal, salonTexte) {
+  let etat = files.get(guild.id);
+  if (!etat) etat = creerFile(guild, salonVocal, salonTexte);
+  etat.salonTexte = salonTexte.id;
+  etat.salonVocal = salonVocal.id;
+
+  if (etat.connexion && etat.connexion.state.status !== VOICE.VoiceConnectionStatus.Destroyed) return etat;
+
+  const connexion = VOICE.joinVoiceChannel({
+    channelId: salonVocal.id,
+    guildId: guild.id,
+    adapterCreator: guild.voiceAdapterCreator,
+    selfDeaf: true,
+  });
+
+  // Une coupure réseau ne doit pas tuer la session : on tente de reprendre
+  connexion.on(VOICE.VoiceConnectionStatus.Disconnected, async () => {
+    try {
+      await Promise.race([
+        VOICE.entersState(connexion, VOICE.VoiceConnectionStatus.Signalling, 5_000),
+        VOICE.entersState(connexion, VOICE.VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+    } catch { quitter(guild.id); }
+  });
+
+  connexion.subscribe(etat.joueur);
+  etat.connexion = connexion;
+
+  try { await VOICE.entersState(connexion, VOICE.VoiceConnectionStatus.Ready, 20_000); }
+  catch { quitter(guild.id); throw new Error("Je n'ai pas réussi à rejoindre le vocal."); }
+
+  return etat;
+}
+
+function quitter(guildId) {
+  const etat = files.get(guildId);
+  if (!etat) return false;
+  annulerDepart(etat);
+  try { etat.joueur.stop(true); } catch { /* déjà arrêté */ }
+  try { etat.connexion?.destroy(); } catch { /* déjà détruite */ }
+  files.delete(guildId);
+  return true;
+}
+
+/** Le vocal s'est vidé : on part au bout d'une minute. */
+function surVocalVide(guild, salonId) {
+  const etat = files.get(guild.id);
+  if (!etat || etat.salonVocal !== salonId) return;
+  let humains = 0;
+  for (const vs of guild.voiceStates.cache.values()) {
+    if (vs.channelId !== salonId) continue;
+    const m = guild.members.cache.get(vs.id);
+    if (!m?.user?.bot) humains++;
+  }
+  if (humains === 0) programmerDepart(guild, 60_000, "Le salon s'est vidé.");
+  else annulerDepart(etat);
+}
+
+/* ========================================================================== */
+/*                            COMMANDES                                       */
+/* ========================================================================== */
+
+/**
+ * Vérifie qu'on est bien dans le chat d'un vocal, et dans le bon.
+ * @returns {{ok:true, salonVocal}|{ok:false, raison:string}}
+ */
+function verifierSalon(message) {
+  const ch = message.channel;
+  if (ch?.type !== ChannelType.GuildVoice && ch?.type !== ChannelType.GuildStageVoice) {
+    return { ok: false, raison: "Ces commandes ne marchent que dans le **chat d'un salon vocal**." };
+  }
+  const monVocal = message.member?.voice?.channelId;
+  if (!monVocal) return { ok: false, raison: "Connecte-toi d'abord au vocal." };
+  if (monVocal !== ch.id) return { ok: false, raison: `Tu dois être connecté à ${ch} pour piloter la musique ici.` };
+
+  const moi = message.guild.members.me;
+  if (!ch.permissionsFor(moi)?.has(PermissionFlagsBits.Connect)
+      || !ch.permissionsFor(moi)?.has(PermissionFlagsBits.Speak)) {
+    return { ok: false, raison: `Il me manque **Se connecter** ou **Parler** dans ${ch}.` };
+  }
+  return { ok: true, salonVocal: ch };
+}
+
+/** Ajoute une demande à la file et démarre si besoin. */
+async function jouer(message, requete) {
+  const v = verifierSalon(message);
+  if (!v.ok) return { ok: false, texte: v.raison };
+  if (!AUDIO_PRET) return { ok: false, texte: "Le lecteur audio n'est pas disponible sur cet hébergement." };
+
+  const r = await resoudre(requete, message.author.id);
+  if (r.erreur) return { ok: false, texte: r.erreur };
+
+  const etat = await connecter(message.guild, v.salonVocal, message.channel);
+  const pistes = r.playlist ?? [r];
+  etat.file.push(...pistes);
+  annulerDepart(etat);
+
+  const enCours = etat.courant !== null;
+  if (!enCours) await suivant(message.guild);
+
+  if (r.playlist) {
+    return { ok: true, titre: `${pistes.length} pistes ajoutées`,
+      texte: `Playlist mise en file.\nEn attente : **${etat.file.length}**` };
+  }
+  if (enCours) {
+    return { ok: true, titre: "Ajouté à la file",
+      texte: `**${r.titre}**\nPosition : **${etat.file.length}** · ${r.source === "youtube" ? "YouTube" : "lien direct"}` };
+  }
+  return null;   // le message de lecture est déjà parti
+}
+
+function passer(guildId) {
+  const etat = files.get(guildId);
+  if (!etat?.courant) return { ok: false, texte: "Rien n'est en cours." };
+  const titre = etat.courant.titre;
+  etat.joueur.stop(true);        // déclenche « Idle » donc la suivante
+  return { ok: true, titre: "Piste passée", texte: `**${titre}** a été passée.` };
+}
+
+function mettreEnPause(guildId, reprendre = false) {
+  const etat = files.get(guildId);
+  if (!etat?.courant) return { ok: false, texte: "Rien n'est en cours." };
+  if (reprendre) { etat.joueur.unpause(); return { ok: true, titre: "Reprise", texte: `**${etat.courant.titre}**` }; }
+  etat.joueur.mettreEnPause();
+  return { ok: true, titre: "En mettreEnPause", texte: `**${etat.courant.titre}**` };
+}
+
+function reglerVolume(guildId, valeur) {
+  const etat = files.get(guildId);
+  if (!etat) return { ok: false, texte: "Rien n'est en cours." };
+  const v = Math.max(0, Math.min(200, Math.round(valeur)));
+  etat.volume = v;
+  if (etat.ressource?.volume) {
+    etat.ressource.volume.setVolume(v / 100);
+    return { ok: true, titre: "Volume", texte: `Réglé sur **${v} %**.` };
+  }
+  return { ok: true, titre: "Volume",
+    texte: `Réglé sur **${v} %** — il s'appliquera à la piste suivante.\n_À 100 % le son passe sans ré-encodage : c'est la meilleure qualité._` };
+}
+
+function fileEmbed(guild) {
+  const etat = files.get(guild.id);
+  if (!etat?.courant) {
+    return embed({ guild, color: COLORS.neutral, author: { name: "🎵  File d'attente" },
+      description: "Rien en cours." });
+  }
+  const suite = etat.file.slice(0, 10)
+    .map((p, n) => `\`${n + 1}.\` ${p.titre} — ${dureeTexte(p.duree)}`).join("\n");
+  return embed({ guild, color: COLORS.primary, author: { name: "🎵  File d'attente" },
+    description: `**En cours :** ${etat.courant.titre}\n${dureeTexte(etat.courant.duree)} · demandé par <@${etat.courant.demandePar}>`,
+    fields: [{ name: `À suivre (${etat.file.length})`, value: suite || "_rien_" }],
+    footer: `Volume ${etat.volume} %` });
+}
+
+/* ========================================================================== */
+/*            10 - TICKETS, GIVEAWAYS, COMPTEURS, PANNEAUX PUBLICS            */
 /* ========================================================================== */
 
 // features.js — tickets, giveaways, compteurs vocaux, panneaux publics.
@@ -4499,7 +5021,7 @@ function memberPanel(guild) {
 }
 
 /* ========================================================================== */
-/*                  10 - ARRIERE-SALLE : ACTIVITES ILLEGALES                  */
+/*                  11 - ARRIERE-SALLE : ACTIVITES ILLEGALES                  */
 /* ========================================================================== */
 
 // crime.js — le quartier illégal. Réussi, tu gardes tout.
@@ -4607,7 +5129,10 @@ async function attempt(guild, user, jobId) {
 
 const heatBar = (h) => `${bar(h, 100, 10)} ${h}/100`;
 
-async function crimeLobby(guild, user) {
+/**
+ * @param {object} [ctx] interaction, pour l'avatar et le pseudo affiché
+ */
+async function crimeLobby(guild, user, ctx = null) {
   const config = await getConfig(guild.id);
   const c = config.economy.currency;
   const w = await getWallet(guild.id, user.id);
@@ -4619,7 +5144,7 @@ async function crimeLobby(guild, user) {
       + `　risque : **${p} %** de s'en sortir · amende **×2**`;
   });
 
-  return {
+  const vue = {
     embeds: [embed({
       guild,
       color: w.coins < 0 ? COLORS.danger : COLORS.neutral,
@@ -4652,6 +5177,28 @@ async function crimeLobby(guild, user) {
            xb("pub:work", "Travailler (légal)", ButtonStyle.Success, "💼")),
     ],
   };
+
+  if (!renderReady()) return vue;
+  try {
+    const avatar = ctx?.user
+      ? await chargerAvatar(ctx.user.displayAvatarURL({ extension: "png", size: 128 }))
+      : null;
+    const buffer = renderCrimeLobby({
+      joueur: ctx?.member?.displayName ?? ctx?.user?.username ?? user.tag ?? "—",
+      avatar, solde: w.coins, pression: heat, monnaie: c,
+      coups: Object.entries(JOBS).map(([id, j]) => ({
+        id, nom: j.label, min: j.min, max: j.max, chance: realChance(j, heat),
+      })),
+    });
+    if (buffer) {
+      const nom = `arriere-salle-${Date.now()}.png`;
+      vue.embeds[0].setImage(`attachment://${nom}`);
+      vue.embeds[0].data.description = undefined;
+      vue.embeds[0].data.fields = [];
+      return { ...vue, files: [{ attachment: buffer, name: nom }], attachments: [] };
+    }
+  } catch (e) { console.error("[arrière-salle]", e.message); }
+  return vue;
 }
 
 function resultView(guild, user, r, currency) {
@@ -4707,8 +5254,8 @@ async function coup(i) {
     return i.update(payload).catch(() => i.reply({ ...payload, ...EPH }));
   };
 
-  if (action === "lobby") return reply(await crimeLobby(i.guild, i.user));
-  if (action === "open") return i.reply({ ...(await crimeLobby(i.guild, i.user)), ...EPH });
+  if (action === "lobby") return reply(await crimeLobby(i.guild, i.user, i));
+  if (action === "open") return i.reply({ ...(await crimeLobby(i.guild, i.user, i)), ...EPH });
 
   if (action === "go") {
     const w = await getWallet(i.guildId, i.user.id);
@@ -4756,7 +5303,7 @@ async function blockedByDebt(guildId, userId) {
 }
 
 /* ========================================================================== */
-/*                                11 - CASINO                                 */
+/*                                12 - CASINO                                 */
 /* ========================================================================== */
 
 // casino.js — le casino : jeux réels, probabilités et gains calculés.
@@ -5681,7 +6228,7 @@ async function startMines(i, mines) {
 }
 
 /* ========================================================================== */
-/*                            12 - PURGE DE MASSE                             */
+/*                            13 - PURGE DE MASSE                             */
 /* ========================================================================== */
 
 // masspurge.js — purge de masse : plusieurs salons d'un coup, sans les supprimer.
@@ -5839,7 +6386,7 @@ function previewEmbed(guild, plan, label) {
 }
 
 /* ========================================================================== */
-/*                          13 - VOCAUX TEMPORAIRES                           */
+/*                          14 - VOCAUX TEMPORAIRES                           */
 /* ========================================================================== */
 
 // tempvoice.js — « Créer ton vocal » : salons vocaux temporaires.
@@ -6171,7 +6718,7 @@ async function handleTempVoiceModal(i) {
 }
 
 /* ========================================================================== */
-/*                          14 - RECOMPENSES VOCALES                          */
+/*                          15 - RECOMPENSES VOCALES                          */
 /* ========================================================================== */
 
 // voice.js — récompenses vocales : XP et coins gagnés en restant en vocal.
@@ -6265,7 +6812,7 @@ function voiceSummary(config) {
 }
 
 /* ========================================================================== */
-/*                            15 - MENUS DE ROLES                             */
+/*                            16 - MENUS DE ROLES                             */
 /* ========================================================================== */
 
 // rolemenus.js — panneaux de rôles à choisir soi-même, groupés par catégorie.
@@ -6497,7 +7044,7 @@ async function handleRoleMenuSelect(i) {
 }
 
 /* ========================================================================== */
-/*                                16 - GRADES                                 */
+/*                                17 - GRADES                                 */
 /* ========================================================================== */
 
 // ranks.js — grades gagnés à l'heure de vocal et au message.
@@ -6691,7 +7238,7 @@ function ladderEmbed(guild, config, stats = null) {
 }
 
 /* ========================================================================== */
-/*                      17 - CREATEUR D EMBED ET PALETTE                      */
+/*                      18 - CREATEUR D EMBED ET PALETTE                      */
 /* ========================================================================== */
 
 // embedbuilder.js — créateur d'embed et palette de couleurs du serveur.
@@ -6815,7 +7362,7 @@ async function sendDraft(guild, channel, d) {
 }
 
 /* ========================================================================== */
-/*                   18 - INVITATIONS ET ROLE DE CONFIANCE                    */
+/*                   19 - INVITATIONS ET ROLE DE CONFIANCE                    */
 /* ========================================================================== */
 
 // invites.js — suivi des invitations et rôle de confiance « Like ».
@@ -7045,7 +7592,7 @@ function isTrusted(member, config) {
 }
 
 /* ========================================================================== */
-/*                      19 - ACTIONS, ARTICLES, ESCALADE                      */
+/*                      20 - ACTIONS, ARTICLES, ESCALADE                      */
 /* ========================================================================== */
 
 // actions.js — la logique métier, appelable depuis n'importe quelle interface.
@@ -7508,7 +8055,7 @@ async function actionGrantCoins(guild, target, amount, moderator, reason) {
 }
 
 /* ========================================================================== */
-/*                          20 - COMMANDES A PREFIXE                          */
+/*                          21 - COMMANDES A PREFIXE                          */
 /* ========================================================================== */
 
 // prefix.js — commandes à préfixe. Le caractère et la liste se règlent au panneau.
@@ -7695,6 +8242,59 @@ const PREFIX_COMMANDS = {
         `🎙️ **${Math.floor(min / 60)} h ${min % 60} min** de vocal\n💬 **${num(msg)}** messages`, COLORS.primary);
     },
   },
+  /* ------------------------------- MUSIQUE ------------------------------ */
+  play: {
+    aliases: ["p", "jouer"], level: 0, voiceOnly: true, usage: "<lien ou titre>",
+    desc: "Joue une piste, ou l'ajoute à la file",
+    run: async ({ message, rest }) => {
+      if (!rest) return pNo("Donne un lien ou un titre à chercher.");
+      const r = await jouer(message, rest);
+      if (!r) return null;                       // le message de lecture est déjà parti
+      return r.ok ? pOk(r.titre, r.texte, COLORS.primary) : pNo(r.texte);
+    },
+  },
+  skip: {
+    aliases: ["s", "suivant"], level: 0, voiceOnly: true, usage: "",
+    desc: "Passe la piste en cours",
+    run: ({ message }) => {
+      const r = passer(message.guild.id);
+      return r.ok ? pOk(r.titre, r.texte) : pNo(r.texte);
+    },
+  },
+  leave: {
+    aliases: ["stop", "quitter"], level: 0, voiceOnly: true, usage: "",
+    desc: "Fait quitter le vocal au bot",
+    run: ({ message }) => quitter(message.guild.id)
+      ? pOk("Vocal quitté", "La file a été vidée.")
+      : pNo("Je ne suis dans aucun vocal."),
+  },
+  queue: {
+    aliases: ["file", "q"], level: 0, voiceOnly: true, usage: "",
+    desc: "Affiche la file d'attente",
+    embedOnly: true,
+    run: ({ message }) => ({ embed: fileEmbed(message.guild) }),
+  },
+  pause: {
+    level: 0, voiceOnly: true, usage: "",
+    desc: "Met la lecture en pause",
+    run: ({ message }) => { const r = mettreEnPause(message.guild.id); return r.ok ? pOk(r.titre, r.texte) : pNo(r.texte); },
+  },
+  resume: {
+    aliases: ["reprendre"], level: 0, voiceOnly: true, usage: "",
+    desc: "Reprend la lecture",
+    run: ({ message }) => { const r = mettreEnPause(message.guild.id, true); return r.ok ? pOk(r.titre, r.texte) : pNo(r.texte); },
+  },
+  volume: {
+    aliases: ["vol"], level: 1, voiceOnly: true, usage: "<0 à 200>",
+    desc: "Règle le volume",
+    run: ({ message, args }) => {
+      const v = parseInt(args[0], 10);
+      if (!Number.isFinite(v)) return pNo("Donne un nombre entre 0 et 200.");
+      const r = reglerVolume(message.guild.id, v);
+      return r.ok ? pOk(r.titre, r.texte) : pNo(r.texte);
+    },
+  },
+
   help: {
     aliases: ["aide", "commandes"], level: 0, usage: "",
     desc: "Liste des commandes disponibles",
@@ -7761,6 +8361,22 @@ async function handlePrefix(message, config) {
 
   const level = permLevel(message.member, config);
   const need = prefixRequiredLevel(name, cmd, config);
+
+  // Les commandes audio ne répondent que dans le chat d'un salon vocal
+  if (cmd.voiceOnly) {
+    if (!musiqueReady()) {
+      await message.channel.send({ embeds: [embed({ guild: message.guild, color: COLORS.danger,
+        author: { name: `${ICONS.no}  Lecteur indisponible` },
+        description: "Les bibliothèques audio ne sont pas installées sur cet hébergement." })] }).catch(() => null);
+      return true;
+    }
+    const v = verifierSalon(message);
+    if (!v.ok) {
+      await message.channel.send({ embeds: [embed({ guild: message.guild, color: COLORS.warning,
+        author: { name: "🎧  Pas au bon endroit" }, description: v.raison })] }).catch(() => null);
+      return true;
+    }
+  }
   const envoyer = async (payload) => {
     if (!canSend(message.channel)) return;
     const m = await message.channel.send(payload).catch(() => null);
@@ -7814,7 +8430,7 @@ async function handlePrefix(message, config) {
 }
 
 /* ========================================================================== */
-/*                 21 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
+/*                 22 - ESPACE COINS : REGLEMENT ET PANNEAUX                  */
 /* ========================================================================== */
 
 // coinsspace.js — remplissage complet de la catégorie ESPACE COINS.
@@ -8083,7 +8699,7 @@ async function setupCoinsSpace(guild, memberPanelFactory) {
 }
 
 /* ========================================================================== */
-/*                22 - AFFECTATION ET VERIFICATION DES SALONS                 */
+/*                23 - AFFECTATION ET VERIFICATION DES SALONS                 */
 /* ========================================================================== */
 
 // destinations.js — la table d'affectation : quel panneau, quelle fonction, quel salon.
@@ -8397,7 +9013,7 @@ function summarizeIssues(results) {
 }
 
 /* ========================================================================== */
-/*                       23 - INSTALLATION AUTOMATIQUE                        */
+/*                       24 - INSTALLATION AUTOMATIQUE                        */
 /* ========================================================================== */
 
 // setup.js — installation automatique. Un bouton, tout est branché.
@@ -8664,7 +9280,7 @@ function setupReport(guild, result) {
 }
 
 /* ========================================================================== */
-/*             24 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
+/*             25 - PANNEAU, MENUS CONTEXTUELS, PANNEAUX PUBLICS              */
 /* ========================================================================== */
 
 // panel.js — l'interface complète. Tout réglage du bot est atteignable ici.
@@ -12370,7 +12986,7 @@ async function handlePublic(i, parts, config) {
 }
 
 /* ========================================================================== */
-/*                    25 - COMMANDES ET MENUS CONTEXTUELS                     */
+/*                    26 - COMMANDES ET MENUS CONTEXTUELS                     */
 /* ========================================================================== */
 
 // commands.js — trois commandes seulement. Tout le reste passe par /panel.
@@ -12582,7 +13198,7 @@ const contextMenus = [
 ];
 
 /* ========================================================================== */
-/*                     26 - CLIENT, EVENEMENTS, DEMARRAGE                     */
+/*                     27 - CLIENT, EVENEMENTS, DEMARRAGE                     */
 /* ========================================================================== */
 
 // index.js — client, événements, démarrage.
@@ -12644,6 +13260,8 @@ client.once(Events.ClientReady, async (c) => {
   // repassera en texte au lieu de faire tomber le bot.
   await initRender();
   console.log(`[images] casino en ${renderReady() ? "image" : "texte"}`);
+  await initMusique();
+  console.log(`[musique] ${musiqueReady() ? "lecteur actif" : "lecteur indisponible"}`);
 
   for (const guild of c.guilds.cache.values()) {
     const watch = await watchOwner(guild, { announce: false }).catch(() => ({ suspended: false }));
@@ -13232,6 +13850,11 @@ client.on(Events.VoiceStateUpdate, async (before, after) => {
 
   // Le compteur vocal réagit tout de suite, dans la limite autorisée par Discord
   if (before.channelId !== after.channelId) scheduleCounters(guild);
+
+  // Le lecteur quitte de lui-même un vocal qui se vide
+  if (musiqueReady() && before.channelId && before.channelId !== after.channelId) {
+    surVocalVide(guild, before.channelId);
+  }
 
   // Piège vocal (JOIN = sanction)
   if (config.trapVoiceId && config.trapAction !== "off" && after.channelId === config.trapVoiceId && before.channelId !== after.channelId) {
