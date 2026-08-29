@@ -4254,20 +4254,24 @@ async function replSoundcloud(titre, demandePar) {
   } catch { return null; }
 }
 
-/** Le blocage anti-robot de YouTube, reconnu à son message. */
-function estBlocageYoutube(message) {
-  return /confirm you.?re not a bot|sign in to confirm|429|403|consent/i.test(String(message ?? ""));
+/** Le blocage anti-robot de YouTube, reconnu à son message ou code HTTP. */
+function estBlocageYoutube(err) {
+  const message = typeof err === "string" ? err : (err?.message ?? String(err ?? ""));
+  const status = err?.statusCode ?? err?.status ?? err?.code;
+  if (status === 429 || status === 403 || status === "429" || status === "403") return true;
+  return /confirm you.?re not a bot|sign in to confirm|429|403|consent|too many requests|login_required|bot.?check/i.test(message);
 }
 
 async function fabriquerRessource(piste, volume) {
   const inline = volume !== 100;
 
-  if (piste.source === "youtube") {
+  // YouTube et SoundCloud passent par play-dl (extraction du vrai flux audio)
+  if (PLAY && (piste.source === "youtube" || piste.source === "soundcloud")) {
     const flux = await PLAY.stream(piste.url, { quality: 2, discordPlayerCompatibility: false });
     return VOICE.createAudioResource(flux.stream, { inputType: flux.type, inlineVolume: inline });
   }
 
-  // Lien direct : ffmpeg s'en charge, on laisse le type se détecter
+  // Lien direct / webradio : ffmpeg s'en charge
   const { stream, type } = await VOICE.demuxProbe(await fluxHttp(piste.url)).catch(() => ({ stream: null, type: null }));
   if (stream) return VOICE.createAudioResource(stream, { inputType: type, inlineVolume: inline });
   return VOICE.createAudioResource(piste.url, { inputType: VOICE.StreamType.Arbitrary, inlineVolume: inline });
@@ -4310,15 +4314,16 @@ async function suivant(guild) {
         { name: "En attente", value: `${etat.file.length}`, inline: true },
       ] }));
   } catch (e) {
-    console.error("[musique] lecture :", e.message);
+    const detail = String(e?.message ?? e ?? "erreur inconnue").slice(0, 120);
+    console.error("[musique] lecture :", detail);
 
-    // YouTube refuse l'hébergeur : on retente la même piste sur SoundCloud
-    if (piste.source === "youtube" && estBlocageYoutube(e.message)) {
+    // YouTube a échoué (429, bot-check, etc.) → repli SoundCloud systématique
+    if (piste.source === "youtube") {
       const repli = await replSoundcloud(piste.titre, piste.demandePar);
       if (repli) {
         await annoncer(guild, embed({ guild, color: COLORS.warning,
           author: { name: "🔁  Repli sur SoundCloud" },
-          description: `YouTube a refusé **${piste.titre}**.\nJe le rejoue depuis SoundCloud.` }));
+          description: `YouTube a refusé **${piste.titre}**${estBlocageYoutube(e) ? " (blocage hébergeur)" : ""}.\nJe le rejoue depuis SoundCloud.` }));
         etat.file.unshift(repli);
         return suivant(guild);
       }
@@ -4326,21 +4331,21 @@ async function suivant(guild) {
         author: { name: "🚫  YouTube bloque le serveur" },
         description: [
           `**${piste.titre}**`,
+          `\`${detail}\``,
           "",
-          "YouTube refuse les adresses d'hébergeur et demande une connexion.",
+          "YouTube refuse souvent les IP d'hébergeurs (Railway, etc.).",
           "",
-          "**Ce qui marche à la place :**",
-          "• un lien SoundCloud",
-          "• un lien audio direct (`.mp3`, `.m4a`) ou une webradio",
-          "",
-          "_Pour débloquer YouTube, le propriétaire peut fournir un cookie — voir `YT_COOKIE`._",
+          "**Solutions :**",
+          "• Coller un lien **SoundCloud** ou un `.mp3` / webradio",
+          "• Ajouter la variable Railway **`YT_COOKIE`** (cookie d'un compte Google jetable)",
+          "• Optionnel : **`SOUNDCLOUD_ID`** si le repli SoundCloud échoue aussi",
         ].join("\n") }));
       return suivant(guild);
     }
 
     await annoncer(guild, embed({ guild, color: COLORS.danger,
       author: { name: `${ICONS.no}  Impossible de lire` },
-      description: `**${piste.titre}**\n\`${e.message.slice(0, 120)}\`` }));
+      description: `**${piste.titre}**\n\`${detail}\`` }));
     return suivant(guild);
   }
 }
@@ -4716,8 +4721,14 @@ async function lancerPiste(guild, membre, salonVocal, salonTexte, piste) {
       description: `**${piste.titre}**\nPosition : **${etat.file.length}**` })], components: [] };
   }
   await suivant(guild);
+  // suivant a déjà annoncé succès ou erreur ; on ne ment pas si la lecture a échoué
+  if (!etat.courant) {
+    return { embeds: [embed({ guild, color: COLORS.warning,
+      author: { name: "⚠️  Lecture non démarrée" },
+      description: `**${piste.titre}**\nVoir le message d'erreur ci-dessus. Un cookie \`YT_COOKIE\` débloque souvent YouTube.` })], components: [] };
+  }
   return { embeds: [embed({ guild, color: COLORS.success,
-    author: { name: "▶️  C'est parti" }, description: `**${piste.titre}**` })], components: [] };
+    author: { name: "▶️  C'est parti" }, description: `**${etat.courant.titre}**` })], components: [] };
 }
 
 /* ========================================================================== */
