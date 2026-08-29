@@ -3995,11 +3995,15 @@ async function pisteSpotify(url) {
 }
 
 /**
- * Trouve le son d'un titre : YouTube d'abord, SoundCloud ensuite.
- * C'est l'étape qui fournit réellement l'audio.
+ * Trouve le son d'un titre.
+ * - Avec cookie YouTube (YT_COOKIE) : YouTube d'abord, SoundCloud en secours.
+ * - Sans cookie : SoundCloud d'abord (les IP d'hébergeur sont souvent en 429 sur YT),
+ *   puis YouTube en secours.
  */
 async function trouverAudio(recherche, demandePar) {
-  if (PLAY) {
+  if (!PLAY) return replSoundcloud(recherche, demandePar);
+
+  const viaYoutube = async () => {
     try {
       const r = await PLAY.search(recherche, { limit: 1, source: { youtube: "video" } });
       if (r.length) {
@@ -4007,10 +4011,20 @@ async function trouverAudio(recherche, demandePar) {
           duree: r[0].durationInSec, source: "youtube", demandePar };
       }
     } catch (e) {
-      if (!estBlocageYoutube(e.message)) console.error("[musique] YouTube :", e.message);
+      if (!estBlocageYoutube(e)) console.error("[musique] YouTube :", e?.message ?? e);
     }
+    return null;
+  };
+
+  // Cookie présent → YouTube fiable en premier
+  if (COOKIE) {
+    return (await viaYoutube()) ?? (await replSoundcloud(recherche, demandePar));
   }
-  return replSoundcloud(recherche, demandePar);
+
+  // Pas de cookie → SoundCloud d'abord pour éviter le 429 quasi systématique
+  const sc = await replSoundcloud(recherche, demandePar);
+  if (sc) return sc;
+  return viaYoutube();
 }
 
 /** Extensions qu'ffmpeg lit sans aucune extraction. */
@@ -4207,25 +4221,25 @@ async function resoudre(requete, demandePar) {
           duree: Math.round((info.durationInMs ?? 0) / 1000) || null, source: "soundcloud", demandePar };
       }
 
-      const res = await PLAY.search(q, { limit: 1, source: { youtube: "video" } });
-      if (!res.length) return { erreur: "Aucun résultat pour cette recherche." };
-      const v = res[0];
-      return { titre: v.title.slice(0, 90), url: v.url, duree: v.durationInSec, source: "youtube", demandePar };
+      // Recherche par nom : SoundCloud d'abord sans cookie, YouTube si cookie
+      const audio = await trouverAudio(q, demandePar);
+      if (audio) return audio;
+      return { erreur: "Aucun résultat audio pour cette recherche. Essaie un autre titre ou un lien SoundCloud / .mp3." };
     } catch (e) {
-      console.error("[musique] recherche :", e.message);
+      console.error("[musique] recherche :", e?.message ?? e);
       if (estURL(q)) return { titre: q.slice(0, 90), url: q, duree: null, source: "direct", demandePar };
 
       const repli = await replSoundcloud(q, demandePar);
       if (repli) return repli;
 
-      return { erreur: estBlocageYoutube(e.message)
+      return { erreur: estBlocageYoutube(e)
         ? "YouTube bloque l'adresse de l'hébergeur. Colle un lien SoundCloud, un lien `.mp3` ou une webradio."
-        : "YouTube ne répond pas. Colle un lien audio direct à la place." };
+        : "Aucune source audio n'a répondu. Colle un lien SoundCloud ou `.mp3`." };
     }
   }
 
   if (estURL(q)) return { titre: q.slice(0, 90), url: q, duree: null, source: "direct", demandePar };
-  return { erreur: "La recherche YouTube est indisponible. Colle un lien audio direct." };
+  return { erreur: "La recherche audio est indisponible. Colle un lien SoundCloud ou `.mp3`." };
 }
 
 /* ========================================================================== */
