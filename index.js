@@ -102,11 +102,18 @@
 //     veille : seul un "membre inconnu" confirme par Discord la provoque.
 //     Desactivable avec la variable Railway SUSPEND_WITHOUT_OWNER=false
 //
+//   UNE ACTION A LA FOIS PAR PERSONNE
+//     Deux clics simultanes permettaient d'etre paye deux fois (quotidien,
+//     travail, encaissement au demineur). Chaque personne ne peut plus
+//     avoir qu'une action d'argent en cours ; le verrou se libere seul.
+//
 //   CODE DE SECURITE
 //     Toute action qui MODIFIE le bot demande un code. Naviguer reste libre.
 //     Une fois saisi, il ouvre 15 minutes de modifications.
 //     3 essais ratés = 10 minutes de blocage. Comparaison a duree constante.
-//     Variables Railway : OWNER_CODE et OWNER_CODE_MINUTES.
+//     Le code n'est plus ecrit en clair : seule son empreinte SHA-256
+//     figure dans le fichier. Variables Railway : OWNER_CODE ou
+//     OWNER_CODE_HASH, et OWNER_CODE_MINUTES pour la duree.
 //
 //   VERROU PROPRIETAIRE
 //     Toute la configuration de 0x est reservee a l'identifiant
@@ -209,6 +216,7 @@ import {
   UserSelectMenuBuilder,
 } from "discord.js";
 import { createServer } from "node:http";
+import { createHash, timingSafeEqual } from "node:crypto";
 import pg from "pg";
 
 
@@ -749,10 +757,12 @@ function canActOn(actorLevel, targetMember, config) {
 }
 
 /* ========================================================================== */
-/*                            3 - CODE DE SECURITE                            */
+/*                    3 - SECURITE : CODE ET SERIALISATION                    */
 /* ========================================================================== */
 
-// verrou.js — code de sécurité exigé avant toute modification du bot.
+// verrou.js — code de sécurité et sérialisation des actions sensibles.
+
+
 //
 // Naviguer dans le panneau reste libre. Dès qu'une action écrit quelque
 // chose, le code est demandé. Une fois saisi, il ouvre une fenêtre de
@@ -763,7 +773,21 @@ function canActOn(actorLevel, targetMember, config) {
  * La valeur inscrite ici n'est qu'un repli : si ton dépôt GitHub est
  * public, n'importe qui peut la lire. Mets-la en variable d'environnement.
  */
-const CODE = process.env.OWNER_CODE || "Gddjkjoufg#@9";
+/**
+ * Le code n'est plus écrit en clair : seule son empreinte figure ici.
+ * Même avec le fichier sous les yeux, on ne peut pas le lire.
+ *
+ *   OWNER_CODE       — code en clair (Railway le garde privé)
+ *   OWNER_CODE_HASH  — ou directement une empreinte SHA-256
+ */
+const EMPREINTE_PAR_DEFAUT = "5f38fb3b83e481aa02ac8489cf425f09b5c505da135f6e46db466017215d70f1";
+
+function empreinte(texte) {
+  return createHash("sha256").update(String(texte), "utf8").digest("hex");
+}
+
+const EMPREINTE = process.env.OWNER_CODE_HASH
+  ?? (process.env.OWNER_CODE ? empreinte(process.env.OWNER_CODE) : EMPREINTE_PAR_DEFAUT);
 
 const DUREE_MIN = Number(process.env.OWNER_CODE_MINUTES ?? 15);
 const ESSAIS_MAX = 3;
@@ -808,12 +832,10 @@ function fermer(guildId, userId) {
 
 /** Comparaison à durée constante : le temps de réponse ne trahit rien. */
 function memeChaine(a, b) {
-  const x = String(a ?? ""), y = String(b ?? "");
-  let diff = x.length ^ y.length;
-  for (let n = 0; n < Math.max(x.length, y.length); n++) {
-    diff |= (x.charCodeAt(n) || 0) ^ (y.charCodeAt(n) || 0);
-  }
-  return diff === 0;
+  const x = Buffer.from(String(a ?? ""), "utf8");
+  const y = Buffer.from(String(b ?? ""), "utf8");
+  if (x.length !== y.length) return false;
+  return timingSafeEqual(x, y);
 }
 
 /**
@@ -827,7 +849,7 @@ function verifier(guildId, userId, saisi) {
     return { ok: false, bloqueMin: Math.ceil((e.bloqueJusqua - Date.now()) / 60_000) };
   }
 
-  if (memeChaine(saisi.trim(), CODE)) {
+  if (memeChaine(empreinte(saisi.trim()), EMPREINTE)) {
     const minutes = ouvrir(guildId, userId);
     return { ok: true, minutes };
   }
@@ -879,8 +901,45 @@ function etatVerrou(guildId, userId) {
     : { ouvert: false, minutes: 0 };
 }
 
+/* ========================================================================== */
+/*                    UNE SEULE ACTION À LA FOIS                              */
+/* ========================================================================== */
+
+/**
+ * Deux clics simultanés sur « encaisser » ou « quotidien » permettaient
+ * d'être payé deux fois : les deux appels lisaient le solde avant que le
+ * premier ne l'écrive. On sérialise donc par personne.
+ *
+ * Le verrou se libère tout seul au bout de 20 secondes, pour qu'une action
+ * bloquée n'enferme jamais quelqu'un.
+ */
+const enCours = new Map();   // "guild:user" -> instant de prise
+
+function prendreJeton(guildId, userId) {
+  const k = cleVerrou(guildId, userId);
+  const depuis = enCours.get(k);
+  if (depuis && Date.now() - depuis < 20_000) return false;
+  enCours.set(k, Date.now());
+  return true;
+}
+
+function rendreJeton(guildId, userId) {
+  enCours.delete(cleVerrou(guildId, userId));
+}
+
+/**
+ * Exécute `action` en garantissant qu'aucune autre ne tourne en même temps
+ * pour la même personne.
+ */
+async function serialiser(guildId, userId, action, siOccupe) {
+  if (!prendreJeton(guildId, userId)) return siOccupe ? siOccupe() : null;
+  try { return await action(); }
+  finally { rendreJeton(guildId, userId); }
+}
+
 setInterval(() => {
   const t = Date.now();
+  for (const [k, d] of enCours) if (t - d > 20_000) enCours.delete(k);
   for (const [k, fin] of ouverts) if (fin < t) ouverts.delete(k);
   for (const [k, e] of essais) if (e.bloqueJusqua && e.bloqueJusqua < t && e.n === 0) essais.delete(k);
 }, 5 * 60_000).unref();
@@ -4632,6 +4691,11 @@ function resultView(guild, user, r, currency) {
 /* ========================================================================== */
 
 async function handleCrime(i) {
+  return serialiser(i.guildId, i.user.id, () => coup(i), () =>
+    i.reply({ content: "Une action est déjà en cours, patiente une seconde.", ...EPH }).catch(() => null));
+}
+
+async function coup(i) {
   const [, action, jobId] = i.customId.split(":");
   const config = await getConfig(i.guildId);
   if (!config.economy.enabled || config.crime?.enabled === false) {
@@ -5146,6 +5210,12 @@ function diceOdds(target, over) {
 /* ========================================================================== */
 
 async function handleCasino(i) {
+  // Deux clics simultanés permettaient d'encaisser deux fois : on sérialise.
+  return serialiser(i.guildId, i.user.id, () => casino(i), () =>
+    i.reply({ content: "Une action est déjà en cours, patiente une seconde.", ...EPH }).catch(() => null));
+}
+
+async function casino(i) {
   const parts = i.customId.split(":");
   const action = parts[1];
   const config = await getConfig(i.guildId);
@@ -7239,6 +7309,11 @@ async function actionPurge(channel, amount, targetId, moderator) {
 /* ================================ ÉCONOMIE ================================ */
 
 async function actionDaily(guild, user) {
+  return serialiser(guild.id, user.id, () => daily(guild, user),
+    () => no("Une action est déjà en cours, patiente une seconde."));
+}
+
+async function daily(guild, user) {
   const config = await getConfig(guild.id);
   if (!config.economy.enabled) return no("L'économie est désactivée.");
   const w = await getWallet(guild.id, user.id);
@@ -7260,6 +7335,11 @@ async function actionDaily(guild, user) {
 const WORK_FLAVOR = ["as modéré le chat", "as rangé les vocaux", "as animé un event", "as aidé un nouveau", "as trié les tickets", "as tenu la boutique"];
 
 async function actionWork(guild, user) {
+  return serialiser(guild.id, user.id, () => work(guild, user),
+    () => no("Une action est déjà en cours, patiente une seconde."));
+}
+
+async function work(guild, user) {
   const config = await getConfig(guild.id);
   if (!config.economy.enabled) return no("L'économie est désactivée.");
   const w = await getWallet(guild.id, user.id);
@@ -7285,6 +7365,11 @@ const ITEM_TYPES = {
 };
 
 async function actionBuy(guild, member, itemId, extra = {}) {
+  return serialiser(guild.id, member.id, () => buy(guild, member, itemId, extra),
+    () => no("Un achat est déjà en cours, patiente une seconde."));
+}
+
+async function buy(guild, member, itemId, extra = {}) {
   const dette = await blockedByDebt(guild.id, member.id);
   if (dette) return no(dette);
   const config = await getConfig(guild.id);
@@ -7376,6 +7461,11 @@ async function actionBuy(guild, member, itemId, extra = {}) {
 }
 
 async function actionPay(guild, from, toUser, amount) {
+  return serialiser(guild.id, from.id, () => pay(guild, from, toUser, amount),
+    () => no("Un transfert est déjà en cours, patiente une seconde."));
+}
+
+async function pay(guild, from, toUser, amount) {
   const config = await getConfig(guild.id);
   if (!config.economy.enabled) return no("L'économie est désactivée.");
   if (toUser.id === from.id) return no("Tu ne peux pas te payer toi-même.");
