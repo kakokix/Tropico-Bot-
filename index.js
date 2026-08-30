@@ -110,7 +110,9 @@
 //     l'audio vient toujours de YouTube ou SoundCloud.
 //     Uniquement dans le CHAT D'UN SALON VOCAL, et seulement si tu es
 //     connecte a ce vocal. YouTube en premier, repli sur lien direct.
-//     Le son est extrait par yt-dlp, mis a jour en permanence contre les
+//     yt-dlp se telecharge tout seul au demarrage s'il manque (version
+//     autonome, sans Python). Le son est extrait par yt-dlp, mis a jour
+//     en permanence contre les
 //     blocages de YouTube. play-dl reste en secours. Les liens directs et
 //     webradios ne passent par aucun extracteur : ils marchent toujours.
 //
@@ -3943,19 +3945,55 @@ const sourcesDispo = () => ({
  */
 let YTDLP = null;   // chemin du binaire
 
+/**
+ * Trouve yt-dlp, ou le télécharge.
+ *
+ * Le paquet npm installe son binaire par un script post-installation, que
+ * certains hébergeurs ignorent. On ne compte donc pas dessus : si le binaire
+ * manque, on va chercher la version autonome sur GitHub, qui ne réclame
+ * même pas Python.
+ */
 async function initYtdlp() {
+  const { existsSync, chmodSync, mkdirSync, createWriteStream } = await import("node:fs");
+  const { join } = await import("node:path");
+
+  const utilisable = (chemin) => {
+    if (!chemin || !existsSync(chemin)) return false;
+    try { chmodSync(chemin, 0o755); } catch { /* déjà exécutable */ }
+    return true;
+  };
+
+  // 1. celui du paquet npm, s'il a bien été posé
   try {
     const { createRequire } = await import("node:module");
-    const req = createRequire(import.meta.url);
-    const c = req("youtube-dl-exec/src/constants.js");
-    const { join } = await import("node:path");
-    const { existsSync, chmodSync } = await import("node:fs");
+    const c = createRequire(import.meta.url)("youtube-dl-exec/src/constants.js");
     const chemin = join(c.YOUTUBE_DL_DIR, c.YOUTUBE_DL_FILE);
-    if (!existsSync(chemin)) return null;
-    try { chmodSync(chemin, 0o755); } catch { /* déjà exécutable */ }
-    YTDLP = chemin;
-    return chemin;
-  } catch { return null; }
+    if (utilisable(chemin)) { YTDLP = chemin; return chemin; }
+  } catch { /* paquet absent ou binaire non téléchargé */ }
+
+  // 2. un exemplaire déjà rapatrié lors d'un démarrage précédent
+  const dossier = process.env.YTDLP_DIR || "/tmp/0x";
+  const local = join(dossier, "yt-dlp");
+  if (utilisable(local)) { YTDLP = local; return local; }
+
+  // 3. téléchargement de la version autonome
+  try {
+    mkdirSync(dossier, { recursive: true });
+    console.log("[musique] téléchargement de yt-dlp…");
+    const r = await fetch("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
+      { redirect: "follow" });
+    if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+    const { Readable } = await import("node:stream");
+    const { pipeline } = await import("node:stream/promises");
+    await pipeline(Readable.fromWeb(r.body), createWriteStream(local));
+    chmodSync(local, 0o755);
+    YTDLP = local;
+    console.log("[musique] yt-dlp téléchargé");
+    return local;
+  } catch (e) {
+    console.warn("[musique] yt-dlp indisponible :", e.message);
+    return null;
+  }
 }
 
 /** Arguments communs : ce qui aide réellement à passer les filtres. */
@@ -4651,7 +4689,7 @@ async function lireUne(guild, etat, piste) {
 
     // YouTube refuse l'hébergeur : on tente le même titre sur SoundCloud,
     // une seule fois, et sans repasser par la piste d'origine.
-    if (piste.source === "youtube" && estBlocageYoutube(e.message)) {
+    if (piste.source === "youtube" && estBlocageYoutube(e)) {
       const repli = await replSoundcloud(piste.titre, piste.demandePar);
       if (repli) {
         await annoncer(guild, embed({ guild, color: COLORS.warning,
@@ -4676,9 +4714,17 @@ async function lireUne(guild, etat, piste) {
       return "echec";
     }
 
+    const extracteur = YTDLP ? "yt-dlp" : PLAY ? "play-dl" : "aucun extracteur";
     await annoncer(guild, embed({ guild, color: COLORS.danger,
       author: { name: `${ICONS.no}  Impossible de lire` },
-      description: `**${piste.titre}**\n\`${String(e.message).slice(0, 120)}\`` }));
+      description: [
+        `**${piste.titre}**`,
+        `Source : ${piste.source} · extracteur : ${extracteur}`,
+        `\`${String(e.message).slice(0, 150)}\``,
+        "",
+        !YTDLP ? "⚠️ **yt-dlp n'est pas installé** — c'est lui qui récupère le son. Regarde les journaux Railway au démarrage."
+          : "Essaie un lien direct `.mp3` ou une webradio pour vérifier que le son sort.",
+      ].join("\n") }));
     return "echec";
   }
 }
