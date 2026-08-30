@@ -110,6 +110,7 @@
 //     l'audio vient toujours de YouTube ou SoundCloud.
 //     Uniquement dans le CHAT D'UN SALON VOCAL, et seulement si tu es
 //     connecte a ce vocal. YouTube en premier, repli sur lien direct.
+//     « +diag » teste chaque source et montre les erreurs BRUTES.
 //     yt-dlp se telecharge tout seul au demarrage s'il manque (version
 //     autonome, sans Python). Le son est extrait par yt-dlp, mis a jour
 //     en permanence contre les
@@ -3963,15 +3964,12 @@ async function initYtdlp() {
     return true;
   };
 
-  // 1. celui du paquet npm, s'il a bien été posé
-  try {
-    const { createRequire } = await import("node:module");
-    const c = createRequire(import.meta.url)("youtube-dl-exec/src/constants.js");
-    const chemin = join(c.YOUTUBE_DL_DIR, c.YOUTUBE_DL_FILE);
+  // 1. un yt-dlp déjà présent sur la machine
+  for (const chemin of ["/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp", "./yt-dlp"]) {
     if (utilisable(chemin)) { YTDLP = chemin; return chemin; }
-  } catch { /* paquet absent ou binaire non téléchargé */ }
+  }
 
-  // 2. un exemplaire déjà rapatrié lors d'un démarrage précédent
+  // 2. un exemplaire rapatrié lors d'un démarrage précédent
   const dossier = process.env.YTDLP_DIR || "/tmp/0x";
   const local = join(dossier, "yt-dlp");
   if (utilisable(local)) { YTDLP = local; return local; }
@@ -4031,7 +4029,8 @@ async function chercherYtdlp(requete, limite = 5, moteur = "ytsearch") {
   try {
     const sortie = await lancerYtdlp([
       `${moteur}${limite}:${requete}`,
-      "--dump-json", "--flat-playlist", "--quiet", ...argsYtdlp(),
+      // sans --flat-playlist : on obtient l'adresse complète et jouable
+      "--dump-json", "--quiet", "--no-download", ...argsYtdlp(),
     ]);
     const pistes = [];
     for (const ligne of sortie.split("\n")) {
@@ -4041,7 +4040,8 @@ async function chercherYtdlp(requete, limite = 5, moteur = "ytsearch") {
         if (!j.url && !j.id) continue;
         pistes.push({
           titre: String(j.title ?? "sans titre").slice(0, 90),
-          url: j.url ?? (j.id ? `https://www.youtube.com/watch?v=${j.id}` : null),
+          url: j.webpage_url ?? j.original_url ?? j.url
+            ?? (j.id ? `https://www.youtube.com/watch?v=${j.id}` : null),
           duree: j.duration ? Math.round(j.duration) : null,
           artiste: String(j.uploader ?? j.channel ?? "").slice(0, 60),
           source: moteur === "scsearch" ? "soundcloud" : "youtube",
@@ -4562,8 +4562,10 @@ async function fabriquerRessource(piste, volume) {
   const inline = volume !== 100;
   const extraire = piste.source === "youtube" || piste.source === "soundcloud";
 
-  // 1. yt-dlp — l'extracteur principal, tenu à jour contre les blocages
-  if (extraire && YTDLP) {
+  // yt-dlp est le seul extracteur. play-dl masquait ses erreurs derrière un
+  // « Got 404 » inutile : on remonte désormais le vrai message.
+  if (extraire) {
+    if (!YTDLP) throw new Error("yt-dlp n'est pas installé — regarde les journaux de démarrage.");
     try {
       const flux = await fluxYtdlp(piste.url);
       const sonde = await VOICE.demuxProbe(flux).catch(() => null);
@@ -4572,28 +4574,10 @@ async function fabriquerRessource(piste, volume) {
         ? VOICE.createAudioResource(sonde.stream, { inputType: sonde.type, inlineVolume: inline })
         : VOICE.createAudioResource(flux, { inputType: VOICE.StreamType.Arbitrary, inlineVolume: inline });
     } catch (e) {
-      console.warn("[musique] yt-dlp :", e.message);
       if (piste.source === "youtube" && estBlocageYoutube(e)) ytSignalerBlocage();
-      // on tente play-dl juste après
-    }
-  }
-
-  // 2. play-dl en secours
-  if (extraire && PLAY) {
-    try {
-      const flux = await PLAY.stream(piste.url, { quality: 2, discordPlayerCompatibility: true });
-      if (piste.source === "youtube") ytSignalerSucces();
-      return VOICE.createAudioResource(flux.stream, { inputType: flux.type, inlineVolume: inline });
-    } catch (e) {
-      if (piste.source === "youtube" && estBlocageYoutube(e)) ytSignalerBlocage();
-      if (piste.source === "soundcloud" && await rafraichirSoundcloudId()) {
-        const flux = await PLAY.stream(piste.url, { quality: 2, discordPlayerCompatibility: true });
-        return VOICE.createAudioResource(flux.stream, { inputType: flux.type, inlineVolume: inline });
-      }
       throw e;
     }
   }
-  if (extraire) throw new Error("Aucun extracteur disponible pour cette source.");
 
   // Lien direct ou webradio : ffmpeg s'en charge
   const { stream, type } = await VOICE.demuxProbe(await fluxHttp(piste.url)).catch(() => ({ stream: null, type: null }));
@@ -4714,7 +4698,7 @@ async function lireUne(guild, etat, piste) {
       return "echec";
     }
 
-    const extracteur = YTDLP ? "yt-dlp" : PLAY ? "play-dl" : "aucun extracteur";
+    const extracteur = YTDLP ? "yt-dlp" : "aucun extracteur installé";
     await annoncer(guild, embed({ guild, color: COLORS.danger,
       author: { name: `${ICONS.no}  Impossible de lire` },
       description: [
@@ -5120,6 +5104,67 @@ async function lancerPiste(guild, membre, salonVocal, salonTexte, piste) {
   await enchainer(guild);
   return { embeds: [embed({ guild, color: COLORS.success,
     author: { name: "▶️  C'est parti" }, description: `**${piste.titre}**` })], components: [] };
+}
+
+
+/* ========================================================================== */
+/*                              DIAGNOSTIC                                    */
+/* ========================================================================== */
+
+/**
+ * Interroge yt-dlp et rapporte ce qu'il répond vraiment, sans filtre.
+ * C'est l'outil à lancer quand « ça ne marche pas » sans qu'on sache pourquoi.
+ */
+async function diagnostic(guild) {
+  const lignes = [];
+  const chrono = async (nom, action) => {
+    const t0 = Date.now();
+    try {
+      const r = await action();
+      lignes.push(`✅ **${nom}** — ${r} _(${Date.now() - t0} ms)_`);
+      return true;
+    } catch (e) {
+      lignes.push(`❌ **${nom}**\n\`\`\`${String(e.message ?? e).slice(0, 300)}\`\`\``);
+      return false;
+    }
+  };
+
+  lignes.push(`**Binaire :** ${YTDLP ? `\`${YTDLP}\`` : "❌ absent"}`);
+  if (YTDLP) {
+    await chrono("Version", async () => (await lancerYtdlp(["--version"], 10_000)).trim());
+  }
+
+  await chrono("Recherche YouTube", async () => {
+    const r = await chercherYtdlp("lofi hip hop", 1, "ytsearch");
+    if (!r.length) throw new Error("aucun résultat — YouTube refuse probablement l'hébergeur");
+    return `${r[0].titre.slice(0, 40)}`;
+  });
+
+  await chrono("Recherche SoundCloud", async () => {
+    const r = await chercherYtdlp("lofi", 1, "scsearch");
+    if (!r.length) throw new Error("aucun résultat");
+    return `${r[0].titre.slice(0, 40)}`;
+  });
+
+  await chrono("Ouverture d'un flux SoundCloud", async () => {
+    const r = await chercherYtdlp("lofi", 1, "scsearch");
+    if (!r.length) throw new Error("pas de piste à tester");
+    const flux = await fluxYtdlp(r[0].url);
+    flux.destroy();
+    return "le son sort";
+  });
+
+  await chrono("Webradio directe", async () => {
+    const f = await fluxHttp(RADIO_TEST);
+    f.destroy();
+    return "accessible";
+  });
+
+  return embed({
+    guild, color: COLORS.primary, author: { name: "🩺  Diagnostic du lecteur" },
+    description: lignes.join("\n\n"),
+    footer: process.env.YT_COOKIE ? "Cookie YouTube fourni" : "Aucun cookie YouTube",
+  });
 }
 
 /* ========================================================================== */
@@ -9086,6 +9131,18 @@ const PREFIX_COMMANDS = {
     },
   },
   /* ------------------------------- MUSIQUE ------------------------------ */
+  diag: {
+    aliases: ["diagnostic", "test"], level: 5, usage: "",
+    desc: "Teste chaque source et montre les vraies erreurs",
+    run: async ({ message }) => {
+      const attente = await message.channel.send({ content: "🩺 Test en cours…" }).catch(() => null);
+      const e = await diagnostic(message.guild);
+      if (attente) await attente.edit({ content: null, embeds: [e] }).catch(() => null);
+      else await message.channel.send({ embeds: [e] }).catch(() => null);
+      return { envoye: true };
+    },
+  },
+
   setup: {
     aliases: ["reglages", "config"], level: 0, usage: "",
     desc: "Réglages du lecteur audio",
