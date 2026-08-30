@@ -110,6 +110,10 @@
 //     l'audio vient toujours de YouTube ou SoundCloud.
 //     Uniquement dans le CHAT D'UN SALON VOCAL, et seulement si tu es
 //     connecte a ce vocal. YouTube en premier, repli sur lien direct.
+//     Le son est extrait par yt-dlp, mis a jour en permanence contre les
+//     blocages de YouTube. play-dl reste en secours. Les liens directs et
+//     webradios ne passent par aucun extracteur : ils marchent toujours.
+//
 //     YouTube bloque les adresses IP d'hebergeur. Deux parades :
 //       YT_COOKIE       cookie d'un compte Google jetable
 //       SOUNDCLOUD_ID   sinon obtenu automatiquement
@@ -3929,6 +3933,139 @@ const sourcesDispo = () => ({
 });
 
 /* ========================================================================== */
+/*                        EXTRACTION PAR YT-DLP                               */
+/* ========================================================================== */
+
+/**
+ * yt-dlp remplace play-dl, qui n'est plus maintenu et échoue depuis les
+ * hébergeurs. Il est mis à jour en permanence contre les blocages de YouTube,
+ * et gère aussi SoundCloud, Bandcamp et des centaines d'autres sites.
+ */
+let YTDLP = null;   // chemin du binaire
+
+async function initYtdlp() {
+  try {
+    const { createRequire } = await import("node:module");
+    const req = createRequire(import.meta.url);
+    const c = req("youtube-dl-exec/src/constants.js");
+    const { join } = await import("node:path");
+    const { existsSync, chmodSync } = await import("node:fs");
+    const chemin = join(c.YOUTUBE_DL_DIR, c.YOUTUBE_DL_FILE);
+    if (!existsSync(chemin)) return null;
+    try { chmodSync(chemin, 0o755); } catch { /* déjà exécutable */ }
+    YTDLP = chemin;
+    return chemin;
+  } catch { return null; }
+}
+
+/** Arguments communs : ce qui aide réellement à passer les filtres. */
+function argsYtdlp() {
+  const a = [
+    "--no-warnings", "--no-playlist", "--no-check-certificates", "--geo-bypass",
+    // le client Android de YouTube échappe souvent au contrôle anti-robot
+    "--extractor-args", "youtube:player_client=android,web_safari,web",
+    "--socket-timeout", "15", "--retries", "2",
+  ];
+  if (process.env.YT_COOKIE) a.push("--add-header", `Cookie:${process.env.YT_COOKIE}`);
+  return a;
+}
+
+/** Lance yt-dlp et récupère sa sortie texte. */
+function lancerYtdlp(args, delaiMs = 25_000) {
+  return new Promise((resolve, reject) => {
+    import("node:child_process").then(({ execFile }) => {
+      const p = execFile(YTDLP, args, { maxBuffer: 12 * 1024 * 1024, timeout: delaiMs },
+        (err, stdout, stderr) => {
+          if (err) return reject(new Error(String(stderr || err.message).split("\n").slice(-3).join(" ").slice(0, 200)));
+          resolve(stdout);
+        });
+      p.on("error", reject);
+    }).catch(reject);
+  });
+}
+
+/**
+ * Cherche des titres. `ytsearch` interroge YouTube, `scsearch` SoundCloud.
+ * @returns {Promise<Array<{titre, url, duree, source}>>}
+ */
+async function chercherYtdlp(requete, limite = 5, moteur = "ytsearch") {
+  if (!YTDLP) return [];
+  try {
+    const sortie = await lancerYtdlp([
+      `${moteur}${limite}:${requete}`,
+      "--dump-json", "--flat-playlist", "--quiet", ...argsYtdlp(),
+    ]);
+    const pistes = [];
+    for (const ligne of sortie.split("\n")) {
+      if (!ligne.trim()) continue;
+      try {
+        const j = JSON.parse(ligne);
+        if (!j.url && !j.id) continue;
+        pistes.push({
+          titre: String(j.title ?? "sans titre").slice(0, 90),
+          url: j.url ?? (j.id ? `https://www.youtube.com/watch?v=${j.id}` : null),
+          duree: j.duration ? Math.round(j.duration) : null,
+          artiste: String(j.uploader ?? j.channel ?? "").slice(0, 60),
+          source: moteur === "scsearch" ? "soundcloud" : "youtube",
+        });
+      } catch { /* ligne illisible */ }
+    }
+    return pistes.filter((x) => x.url);
+  } catch (e) {
+    console.warn(`[musique] yt-dlp ${moteur} :`, e.message);
+    return [];
+  }
+}
+
+/**
+ * Ouvre le flux audio d'une adresse. yt-dlp écrit sur sa sortie standard,
+ * qu'on branche directement sur le lecteur.
+ */
+async function fluxYtdlp(url) {
+  if (!YTDLP) throw new Error("yt-dlp indisponible");
+  const { spawn } = await import("node:child_process");
+
+  const proc = spawn(YTDLP, [
+    url, "-f", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
+    "-o", "-", "--quiet", ...argsYtdlp(),
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+
+  let erreur = "";
+  proc.stderr.on("data", (d) => { erreur += String(d); });
+  proc.on("error", () => { /* remonté par le flux */ });
+
+  // Un échec immédiat doit être signalé plutôt que d'attendre un flux vide
+  await new Promise((resolve, reject) => {
+    // « readable » se déclenche aussi à la fin d'un flux VIDE : il faut donc
+    // vérifier qu'un octet est réellement sorti, puis le remettre en place.
+    const ok = () => {
+      const morceau = proc.stdout.read();
+      if (morceau === null) return;          // fausse alerte, on attend encore
+      proc.stdout.unshift(morceau);
+      nettoyer(); resolve();
+    };
+    const ko = () => {
+      nettoyer();
+      try { proc.kill("SIGKILL"); } catch { /* déjà terminé */ }
+      const detail = erreur.split("\n").filter(Boolean).slice(-2).join(" ").slice(0, 200);
+      reject(new Error(detail || "yt-dlp n'a produit aucun son"));
+    };
+    const nettoyer = () => {
+      proc.stdout.removeListener("readable", ok);
+      proc.removeListener("close", ko);
+      proc.stdout.removeListener("end", ko);
+      clearTimeout(minuterie);
+    };
+    const minuterie = setTimeout(ko, 20_000);
+    proc.stdout.on("readable", ok);
+    proc.stdout.once("end", ko);
+    proc.once("close", ko);
+  });
+
+  return proc.stdout;
+}
+
+/* ========================================================================== */
 /*                      CATALOGUE : DEEZER ET SPOTIFY                         */
 /* ========================================================================== */
 
@@ -3999,6 +4136,16 @@ async function pisteSpotify(url) {
  * C'est l'étape qui fournit réellement l'audio.
  */
 async function trouverAudio(recherche, demandePar) {
+  // yt-dlp cherche lui-même, sur YouTube puis sur SoundCloud
+  if (YTDLP) {
+    if (!ytAuRepos()) {
+      const yt = await chercherYtdlp(recherche, 1, "ytsearch");
+      if (yt.length) return { ...yt[0], demandePar };
+    }
+    const sc = await chercherYtdlp(recherche, 1, "scsearch");
+    if (sc.length) return { ...sc[0], demandePar };
+  }
+
   if (!PLAY) return replSoundcloud(recherche, demandePar);
 
   const viaYoutube = async () => {
@@ -4083,6 +4230,7 @@ async function initMusique() {
     } catch { /* on tentera l'ffmpeg du système */ }
 
     VOICE = await import("@discordjs/voice");
+    await initYtdlp();
 
     try {
       PLAY = await import("play-dl");
@@ -4120,8 +4268,9 @@ async function initMusique() {
     }
 
     AUDIO_PRET = true;
-    console.log(`[musique] lecteur prêt · YouTube ${PLAY ? (COOKIE ? "avec cookie" : "sans cookie") : "indisponible"}`
-      + ` · SoundCloud ${SOUND ? "disponible" : "indisponible"}`);
+    console.log(`[musique] lecteur prêt · yt-dlp ${YTDLP ? "actif" : "absent"}`
+      + ` · cookie ${COOKIE ? "fourni" : "aucun"}`
+      + ` · play-dl ${PLAY ? "en secours" : "absent"}`);
     try {
       const rapport = VOICE.generateDependencyReport();
       const ligne = (motif) => (rapport.match(motif)?.[0] ?? "absent").trim();
@@ -4373,17 +4522,32 @@ const ytReposRestant = () => Math.max(0, Math.ceil((ytReposJusqua - Date.now()) 
 
 async function fabriquerRessource(piste, volume) {
   const inline = volume !== 100;
+  const extraire = piste.source === "youtube" || piste.source === "soundcloud";
 
-  // YouTube et SoundCloud passent par play-dl, qui extrait le vrai flux audio
-  if (PLAY && (piste.source === "youtube" || piste.source === "soundcloud")) {
+  // 1. yt-dlp — l'extracteur principal, tenu à jour contre les blocages
+  if (extraire && YTDLP) {
+    try {
+      const flux = await fluxYtdlp(piste.url);
+      const sonde = await VOICE.demuxProbe(flux).catch(() => null);
+      if (piste.source === "youtube") ytSignalerSucces();
+      return sonde
+        ? VOICE.createAudioResource(sonde.stream, { inputType: sonde.type, inlineVolume: inline })
+        : VOICE.createAudioResource(flux, { inputType: VOICE.StreamType.Arbitrary, inlineVolume: inline });
+    } catch (e) {
+      console.warn("[musique] yt-dlp :", e.message);
+      if (piste.source === "youtube" && estBlocageYoutube(e)) ytSignalerBlocage();
+      // on tente play-dl juste après
+    }
+  }
+
+  // 2. play-dl en secours
+  if (extraire && PLAY) {
     try {
       const flux = await PLAY.stream(piste.url, { quality: 2, discordPlayerCompatibility: true });
       if (piste.source === "youtube") ytSignalerSucces();
       return VOICE.createAudioResource(flux.stream, { inputType: flux.type, inlineVolume: inline });
     } catch (e) {
       if (piste.source === "youtube" && estBlocageYoutube(e)) ytSignalerBlocage();
-
-      // Client SoundCloud périmé : on en prend un neuf et on retente une fois
       if (piste.source === "soundcloud" && await rafraichirSoundcloudId()) {
         const flux = await PLAY.stream(piste.url, { quality: 2, discordPlayerCompatibility: true });
         return VOICE.createAudioResource(flux.stream, { inputType: flux.type, inlineVolume: inline });
@@ -4391,6 +4555,7 @@ async function fabriquerRessource(piste, volume) {
       throw e;
     }
   }
+  if (extraire) throw new Error("Aucun extracteur disponible pour cette source.");
 
   // Lien direct ou webradio : ffmpeg s'en charge
   const { stream, type } = await VOICE.demuxProbe(await fluxHttp(piste.url)).catch(() => ({ stream: null, type: null }));
@@ -4795,6 +4960,7 @@ function vueReglages(guild, config) {
       description: [
         ligne(AUDIO_PRET, "Moteur audio", AUDIO_PRET ? "prêt" : AUDIO_CAUSE),
         ligne(s.deezer, "Deezer", "catalogue de recherche, aucune clé requise"),
+        ligne(!!YTDLP, "yt-dlp", YTDLP ? "extracteur principal, à jour" : "absent — c'est lui qui récupère le son"),
         ligne(s.youtube && s.cookie && !ytAuRepos(), "YouTube",
           ytAuRepos() ? `au repos ${ytReposRestant()} min — trop de refus`
             : s.cookie ? "cookie fourni, interrogé en premier"
