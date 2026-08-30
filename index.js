@@ -4000,8 +4000,10 @@ async function initYtdlp() {
 function argsYtdlp() {
   const a = [
     "--no-warnings", "--no-playlist", "--no-check-certificates", "--geo-bypass",
-    // le client Android de YouTube échappe souvent au contrôle anti-robot
-    "--extractor-args", "youtube:player_client=android,web_safari,web",
+    // Chaque « client » est une façon de se présenter à YouTube. Android a
+    // été fermé courant 2025 ; tv et ios sont ceux qui passent encore le
+    // mieux depuis un serveur. On les essaie dans cet ordre.
+    "--extractor-args", "youtube:player_client=tv,ios,mweb,web_embedded,android,web",
     "--socket-timeout", "15", "--retries", "2",
   ];
   if (process.env.YT_COOKIE) a.push("--add-header", `Cookie:${process.env.YT_COOKIE}`);
@@ -4180,8 +4182,10 @@ async function trouverAudio(recherche, demandePar) {
   // et il suffit alors de passer au suivant sans embêter la personne.
   if (YTDLP) {
     const candidats = [];
-    if (!ytAuRepos()) candidats.push(...await chercherYtdlp(recherche, 5, "ytsearch"));
-    candidats.push(...await chercherYtdlp(recherche, 5, "scsearch"));
+    if (!ytAuRepos()) candidats.push(...await chercherYtdlp(recherche, 6, "ytsearch"));
+    // Sur SoundCloud, les versions officielles sont souvent en Go+ chiffré.
+    // On en demande beaucoup pour atteindre les reprises lisibles.
+    candidats.push(...await chercherYtdlp(recherche, 15, "scsearch"));
 
     if (candidats.length) {
       const [premier, ...suite] = candidats.map((c) => ({ ...c, demandePar }));
@@ -4727,10 +4731,16 @@ async function lireUne(guild, etat, piste) {
         description: [
           `**${piste.titre}**`,
           "",
-          "Toutes les versions trouvées sont protégées ou indisponibles.",
-          "Sur SoundCloud, les titres **Go+** sont chiffrés et illisibles par un bot.",
+          "Les versions trouvées sont toutes protégées ou indisponibles.",
           "",
-          "Essaie un autre titre, un lien direct `.mp3`, ou une webradio.",
+          "**Ce qui marche tout de suite :**",
+          "• colle un **lien YouTube** au lieu du titre",
+          "• ou un lien SoundCloud d'une reprise",
+          "• ou un lien `.mp3` / une webradio",
+          "",
+          ytAuRepos() || !process.env.YT_COOKIE
+            ? "_La recherche YouTube est bloquée depuis cet hébergeur. La variable `YT_COOKIE` la débloque définitivement._"
+            : "_Essaie un autre titre._",
         ].join("\n") }));
       return "echec";
     }
@@ -5187,6 +5197,14 @@ async function diagnostic(guild) {
     const flux = await fluxYtdlp(r[0].url);
     flux.destroy();
     return "le son sort";
+  });
+
+  await chrono("Lien YouTube direct", async () => {
+    // Recherche et lecture directe passent par des routes différentes :
+    // l'une peut être bloquée sans l'autre.
+    const flux = await fluxYtdlp("https://www.youtube.com/watch?v=jNQXAC9IVRw");
+    flux.destroy();
+    return "extraction possible";
   });
 
   await chrono("Webradio directe", async () => {
