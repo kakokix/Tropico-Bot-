@@ -110,7 +110,9 @@
 //     l'audio vient toujours de YouTube ou SoundCloud.
 //     Uniquement dans le CHAT D'UN SALON VOCAL, et seulement si tu es
 //     connecte a ce vocal. YouTube en premier, repli sur lien direct.
-//     « +diag » teste chaque source et montre les erreurs BRUTES.
+//     Les pistes protegees par DRM (SoundCloud Go+) sont ignorees : le bot
+//     essaie automatiquement le resultat suivant, jusqu'a en trouver une
+//     lisible. « +diag » teste chaque source et montre les erreurs BRUTES.
 //     yt-dlp se telecharge tout seul au demarrage s'il manque (version
 //     autonome, sans Python). Le son est extrait par yt-dlp, mis a jour
 //     en permanence contre les
@@ -4064,7 +4066,7 @@ async function fluxYtdlp(url) {
   const { spawn } = await import("node:child_process");
 
   const proc = spawn(YTDLP, [
-    url, "-f", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
+    url, "-f", "bestaudio[protocol^=http][ext=webm]/bestaudio[protocol^=http]/bestaudio/best",
     "-o", "-", "--quiet", ...argsYtdlp(),
   ], { stdio: ["ignore", "pipe", "pipe"] });
 
@@ -4174,14 +4176,17 @@ async function pisteSpotify(url) {
  * C'est l'étape qui fournit réellement l'audio.
  */
 async function trouverAudio(recherche, demandePar) {
-  // yt-dlp cherche lui-même, sur YouTube puis sur SoundCloud
+  // On ramène plusieurs candidats : le premier est souvent protégé par DRM,
+  // et il suffit alors de passer au suivant sans embêter la personne.
   if (YTDLP) {
-    if (!ytAuRepos()) {
-      const yt = await chercherYtdlp(recherche, 1, "ytsearch");
-      if (yt.length) return { ...yt[0], demandePar };
+    const candidats = [];
+    if (!ytAuRepos()) candidats.push(...await chercherYtdlp(recherche, 5, "ytsearch"));
+    candidats.push(...await chercherYtdlp(recherche, 5, "scsearch"));
+
+    if (candidats.length) {
+      const [premier, ...suite] = candidats.map((c) => ({ ...c, demandePar }));
+      return { ...premier, alternatives: suite };
     }
-    const sc = await chercherYtdlp(recherche, 1, "scsearch");
-    if (sc.length) return { ...sc[0], demandePar };
   }
 
   if (!PLAY) return replSoundcloud(recherche, demandePar);
@@ -4516,6 +4521,16 @@ function estBlocageYoutube(err) {
   return /confirm you.?re not a bot|sign in to confirm|\b(429|403|404)\b|consent|too many requests|login_required|bot.?check|could not extract|unable to extract/i.test(message);
 }
 
+/**
+ * Une piste peut être injouable pour elle-même : protégée par DRM (les
+ * titres SoundCloud Go+), privée, retirée, ou bloquée dans le pays.
+ * Ce n'est pas un blocage de l'hébergeur — il suffit d'essayer la suivante.
+ */
+function estPisteInjouable(err) {
+  const m = typeof err === "string" ? err : (err?.message ?? String(err ?? ""));
+  return /drm protected|private (video|track)|video unavailable|has been removed|not available in your country|geo.?restricted|requested format is not available|premium|go\+|paywall|only available to/i.test(m);
+}
+
 /** Un client SoundCloud expire : on en reprend un et on retente. */
 async function rafraichirSoundcloudId() {
   if (!PLAY) return false;
@@ -4673,6 +4688,13 @@ async function lireUne(guild, etat, piste) {
 
     // YouTube refuse l'hébergeur : on tente le même titre sur SoundCloud,
     // une seule fois, et sans repasser par la piste d'origine.
+    // Piste protégée ou retirée : on prend simplement la suivante trouvée
+    if (estPisteInjouable(e) && piste.alternatives?.length) {
+      const [suivante, ...reste] = piste.alternatives;
+      console.log(`[musique] « ${piste.titre} » injouable, essai suivant`);
+      return lireUne(guild, etat, { ...suivante, alternatives: reste });
+    }
+
     if (piste.source === "youtube" && estBlocageYoutube(e)) {
       const repli = await replSoundcloud(piste.titre, piste.demandePar);
       if (repli) {
@@ -4699,6 +4721,19 @@ async function lireUne(guild, etat, piste) {
     }
 
     const extracteur = YTDLP ? "yt-dlp" : "aucun extracteur installé";
+    if (estPisteInjouable(e)) {
+      await annoncer(guild, embed({ guild, color: COLORS.warning,
+        author: { name: "🔒  Titre protégé" },
+        description: [
+          `**${piste.titre}**`,
+          "",
+          "Toutes les versions trouvées sont protégées ou indisponibles.",
+          "Sur SoundCloud, les titres **Go+** sont chiffrés et illisibles par un bot.",
+          "",
+          "Essaie un autre titre, un lien direct `.mp3`, ou une webradio.",
+        ].join("\n") }));
+      return "echec";
+    }
     await annoncer(guild, embed({ guild, color: COLORS.danger,
       author: { name: `${ICONS.no}  Impossible de lire` },
       description: [
